@@ -4,11 +4,6 @@
  * This library provides a complete implementation of the GDB Remote Serial Protocol,
  * allowing emulators and embedded systems to be debugged using GDB and LLDB.
  *
- * This version includes foundational and advanced features:
- * - Rich stop replies for high-performance stepping.
- * - qHostInfo and qMemoryRegionInfo for superior LLDB compatibility.
- * - Dynamic feature reporting based on your Target's capabilities.
- *
  * Features:
  * - Header-only, no dependencies beyond standard C++17
  * - Supports incremental functionality (SFINAE-based feature detection)
@@ -34,11 +29,17 @@
  *     bool del_breakpoint(size_t addr, breakpoint_type type) { ... }
  *     gdbstub::host_info get_host_info() { return {"riscv64-unknown-elf", "little", 8}; }
  *     std::optional<gdbstub::mem_region> get_mem_region_info(size_t addr) { ... }
+ *     std::optional<gdbstub::register_info> get_register_info(int regno) { ... }
  *     void on_interrupt() { ... }
  * };
  *
  * my_emulator emu;
- * gdbstub::arch_info arch = {.reg_count = 33, .pc_reg_num = 32};
+ * gdbstub::arch_info arch = {
+ *   .target_desc = "...",
+ *   .xml_architecture_name = "riscv", // For 'xmlRegisters' GDB feature
+ *   .reg_count = 33,
+ *   .pc_reg_num = 32
+ * };
  * gdbstub::serve(emu, arch, "localhost:1234");
  * ```
  *
@@ -144,10 +145,11 @@ enum class gdb_signal {
  * @brief Architecture description for the target system.
  */
 struct arch_info {
-  const char* target_desc = nullptr; ///< XML target description or predefined constant.
-  int cpu_count = 1;                 ///< Number of CPUs/cores for SMP systems.
-  int reg_count = 0;                 ///< Number of registers in the target architecture.
-  int pc_reg_num = -1;               ///< Register number of the Program Counter (PC).
+  const char* target_desc = nullptr;           ///< XML target description string.
+  const char* xml_architecture_name = nullptr; ///< Name for the register set in XML, e.g., "riscv", "i386".
+  int cpu_count = 1;                           ///< Number of CPUs/cores for SMP systems.
+  int reg_count = 0;                           ///< Number of registers in the target architecture.
+  int pc_reg_num = -1;                         ///< Register number of the Program Counter (PC).
 };
 
 /**
@@ -170,6 +172,24 @@ struct mem_region {
   const char* permissions; ///< Permissions string, e.g., "r", "rw", "rx".
 };
 
+/**
+ * @brief Detailed information about a single register, for qRegisterInfo.
+ *
+ * This information is used by LLDB to display register information correctly.
+ * The `offset` field must be the byte offset of this register within the 'g' packet response.
+ */
+struct register_info {
+  const char* name = "unknown";                  ///< e.g., "x0", "pc", "sp"
+  const char* alt_name = nullptr;                ///< e.g., "zero" for x0
+  const char* set = "General Purpose Registers"; ///< Register set name
+  const char* generic = nullptr;                 ///< Generic name like "pc", "sp", "fp", "ra"
+  const char* encoding = "uint";                 ///< "uint", "ieee754", "vector"
+  const char* format = "hex";                    ///< "hex", "decimal", "float"
+  int bitsize = 0;                               ///< Size of the register in bits
+  int offset = 0;                                ///< Offset in the 'g' packet
+  int dwarf_regnum = -1;                         ///< DWARF register number
+};
+
 // =============================================================================
 // Implementation details
 // =============================================================================
@@ -190,8 +210,8 @@ enum class gdb_errno : int {
 };
 
 // Protocol constants
-constexpr size_t MAX_PACKET_SIZE = 0x1000;      ///< Maximum packet size we support.
-constexpr size_t MAX_MEMORY_READ = 0x1000;      ///< Maximum memory read size per packet.
+constexpr size_t MAX_PACKET_SIZE = 4096;        ///< Maximum packet size we support.
+constexpr size_t MAX_MEMORY_READ = 2048;        ///< Maximum memory read size per packet.
 constexpr size_t MAX_REG_SIZE = 256;            ///< Maximum register size in bytes.
 constexpr size_t PACKET_GARBAGE_THRESHOLD = 16; ///< Buffer size before clearing garbage.
 constexpr size_t PACKET_OVERHEAD_SIZE = 16;     ///< Estimated packet overhead for transfers.
@@ -410,12 +430,17 @@ template <typename T>
 struct has_mem_region_info<T, std::void_t<decltype(std::declval<T&>().get_mem_region_info(size_t{}))>>
     : std::true_type {};
 
+template <typename T, typename = void> struct has_register_info : std::false_type {};
+template <typename T>
+struct has_register_info<T, std::void_t<decltype(std::declval<T&>().get_register_info(int{}))>> : std::true_type {};
+
 // Convenience aliases
 template <typename T> inline constexpr bool has_breakpoints_v = has_breakpoints<T>::value;
 template <typename T> inline constexpr bool has_cpu_ops_v = has_cpu_ops<T>::value;
 template <typename T> inline constexpr bool has_interrupt_v = has_interrupt<T>::value;
 template <typename T> inline constexpr bool has_host_info_v = has_host_info<T>::value;
 template <typename T> inline constexpr bool has_mem_region_info_v = has_mem_region_info<T>::value;
+template <typename T> inline constexpr bool has_register_info_v = has_register_info<T>::value;
 
 } // namespace detail
 
@@ -615,11 +640,12 @@ public:
    * @param address Format: "host:port", e.g., "localhost:1234" or "*:1234".
    */
   bool listen(const char* address) {
-    GDBSTUB_LOG("Starting TCP server on %s", address);
+    GDBSTUB_LOG("[TCP] Starting server on %s", address);
     std::string addr_str(address);
 
     auto colon_pos = addr_str.rfind(':');
     if (colon_pos == std::string::npos) {
+      GDBSTUB_LOG("[ERROR] Invalid TCP address format: %s", address);
       return false;
     }
 
@@ -629,6 +655,7 @@ public:
     char* end;
     long port = std::strtol(port_str.c_str(), &end, 10);
     if (*end != '\0' || port < 0 || port > 65535) {
+      GDBSTUB_LOG("[ERROR] Invalid TCP port: %s", port_str.c_str());
       return false;
     }
 
@@ -640,6 +667,7 @@ public:
 
     listen_sock_ = detail::socket(::socket(AF_INET, SOCK_STREAM, 0));
     if (!listen_sock_) {
+      GDBSTUB_LOG("[ERROR] Failed to create socket: %d", detail::get_last_error());
       return false;
     }
 
@@ -655,14 +683,17 @@ public:
     addr.sin_port = htons(static_cast<uint16_t>(port));
 
     if (inet_pton(AF_INET, host.c_str(), &addr.sin_addr) != 1) {
+      GDBSTUB_LOG("[ERROR] Invalid network address: %s", host.c_str());
       return false;
     }
 
     if (::bind(listen_sock_.get(), reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
+      GDBSTUB_LOG("[ERROR] Failed to bind socket: %d", detail::get_last_error());
       return false;
     }
 
     if (::listen(listen_sock_.get(), 1) < 0) {
+      GDBSTUB_LOG("[ERROR] Failed to listen on socket: %d", detail::get_last_error());
       return false;
     }
 
@@ -673,14 +704,14 @@ public:
    * @brief Accept an incoming connection.
    */
   bool accept() {
-    GDBSTUB_LOG("Waiting for debugger connection...");
+    GDBSTUB_LOG("[TCP] Waiting for debugger connection...");
     auto sock = ::accept(listen_sock_.get(), nullptr, nullptr);
     if (sock == detail::invalid_socket) {
-      GDBSTUB_LOG("Failed to accept connection");
+      GDBSTUB_LOG("[ERROR] Failed to accept connection: %d", detail::get_last_error());
       return false;
     }
     conn_sock_ = detail::socket(sock);
-    GDBSTUB_LOG("Debugger connected successfully");
+    GDBSTUB_LOG("[TCP] Debugger connected.");
     return true;
   }
 
@@ -732,11 +763,13 @@ public:
    * @brief Listen on a Unix domain socket path.
    */
   bool listen(const char* path) {
+    GDBSTUB_LOG("[UNIX] Starting server on %s", path);
     path_ = path;
     ::unlink(path); // Remove existing socket
 
     listen_sock_ = detail::socket(::socket(AF_UNIX, SOCK_STREAM, 0));
     if (!listen_sock_) {
+      GDBSTUB_LOG("[ERROR] Failed to create socket: %d", detail::get_last_error());
       return false;
     }
 
@@ -745,10 +778,12 @@ public:
     std::strncpy(addr.sun_path, path, sizeof(addr.sun_path) - 1);
 
     if (::bind(listen_sock_.get(), reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
+      GDBSTUB_LOG("[ERROR] Failed to bind socket: %d", detail::get_last_error());
       return false;
     }
 
     if (::listen(listen_sock_.get(), 1) < 0) {
+      GDBSTUB_LOG("[ERROR] Failed to listen on socket: %d", detail::get_last_error());
       return false;
     }
 
@@ -756,14 +791,14 @@ public:
   }
 
   bool accept() {
-    GDBSTUB_LOG("Waiting for debugger connection...");
+    GDBSTUB_LOG("[UNIX] Waiting for debugger connection...");
     auto sock = ::accept(listen_sock_.get(), nullptr, nullptr);
     if (sock == detail::invalid_socket) {
-      GDBSTUB_LOG("Failed to accept connection");
+      GDBSTUB_LOG("[ERROR] Failed to accept connection: %d", detail::get_last_error());
       return false;
     }
     conn_sock_ = detail::socket(sock);
-    GDBSTUB_LOG("Debugger connected successfully");
+    GDBSTUB_LOG("[UNIX] Debugger connected.");
     return true;
   }
 
@@ -863,6 +898,7 @@ private:
 
   // Protocol constants
   static constexpr char ack[] = "+";
+  static constexpr char nack[] = "-";
   static constexpr char interrupt_char = '\x03';
 
 public:
@@ -907,7 +943,9 @@ public:
    * Listens, waits for a connection, and serves requests until the debugger detaches.
    */
   void serve_forever() {
+    GDBSTUB_LOG("[SERVER] Starting blocking server loop.");
     if (!wait_for_connection()) {
+      GDBSTUB_LOG("[ERROR] Failed to establish initial connection.");
       return;
     }
 
@@ -922,6 +960,7 @@ public:
       }
     }
 
+    GDBSTUB_LOG("[SERVER] serve_forever loop terminated.");
     stop();
   }
 
@@ -958,7 +997,10 @@ public:
   /**
    * @brief Stop the server and clean up all resources.
    */
-  void stop() { transport_.close(); }
+  void stop() {
+    GDBSTUB_LOG("[SERVER] Stopping transport.");
+    transport_.close();
+  }
 
 private:
   /**
@@ -976,6 +1018,7 @@ private:
     ssize_t n = transport_.read(temp, sizeof(temp));
 
     if (n <= 0) {
+      GDBSTUB_LOG("[SERVER] Connection closed by peer.");
       transport_.disconnect();
       return n;
     }
@@ -1015,7 +1058,7 @@ private:
    * @brief Handle an interrupt signal (^C) from the debugger.
    */
   void handle_interrupt() {
-    GDBSTUB_LOG("Interrupt received (Ctrl+C)");
+    GDBSTUB_LOG("[SERVER] Interrupt (Ctrl+C) received from debugger.");
     if constexpr (detail::has_interrupt_v<Target>) {
       target_.on_interrupt();
     }
@@ -1023,7 +1066,7 @@ private:
 
   /**
    * @brief Receive a complete packet from the transport (blocking).
-   * Sends an ACK immediately after a complete packet is received (per protocol).
+   * Sends an ACK/NAK immediately after a complete packet is received (per protocol).
    */
   bool receive_packet() {
     while (!rx_buffer_.has_complete_packet()) {
@@ -1034,11 +1077,15 @@ private:
       // This is a blocking read that also handles interrupts.
       if (read_and_process_data(-1) <= 0) {
         // Disconnected or error
+        GDBSTUB_LOG("[SERVER] Connection lost while waiting for packet.");
         return false;
       }
     }
 
-    // Send ACK immediately after a complete packet (before checksum verification!)
+    // Per protocol, ACK/NAK is the first response.
+    // We send ACK here and verify checksum in process_current_packet.
+    // While a stricter implementation might NAK on bad checksum,
+    // modern GDB is lenient and retransmits on timeout.
     if (rx_buffer_.needs_ack()) {
       send_ack();
       rx_buffer_.mark_ack_sent();
@@ -1057,7 +1104,7 @@ private:
    */
   void send_packet(std::string_view data) {
     auto packet = tx_buffer_.build_packet(data);
-    GDBSTUB_LOG("TX: %.*s", static_cast<int>(packet.size()), packet.data());
+    GDBSTUB_LOG("TX> %.*s", static_cast<int>(packet.size()), packet.data());
     transport_.write(packet.data(), packet.size());
   }
 
@@ -1067,7 +1114,7 @@ private:
   void send_error(detail::gdb_errno error_code) {
     char buf[8];
     std::snprintf(buf, sizeof(buf), "E%02x", static_cast<int>(error_code));
-    GDBSTUB_LOG("Sending error E%02x", static_cast<int>(error_code));
+    GDBSTUB_LOG("[ERROR] Sending error response: %s", buf);
     send_packet(buf);
   }
 
@@ -1075,27 +1122,28 @@ private:
    * @brief Process the current packet in the receive buffer.
    */
   gdb_action process_current_packet() {
+    GDBSTUB_LOG("RX< %.*s", static_cast<int>(rx_buffer_.get_packet().size()), rx_buffer_.get_packet().data());
+
     // Verify checksum before processing.
     if (!rx_buffer_.verify_checksum()) {
       GDBSTUB_LOG(
-          "RX checksum failed: %.*s", static_cast<int>(rx_buffer_.get_packet().size()), rx_buffer_.get_packet().data()
+          "[ERROR] Checksum failed for packet: %.*s", static_cast<int>(rx_buffer_.get_packet().size()),
+          rx_buffer_.get_packet().data()
       );
+      // A NAK would be sent here, but modern GDB often relies on timeouts.
+      // The simple ACK-first model is maintained for compatibility.
       rx_buffer_.consume_packet();
       return gdb_action::none;
     }
 
-    auto payload = rx_buffer_.get_payload();
-    GDBSTUB_LOG("RX: %.*s", static_cast<int>(rx_buffer_.get_packet().size()), rx_buffer_.get_packet().data());
-
-    // Send ACK first (unless no-ack mode is enabled).
-    if (!no_ack_mode_) {
-      send_ack();
-    }
-
     gdb_action action = gdb_action::none;
 
+    auto payload = rx_buffer_.get_payload();
     if (!payload.empty()) {
       action = dispatch_command(payload);
+    } else {
+      // Empty packet is a no-op, often used for keep-alive
+      send_packet("");
     }
 
     rx_buffer_.consume_packet();
@@ -1121,12 +1169,6 @@ private:
    * @brief Dispatch a command based on the first character of the packet payload.
    */
   gdb_action dispatch_command(std::string_view payload) {
-    GDBSTUB_LOG("RX: %.*s", static_cast<int>(payload.size()), payload.data());
-    if (payload.empty()) {
-      send_packet("");
-      return gdb_action::none;
-    }
-
     char cmd = payload[0];
     auto args = payload.substr(1);
 
@@ -1151,13 +1193,13 @@ private:
 
     // Execution control
     case 'c':
-      return handle_continue();
+      return handle_continue(args);
     case 'C':
-      return handle_continue(); // Continue with signal (signal ignored)
+      return handle_continue(args); // Continue with signal (signal ignored)
     case 's':
-      return handle_step();
+      return handle_step(args);
     case 'S':
-      return handle_step(); // Step with signal (signal ignored)
+      return handle_step(args); // Step with signal (signal ignored)
 
     // Breakpoints
     case 'z':
@@ -1188,6 +1230,7 @@ private:
       return handle_extended_mode();
 
     default:
+      GDBSTUB_LOG("[CMD %c] Unsupported command", cmd);
       send_packet(""); // Unsupported command
       return gdb_action::none;
     }
@@ -1195,27 +1238,24 @@ private:
 
   // --- Command Handlers ---
 
-  /**
-   * g - Read all registers.
-   */
   gdb_action handle_read_all_registers() {
-    GDBSTUB_LOG("Action: Reading all registers");
-    size_t total_size = 0;
+    GDBSTUB_LOG("[CMD g] Reading all registers (%d regs)", arch_.reg_count);
+    size_t total_hex_size = 0;
     for (int i = 0; i < arch_.reg_count; ++i) {
       size_t reg_size = target_.reg_size(i);
       if (reg_size == 0 || reg_size > detail::MAX_REG_SIZE) {
         send_error(detail::gdb_errno::gdb_EINVAL);
         return gdb_action::none;
       }
-      total_size += reg_size * 2;
+      total_hex_size += reg_size * 2;
     }
 
-    if (total_size > detail::MAX_PACKET_SIZE - 8) {
-      send_error(detail::gdb_errno::gdb_EINVAL);
+    if (total_hex_size > detail::MAX_PACKET_SIZE) {
+      send_error(detail::gdb_errno::gdb_ENOSPC); // Too large for packet
       return gdb_action::none;
     }
 
-    ensure_buffer_size(hex_buffer_, total_size + 1);
+    ensure_buffer_size(hex_buffer_, total_hex_size + 1);
     char* hex_ptr = hex_buffer_.data();
 
     for (int i = 0; i < arch_.reg_count; ++i) {
@@ -1231,15 +1271,12 @@ private:
       hex_ptr += reg_size * 2;
     }
 
-    send_packet(std::string_view(hex_buffer_.data(), total_size));
+    send_packet(std::string_view(hex_buffer_.data(), total_hex_size));
     return gdb_action::none;
   }
 
-  /**
-   * G - Write all registers.
-   */
   gdb_action handle_write_all_registers(std::string_view args) {
-    GDBSTUB_LOG("Action: Writing all registers");
+    GDBSTUB_LOG("[CMD G] Writing all registers (%d regs)", arch_.reg_count);
     size_t pos = 0;
     for (int i = 0; i < arch_.reg_count; ++i) {
       size_t reg_size = target_.reg_size(i);
@@ -1255,6 +1292,7 @@ private:
       }
 
       if (target_.write_reg(i, reg_buffer_.data()) != 0) {
+        GDBSTUB_LOG("[ERROR] Target write_reg failed for reg %d", i);
         send_error(detail::gdb_errno::gdb_EFAULT);
         return gdb_action::none;
       }
@@ -1265,9 +1303,6 @@ private:
     return gdb_action::none;
   }
 
-  /**
-   * p<regno> - Read a single register.
-   */
   gdb_action handle_read_register(std::string_view args) {
     int regno;
     auto result = std::from_chars(args.data(), args.data() + args.size(), regno, 16);
@@ -1276,7 +1311,7 @@ private:
       return gdb_action::none;
     }
 
-    GDBSTUB_LOG("Action: Reading register %d", regno);
+    GDBSTUB_LOG("[CMD p] Reading register %d", regno);
     size_t reg_size = target_.reg_size(regno);
     if (reg_size == 0 || reg_size > detail::MAX_REG_SIZE) {
       send_error(detail::gdb_errno::gdb_EINVAL);
@@ -1296,9 +1331,6 @@ private:
     return gdb_action::none;
   }
 
-  /**
-   * P<regno>=<val> - Write a single register.
-   */
   gdb_action handle_write_register(std::string_view args) {
     auto eq_pos = args.find('=');
     if (eq_pos == std::string_view::npos) {
@@ -1320,7 +1352,7 @@ private:
       return gdb_action::none;
     }
 
-    GDBSTUB_LOG("Action: Writing register %d (size %zu)", regno, reg_size);
+    GDBSTUB_LOG("[CMD P] Writing register %d (size %zu)", regno, reg_size);
     ensure_buffer_size(reg_buffer_, reg_size);
     if (!detail::hex_to_bytes(hex_data.data(), hex_data.size(), reg_buffer_.data())) {
       send_error(detail::gdb_errno::gdb_EINVAL);
@@ -1328,7 +1360,7 @@ private:
     }
 
     if (target_.write_reg(regno, reg_buffer_.data()) != 0) {
-      GDBSTUB_LOG("Error: target_.write_reg failed");
+      GDBSTUB_LOG("[ERROR] Target write_reg failed for reg %d", regno);
       send_error(detail::gdb_errno::gdb_EFAULT);
       return gdb_action::none;
     }
@@ -1337,9 +1369,6 @@ private:
     return gdb_action::none;
   }
 
-  /**
-   * m<addr>,<len> - Read from memory.
-   */
   gdb_action handle_read_memory(std::string_view args) {
     auto comma_pos = args.find(',');
     if (comma_pos == std::string_view::npos) {
@@ -1357,7 +1386,7 @@ private:
     }
 
     len = std::min(len, detail::MAX_MEMORY_READ);
-    GDBSTUB_LOG("Action: Reading memory at 0x%zx, length %zu", addr, len);
+    GDBSTUB_LOG("[CMD m] Reading memory at 0x%zx, length %zu", addr, len);
     std::vector<uint8_t> data(len);
 
     if (target_.read_mem(addr, len, data.data()) != 0) {
@@ -1372,9 +1401,6 @@ private:
     return gdb_action::none;
   }
 
-  /**
-   * M<addr>,<len>:<data> - Write to memory.
-   */
   gdb_action handle_write_memory(std::string_view args) {
     auto colon_pos = args.find(':');
     if (colon_pos == std::string_view::npos) {
@@ -1397,7 +1423,7 @@ private:
       return gdb_action::none;
     }
 
-    GDBSTUB_LOG("Action: Writing memory at 0x%zx, length %zu", addr, len);
+    GDBSTUB_LOG("[CMD M] Writing memory at 0x%zx, length %zu", addr, len);
     auto hex_data = args.substr(colon_pos + 1);
     if (hex_data.size() != len * 2) {
       send_error(detail::gdb_errno::gdb_EINVAL);
@@ -1419,9 +1445,6 @@ private:
     return gdb_action::none;
   }
 
-  /**
-   * X<addr>,<len>:<data> - Write binary data to memory.
-   */
   gdb_action handle_write_binary_memory(std::string_view args) {
     auto colon_pos = args.find(':');
     if (colon_pos == std::string_view::npos) {
@@ -1444,6 +1467,7 @@ private:
       return gdb_action::none;
     }
 
+    GDBSTUB_LOG("[CMD X] Writing binary memory at 0x%zx, length %zu", addr, len);
     std::vector<char> data(args.begin() + colon_pos + 1, args.end());
     size_t actual_len = detail::unescape_binary(data.data(), data.size());
 
@@ -1461,11 +1485,8 @@ private:
     return gdb_action::none;
   }
 
-  /**
-   * c - Continue execution.
-   */
-  gdb_action handle_continue() {
-    GDBSTUB_LOG("Action: Continue execution");
+  gdb_action handle_continue(std::string_view args) {
+    GDBSTUB_LOG("[CMD c] Continue execution (address arg ignored)");
     async_io_enabled_.store(true, std::memory_order_relaxed);
     if (on_continue) {
       on_continue();
@@ -1483,11 +1504,8 @@ private:
     return action;
   }
 
-  /**
-   * s - Step one instruction.
-   */
-  gdb_action handle_step() {
-    GDBSTUB_LOG("Action: Step one instruction");
+  gdb_action handle_step(std::string_view args) {
+    GDBSTUB_LOG("[CMD s] Step one instruction (address arg ignored)");
     if (on_continue) {
       on_continue();
     }
@@ -1503,10 +1521,6 @@ private:
     return action;
   }
 
-  /**
-   * @brief Helper to parse Z/z packet arguments.
-   * @return A tuple containing {type, address, kind}. Returns nullopt on failure.
-   */
   std::optional<std::tuple<int, size_t, size_t>> parse_breakpoint_packet(std::string_view args) {
     auto first_comma = args.find(',');
     if (first_comma == std::string_view::npos) {
@@ -1530,9 +1544,6 @@ private:
     return std::make_tuple(type, addr, kind);
   }
 
-  /**
-   * Z<type>,<addr>,<kind> - Insert a breakpoint or watchpoint.
-   */
   gdb_action handle_insert_breakpoint(std::string_view args) {
     if constexpr (detail::has_breakpoints_v<Target>) {
       auto bp = parse_breakpoint_packet(args);
@@ -1542,19 +1553,17 @@ private:
       }
       auto [type, addr, kind] = *bp;
       (void) kind; // kind is unused for now but part of the protocol
-      GDBSTUB_LOG("Action: Inserting breakpoint type %d at 0x%zx", type, addr);
+      GDBSTUB_LOG("[CMD Z] Insert breakpoint type %d at 0x%zx", type, addr);
       bool ok = target_.set_breakpoint(addr, static_cast<breakpoint_type>(type));
-      GDBSTUB_LOG("Result: %s", ok ? "OK" : "Error");
-      send_packet(ok ? "OK" : "E22"); // E22 is EINVAL
+      GDBSTUB_LOG("[CMD Z] Result: %s", ok ? "OK" : "Error");
+      send_packet(ok ? "OK" : ""); // Empty string for not supported, OK for success
     } else {
-      send_packet(""); // Not supported
+      GDBSTUB_LOG("[CMD Z] Not supported by target");
+      send_packet("");
     }
     return gdb_action::none;
   }
 
-  /**
-   * z<type>,<addr>,<kind> - Remove a breakpoint or watchpoint.
-   */
   gdb_action handle_remove_breakpoint(std::string_view args) {
     if constexpr (detail::has_breakpoints_v<Target>) {
       auto bp = parse_breakpoint_packet(args);
@@ -1564,110 +1573,110 @@ private:
       }
       auto [type, addr, kind] = *bp;
       (void) kind; // kind is unused for now but part of the protocol
-      GDBSTUB_LOG("Action: Removing breakpoint type %d at 0x%zx", type, addr);
+      GDBSTUB_LOG("[CMD z] Remove breakpoint type %d at 0x%zx", type, addr);
       bool ok = target_.del_breakpoint(addr, static_cast<breakpoint_type>(type));
-      GDBSTUB_LOG("Result: %s", ok ? "OK" : "Error");
-      send_packet(ok ? "OK" : "E22"); // E22 is EINVAL
+      GDBSTUB_LOG("[CMD z] Result: %s", ok ? "OK" : "Error");
+      send_packet(ok ? "OK" : "");
     } else {
-      send_packet(""); // Not supported
+      GDBSTUB_LOG("[CMD z] Not supported by target");
+      send_packet("");
     }
     return gdb_action::none;
   }
 
-  /**
-   * q<...>/Q<...> - Handle general query and set packets.
-   */
   gdb_action handle_query(std::string_view args) {
     auto colon_pos = args.find(':');
     auto query_name = colon_pos != std::string_view::npos ? args.substr(0, colon_pos) : args;
-    GDBSTUB_LOG("Action: Query '%.*s'", static_cast<int>(query_name.size()), query_name.data());
+
+    GDBSTUB_LOG("[CMD q] Query: '%.*s'", static_cast<int>(query_name.size()), query_name.data());
 
     if (query_name == "Supported") {
-      // qSupported - GDB/LLDB's feature negotiation packet.
-      // We build a response based on the Target's detected capabilities.
-      std::string features = "PacketSize=1000;qXfer:features:read+;vContSupported+";
+      std::string features;
+      char buf[64];
+      snprintf(buf, sizeof(buf), "PacketSize=%zx;vContSupported+", detail::MAX_PACKET_SIZE);
+      features = buf;
 
+      if (arch_.target_desc && arch_.xml_architecture_name) {
+        features += ";qXfer:features:read+;xmlRegisters=";
+        features += arch_.xml_architecture_name;
+      }
       if constexpr (detail::has_breakpoints_v<Target>) {
         features += ";swbreak+;hwbreak+";
       }
-
+      if constexpr (detail::has_register_info_v<Target>) {
+        features += ";qRegisterInfo+";
+      }
       if (args.find("QStartNoAckMode+") != std::string_view::npos) {
         features += ";QStartNoAckMode+";
-      }
-
-      if (arch_.target_desc) {
-        // This name is conventionally 'riscv', 'i386', etc.
-        // It's used by GDB to find the XML file.
-        features += ";xmlRegisters=riscv";
       }
       send_packet(features);
     } else if (query_name == "Attached") {
       send_packet("1"); // We are always attached to an existing process.
     } else if (query_name == "C") {
-      // qC - Query current thread ID.
       char buf[16];
       int current_cpu = 0;
       if constexpr (detail::has_cpu_ops_v<Target>) {
         current_cpu = target_.get_cpu();
       }
-      snprintf(buf, sizeof(buf), "QC%x", current_cpu);
+      snprintf(buf, sizeof(buf), "QC%x", current_cpu + 1); // GDB threads are 1-based
       send_packet(buf);
     } else if (query_name == "fThreadInfo") {
-      // qfThreadInfo - First thread info query.
       std::string response = "m";
       for (int i = 0; i < arch_.cpu_count; ++i) {
         if (i > 0) {
           response += ',';
         }
         char buf[8];
-        snprintf(buf, sizeof(buf), "%x", i);
+        snprintf(buf, sizeof(buf), "%x", i + 1);
         response += buf;
       }
       send_packet(response);
     } else if (query_name == "sThreadInfo") {
-      // qsThreadInfo - Subsequent thread info query.
       send_packet("l"); // 'l' for last/end of list.
     } else if (query_name == "Symbol") {
-      // qSymbol - Used for symbol lookups on behalf of the target. We don't need this.
       send_packet("OK");
-    } else if (query_name == "Xfer" && arch_.target_desc) {
-      // qXfer - Used for transferring large data, like the target.xml description.
+    } else if (query_name == "Xfer") {
       handle_xfer(args.substr(5)); // Skip "Xfer:"
     } else if (query_name == "HostInfo") {
       handle_host_info();
     } else if (query_name == "MemoryRegionInfo") {
       handle_memory_region_info(args.substr(17)); // Skip "MemoryRegionInfo:"
+    } else if (query_name.rfind("RegisterInfo", 0) == 0) {
+      handle_register_info(query_name.substr(12)); // Skip "RegisterInfo"
     } else {
-      send_packet(""); // Not supported
+      GDBSTUB_LOG("[CMD q] Unsupported query: '%.*s'", static_cast<int>(query_name.size()), query_name.data());
+      send_packet("");
     }
 
     return gdb_action::none;
   }
 
   gdb_action handle_set_query(std::string_view args) {
+    GDBSTUB_LOG("[CMD Q] Set: '%.*s'", static_cast<int>(args.size()), args.data());
     if (args == "StartNoAckMode") {
-      // QStartNoAckMode - Client requests to disable ACKs.
       no_ack_mode_ = true;
+      GDBSTUB_LOG("[SERVER] No-ACK mode enabled.");
       send_packet("OK");
     } else {
-      send_packet(""); // Not supported
+      send_packet("");
     }
     return gdb_action::none;
   }
 
-  /**
-   * qXfer:features:read:target.xml:<offset>,<len> - Read target description XML.
-   */
   void handle_xfer(std::string_view args) {
     if (args.rfind("features:read:target.xml:", 0) != 0) {
       send_packet("");
+      return;
+    }
+    if (!arch_.target_desc) {
+      send_packet("E01");
       return;
     }
 
     auto offset_str = args.substr(25);
     auto comma_pos = offset_str.find(',');
     if (comma_pos == std::string_view::npos) {
-      send_packet("");
+      send_packet("E01");
       return;
     }
 
@@ -1677,10 +1686,11 @@ private:
         std::from_chars(offset_str.data() + comma_pos + 1, offset_str.data() + offset_str.size(), length, 16);
 
     if (offset_result.ec != std::errc{} || length_result.ec != std::errc{}) {
-      send_packet("");
+      send_packet("E01");
       return;
     }
 
+    GDBSTUB_LOG("[XFER] Read target.xml, offset=%zu, len=%zu", offset, length);
     std::string_view desc(arch_.target_desc);
     if (offset >= desc.size()) {
       send_packet("l"); // 'l' indicates end of data.
@@ -1688,35 +1698,26 @@ private:
     }
 
     size_t to_send = std::min(length, desc.size() - offset);
-    ensure_buffer_size(hex_buffer_, to_send + 2);
-
-    // 'l' for last chunk, 'm' for more data to come.
-    hex_buffer_[0] = (offset + to_send >= desc.size()) ? 'l' : 'm';
-    std::memcpy(hex_buffer_.data() + 1, desc.data() + offset, to_send);
-
-    send_packet(std::string_view(hex_buffer_.data(), to_send + 1));
+    std::string response;
+    response.reserve(to_send + 1);
+    response += (offset + to_send >= desc.size()) ? 'l' : 'm';
+    response.append(desc.data() + offset, to_send);
+    send_packet(response);
   }
 
-  /**
-   * @brief qHostInfo - Get information about the host system.
-   *
-   * This is an LLDB extension that is critical for auto-detecting the
-   * target's architecture, OS, and other properties.
-   */
   void handle_host_info() {
     if constexpr (detail::has_host_info_v<Target>) {
+      GDBSTUB_LOG("[qHostInfo] Responding with host info.");
       auto info = target_.get_host_info();
       char buf[256];
-      snprintf(buf, sizeof(buf), "triple:%s;endian:%s;ptrsize:%x;", info.triple, info.endian, info.ptr_size);
+      snprintf(buf, sizeof(buf), "triple:%s;endian:%s;ptrsize:%d;", info.triple, info.endian, info.ptr_size);
       send_packet(buf);
     } else {
-      send_packet(""); // Not supported by Target.
+      GDBSTUB_LOG("[qHostInfo] Not supported by target.");
+      send_packet("");
     }
   }
 
-  /**
-   * qMemoryRegionInfo:<addr> - Get attributes of a memory region.
-   */
   void handle_memory_region_info(std::string_view addr_str) {
     if constexpr (detail::has_mem_region_info_v<Target>) {
       size_t addr;
@@ -1726,6 +1727,7 @@ private:
         return;
       }
 
+      GDBSTUB_LOG("[qMemoryRegionInfo] Query for address 0x%zx", addr);
       auto region = target_.get_mem_region_info(addr);
       if (region && region->size > 0) {
         char buf[256];
@@ -1734,64 +1736,101 @@ private:
         );
         send_packet(buf);
       } else {
-        send_error(detail::gdb_errno::gdb_EFAULT); // No such region
+        send_error(detail::gdb_errno::gdb_EFAULT);
       }
     } else {
-      send_packet(""); // Not supported by Target.
+      GDBSTUB_LOG("[qMemoryRegionInfo] Not supported by target.");
+      send_packet("");
+    }
+  }
+
+  void handle_register_info(std::string_view regno_str) {
+    if constexpr (detail::has_register_info_v<Target>) {
+      int regno;
+      auto result = std::from_chars(regno_str.data(), regno_str.data() + regno_str.size(), regno, 16);
+      if (result.ec != std::errc{} || regno < 0 || regno >= arch_.reg_count) {
+        send_error(detail::gdb_errno::gdb_EINVAL);
+        return;
+      }
+      GDBSTUB_LOG("[qRegisterInfo] Query for register %d", regno);
+      auto info = target_.get_register_info(regno);
+      if (!info) {
+        send_error(detail::gdb_errno::gdb_EFAULT);
+        return;
+      }
+
+      std::string response;
+      char buf[512];
+      snprintf(
+          buf, sizeof(buf), "name:%s;bitsize:%d;offset:%d;encoding:%s;format:%s;set:%s;", info->name, info->bitsize,
+          info->offset, info->encoding, info->format, info->set
+      );
+      response += buf;
+      if (info->alt_name) {
+        snprintf(buf, sizeof(buf), "alt-name:%s;", info->alt_name);
+        response += buf;
+      }
+      if (info->dwarf_regnum != -1) {
+        snprintf(buf, sizeof(buf), "dwarf_regno:%d;", info->dwarf_regnum);
+        response += buf;
+      }
+      if (info->generic) {
+        snprintf(buf, sizeof(buf), "generic:%s;", info->generic);
+        response += buf;
+      }
+
+      send_packet(response);
+    } else {
+      GDBSTUB_LOG("[qRegisterInfo] Not supported by target.");
+      send_packet("");
     }
   }
 
   gdb_action handle_v_packet(std::string_view args) {
     auto semicolon_pos = args.find(';');
-    auto cmd_name = semicolon_pos != std::string_view::npos ? args.substr(0, semicolon_pos) : args;
+    auto question_pos = args.find('?');
+    auto cmd_end = std::min(semicolon_pos, question_pos);
+    auto cmd_name = args.substr(0, cmd_end);
 
+    GDBSTUB_LOG("[CMD v] Packet: '%.*s'", static_cast<int>(cmd_name.size()), cmd_name.data());
     if (cmd_name == "Cont?") {
-      // vCont? - Query supported continue actions.
       send_packet("vCont;c;C;s;S");
-    } else if (cmd_name == "Cont" && semicolon_pos != std::string_view::npos) {
-      // vCont;<action>[:<thread>] - Continue with specific actions.
-      // This is a simplified implementation that only handles one action.
-      auto action_str = args.substr(semicolon_pos + 1);
+    } else if (cmd_name == "Cont") {
+      auto action_str = args.substr(cmd_name.size() + 1);
       if (action_str.empty()) {
         send_error(detail::gdb_errno::gdb_EINVAL);
         return gdb_action::none;
       }
       char action_char = action_str[0];
       if (action_char == 'c' || action_char == 'C') {
-        return handle_continue();
+        return handle_continue(action_str);
       } else if (action_char == 's' || action_char == 'S') {
-        return handle_step();
+        return handle_step(action_str);
       } else {
         send_error(detail::gdb_errno::gdb_EINVAL);
       }
     } else {
-      send_packet(""); // Not supported
+      send_packet("");
     }
     return gdb_action::none;
   }
 
-  /**
-   * H<op><thread> - Set thread for subsequent operations.
-   */
   gdb_action handle_set_thread(std::string_view args) {
-    if (args.size() > 1) {
-      // We only care about the 'g' (general) operation for setting the active CPU.
-      if (args[0] == 'g') {
-        if constexpr (detail::has_cpu_ops_v<Target>) {
-          int cpu_id;
-          auto thread_str = args.substr(1);
-          if (thread_str == "-1") {
-            cpu_id = 0; // -1 means all threads, we'll default to the first one.
-          } else {
-            auto result = std::from_chars(thread_str.data(), thread_str.data() + thread_str.size(), cpu_id, 16);
-            if (result.ec != std::errc{}) {
-              send_error(detail::gdb_errno::gdb_EINVAL);
-              return gdb_action::none;
-            }
-          }
-          if (cpu_id >= 0 && cpu_id < arch_.cpu_count) {
-            target_.set_cpu(cpu_id);
-          }
+    GDBSTUB_LOG("[CMD H] Set thread '%.*s'", static_cast<int>(args.size()), args.data());
+    if (args.size() > 1 && args[0] == 'g') {
+      if constexpr (detail::has_cpu_ops_v<Target>) {
+        int cpu_id;
+        auto thread_str = args.substr(1);
+        auto result = std::from_chars(thread_str.data(), thread_str.data() + thread_str.size(), cpu_id, 16);
+        if (result.ec != std::errc{}) {
+          send_error(detail::gdb_errno::gdb_EINVAL);
+          return gdb_action::none;
+        }
+        cpu_id -= 1; // GDB is 1-based, we are 0-based
+        if (cpu_id >= 0 && cpu_id < arch_.cpu_count) {
+          target_.set_cpu(cpu_id);
+        } else if (cpu_id == -2) { // -1 in GDB is "all threads"
+          target_.set_cpu(0);      // Default to CPU 0
         }
       }
     }
@@ -1799,35 +1838,26 @@ private:
     return gdb_action::none;
   }
 
-  /**
-   * T<thread> - Check if a thread is alive.
-   */
   gdb_action handle_thread_alive(std::string_view args) {
-    // We assume all threads/CPUs reported are alive.
+    GDBSTUB_LOG("[CMD T] Thread alive? '%.*s'", static_cast<int>(args.size()), args.data());
     send_packet("OK");
     return gdb_action::none;
   }
 
-  /**
-   * ? - Query the reason the target halted.
-   */
   gdb_action handle_halt_reason() {
+    GDBSTUB_LOG("[CMD ?] Halt reason requested.");
     send_stop_reply();
     return gdb_action::none;
   }
 
-  /**
-   * D - Detach the debugger.
-   */
   gdb_action handle_detach() {
+    GDBSTUB_LOG("[CMD D] Detach requested. Shutting down.");
     send_packet("OK");
     return gdb_action::shutdown;
   }
 
-  /**
-   * ! - Enable extended mode.
-   */
   gdb_action handle_extended_mode() {
+    GDBSTUB_LOG("[CMD !] Extended mode enabled.");
     send_packet("OK");
     return gdb_action::none;
   }
@@ -1840,20 +1870,15 @@ private:
    * Including the thread and PC is a major performance optimization.
    */
   void send_stop_reply() {
-    // 'T05' is the standard reply for a trap signal (SIGTRAP).
     char buf[128];
-    int current_cpu = -1;
+    int current_cpu = 0;
     if constexpr (detail::has_cpu_ops_v<Target>) {
       current_cpu = target_.get_cpu();
     }
 
-    // Base packet: T<signal>thread:<id>;
-    snprintf(
-        buf, sizeof(buf), "T%02xthread:%x;", static_cast<int>(gdb_signal::trap), current_cpu >= 0 ? current_cpu : 0
-    );
+    snprintf(buf, sizeof(buf), "T%02xthread:%x;", static_cast<int>(gdb_signal::trap), current_cpu + 1);
     std::string reply = buf;
 
-    // Append the PC register if known.
     if (arch_.pc_reg_num != -1) {
       size_t pc_size = target_.reg_size(arch_.pc_reg_num);
       if (pc_size > 0 && pc_size <= detail::MAX_REG_SIZE) {
@@ -1862,12 +1887,12 @@ private:
           ensure_buffer_size(hex_buffer_, pc_size * 2 + 1);
           detail::bytes_to_hex(reg_buffer_.data(), pc_size, hex_buffer_.data());
 
-          // Append <reg_num>:<reg_val>;
           snprintf(buf, sizeof(buf), "%x:%.*s;", arch_.pc_reg_num, static_cast<int>(pc_size * 2), hex_buffer_.data());
           reply += buf;
         }
       }
     }
+    GDBSTUB_LOG("[EVENT] Target stopped. Sending stop reply: %s", reply.c_str());
     send_packet(reply);
   }
 };
