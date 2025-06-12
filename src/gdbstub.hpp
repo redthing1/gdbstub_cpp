@@ -1277,6 +1277,29 @@ private:
 
   // --- Command Handlers ---
 
+  /**
+   * @brief Helper to perform a resume action and wait for a stop reason.
+   */
+  gdb_action resume_and_wait(std::function<std::optional<stop_reason>()> resume_fn) {
+    async_io_enabled_.store(true, std::memory_order_relaxed);
+    if (on_continue) {
+      on_continue();
+    }
+
+    auto reason = resume_fn();
+
+    async_io_enabled_.store(false, std::memory_order_relaxed);
+    if (reason) {
+      send_stop_reply(*reason);
+      if (on_break) {
+        on_break();
+      }
+      return gdb_action::stop;
+    }
+    // if we are here, target is still running, so no action for the stub
+    return gdb_action::none;
+  }
+
   gdb_action handle_read_all_registers() {
     GDBSTUB_LOG("[CMD g] Reading all registers (%d regs)", arch_.reg_count);
     size_t total_hex_size = 0;
@@ -1534,44 +1557,12 @@ private:
 
   gdb_action handle_continue(std::string_view args) {
     GDBSTUB_LOG("[CMD c] Continue execution (address arg ignored)");
-    async_io_enabled_.store(true, std::memory_order_relaxed);
-    if (on_continue) {
-      on_continue();
-    }
-
-    auto reason = target_.cont();
-
-    async_io_enabled_.store(false, std::memory_order_relaxed);
-    if (reason) {
-      send_stop_reply(*reason);
-      if (on_break) {
-        on_break();
-      }
-      return gdb_action::stop;
-    }
-    // if we are here, target is still running, so no action for the stub
-    return gdb_action::none;
+    return resume_and_wait([this] { return target_.cont(); });
   }
 
   gdb_action handle_step(std::string_view args) {
     GDBSTUB_LOG("[CMD s] Step one instruction (address arg ignored)");
-    if (on_continue) {
-      on_continue();
-    }
-
-    auto reason = target_.stepi();
-
-    if (reason) {
-      send_stop_reply(*reason);
-      if (on_break) {
-        on_break();
-      }
-      return gdb_action::stop;
-    }
-    // this path should ideally not be taken for a step, as a step by definition stops.
-    // however, if the target has a pipeline where a step isn't instantaneous,
-    // we return no action.
-    return gdb_action::none;
+    return resume_and_wait([this] { return target_.stepi(); });
   }
 
   std::optional<std::tuple<int, size_t, size_t>> parse_breakpoint_packet(std::string_view args) {
@@ -1865,22 +1856,46 @@ private:
     if (cmd_name == "Cont?") {
       send_packet("vCont;c;C;s;S");
     } else if (cmd_name == "Cont") {
-      auto action_str = args.substr(cmd_name.size());
-      while (!action_str.empty() && action_str[0] == ';') {
-        action_str = action_str.substr(1);
+      auto actions_str = args.substr(cmd_name.size());
+
+      bool is_step = false;
+      bool has_action = false;
+
+      // Iterate through semicolon-separated actions
+      std::string_view remainder = actions_str;
+      while (!remainder.empty()) {
+        if (remainder.front() == ';') {
+          remainder.remove_prefix(1);
+        }
+        auto next_semicolon = remainder.find(';');
+        std::string_view action_part = remainder.substr(0, next_semicolon);
+
+        if (!action_part.empty()) {
+          has_action = true;
+          char action_char = action_part[0];
+          // For a simple target, any step action takes precedence over continue actions.
+          if (action_char == 's' || action_char == 'S') {
+            is_step = true;
+          }
+        }
+
+        if (next_semicolon == std::string_view::npos) {
+          break;
+        }
+        remainder.remove_prefix(next_semicolon);
       }
 
-      if (action_str.empty()) {
+      if (!has_action) {
+        GDBSTUB_LOG("[vCont] No actions specified in vCont packet.");
         send_error(detail::gdb_errno::gdb_EINVAL);
         return gdb_action::none;
       }
-      char action_char = action_str[0];
-      if (action_char == 'c' || action_char == 'C') {
-        return handle_continue(action_str);
-      } else if (action_char == 's' || action_char == 'S') {
-        return handle_step(action_str);
+
+      GDBSTUB_LOG("[vCont] Action determined: %s", is_step ? "step" : "continue");
+      if (is_step) {
+        return resume_and_wait([this] { return target_.stepi(); });
       } else {
-        send_error(detail::gdb_errno::gdb_EINVAL);
+        return resume_and_wait([this] { return target_.cont(); });
       }
     } else {
       send_packet("");
