@@ -1,0 +1,15 @@
+name "gdbstub_test_d"
+description "D port of gdbstub test helper with MockTarget"
+authors "redthing1"
+license "proprietary"
+targetType "executable"
+targetName "test_helper"
+
+configuration "debug" {
+    versions "GDBSTUB_DEBUG"
+    buildType "debug"
+}
+
+configuration "release" {
+    buildType "release"
+}
