@@ -1831,7 +1831,7 @@ private:
         response += buf;
       }
       if (info->dwarf_regnum != -1) {
-        snprintf(buf, sizeof(buf), "dwarf_regno:%d;", info->dwarf_regnum);
+        snprintf(buf, sizeof(buf), "dwarf:%d;", info->dwarf_regnum);
         response += buf;
       }
       if (info->generic) {
