@@ -548,7 +548,7 @@ public:
         buffer_[data.length + 3] = hex_chars[checksum & 0xf];
 
         size_ = data.length + 4;
-        return cast(string) buffer_[0 .. size_];
+        return cast(string) buffer_[0 .. size_].dup;
     }
 }
 
@@ -571,11 +571,11 @@ public:
      * @param address Format: "host:port", e.g., "localhost:1234" or "*:1234".
      */
     bool listen(string address) {
-        GDBSTUB_LOG("[TCP] Starting server on %s", address.ptr);
+        GDBSTUB_LOG("[TCP] Starting server on %s", address);
         try {
             auto colon_pos = address.lastIndexOf(':');
             if (colon_pos < 0) {
-                GDBSTUB_LOG("[ERROR] Invalid TCP address format: %s", address.ptr);
+                GDBSTUB_LOG("[ERROR] Invalid TCP address format: %s", address);
                 return false;
             }
 
@@ -592,7 +592,7 @@ public:
             } else {
                 auto results = getAddress(host, port_str);
                 if (results.length == 0) {
-                     GDBSTUB_LOG("[ERROR] Could not resolve address: %s", address.ptr);
+                     GDBSTUB_LOG("[ERROR] Could not resolve address: %s", address);
                      return false;
                 }
                 listen_sock_ = new TcpSocket(results[0].addressFamily);
@@ -603,7 +603,7 @@ public:
             listen_sock_.listen(1);
             return true;
         } catch (SocketException e) {
-            GDBSTUB_LOG("[ERROR] Socket listen failed: %s", e.msg.ptr);
+            GDBSTUB_LOG("[ERROR] Socket listen failed: %s", e.msg);
             return false;
         }
     }
@@ -618,7 +618,7 @@ public:
             GDBSTUB_LOG("[TCP] Debugger connected.");
             return true;
         } catch (SocketException e) {
-            GDBSTUB_LOG("[ERROR] Failed to accept connection: %s", e.msg.ptr);
+            GDBSTUB_LOG("[ERROR] Failed to accept connection: %s", e.msg);
             return false;
         }
     }
@@ -732,7 +732,7 @@ version (Posix) {
                 GDBSTUB_LOG("[UNIX] Debugger connected.");
                 return true;
             } catch (SocketException e) {
-                GDBSTUB_LOG("[ERROR] Failed to accept connection: %s", e.msg.ptr);
+                GDBSTUB_LOG("[ERROR] Failed to accept connection: %s", e.msg);
                 return false;
             }
         }
@@ -1074,7 +1074,7 @@ private:
      */
     void send_packet(string data) {
         auto packet = tx_buffer_.build_packet(data);
-        GDBSTUB_LOG("TX> %.*s", cast(int) packet.length, packet.ptr);
+        GDBSTUB_LOG("TX> %s", packet);
         transport_.write(packet.ptr, packet.length);
     }
 
@@ -1092,13 +1092,12 @@ private:
      */
     gdb_action process_current_packet() {
         auto packet = rx_buffer_.get_packet();
-        GDBSTUB_LOG("RX< %.*s", cast(int) packet.length, packet.ptr);
+        GDBSTUB_LOG("RX< %s", packet);
 
         // Verify checksum before processing.
         if (!rx_buffer_.verify_checksum()) {
             GDBSTUB_LOG(
-                "[ERROR] Checksum failed for packet: %.*s", cast(int) packet.length,
-                packet.ptr
+                "[ERROR] Checksum failed for packet: %s", packet
             );
             if (!no_ack_mode_) {
                 transport_.write(nack.ptr, 1);
@@ -1586,7 +1585,7 @@ private:
         auto colon_pos = args.indexOf(':');
         auto query_name = colon_pos != -1 ? args[0 .. colon_pos] : args;
 
-        GDBSTUB_LOG("[CMD q] Query: '%.*s'", cast(int) query_name.length, query_name.ptr);
+        GDBSTUB_LOG("[CMD q] Query: '%s'", query_name);
 
         if (query_name == "Supported") {
             auto features = appender!string;
@@ -1646,7 +1645,7 @@ private:
         } else if (query_name == "ProcessInfo") {
             handle_process_info();
         } else {
-            GDBSTUB_LOG("[CMD q] Unsupported query: '%.*s'", cast(int) query_name.length, query_name.ptr);
+            GDBSTUB_LOG("[CMD q] Unsupported query: '%s'", query_name);
             send_packet("");
         }
 
@@ -1654,7 +1653,7 @@ private:
     }
 
     gdb_action handle_set_query(string args) {
-        GDBSTUB_LOG("[CMD Q] Set: '%.*s'", cast(int) args.length, args.ptr);
+        GDBSTUB_LOG("[CMD Q] Set: '%s'", args);
         if (args == "StartNoAckMode") {
             no_ack_mode_ = true;
             GDBSTUB_LOG("[SERVER] No-ACK mode enabled.");
@@ -1920,7 +1919,7 @@ private:
         }
 
         // Unrecognized 'v' packet
-        GDBSTUB_LOG("[CMD v] Unrecognized v-packet: '%.*s'", cast(int) args.length, args.ptr);
+        GDBSTUB_LOG("[CMD v] Unrecognized v-packet: '%s'", args);
         send_packet("");
         return gdb_action.none;
     }
@@ -1934,7 +1933,7 @@ private:
      * This function is the translation layer between the two.
      */
     gdb_action handle_set_thread(string args) {
-        GDBSTUB_LOG("[CMD H] Set thread '%.*s'", cast(int) args.length, args.ptr);
+        GDBSTUB_LOG("[CMD H] Set thread '%s'", args);
         if (args.length > 1 && (args[0] == 'g' || args[0] == 'c')) {
             static if (has_cpu_ops!Target) {
                 auto thread_str = args[1 .. $];
@@ -1966,7 +1965,7 @@ private:
     }
 
     gdb_action handle_thread_alive(string args) {
-        GDBSTUB_LOG("[CMD T] Thread alive? '%.*s'", cast(int) args.length, args.ptr);
+        GDBSTUB_LOG("[CMD T] Thread alive? '%s'", args);
         send_packet("OK");
         return gdb_action.none;
     }
@@ -2047,14 +2046,14 @@ private:
                     bytes_to_hex(reg_buffer_.ptr, pc_size, hex_buffer_.ptr);
 
                     reply.put(format(
-                        "%x:%.*s;", arch_.pc_reg_num, cast(int) (pc_size * 2),
-                        hex_buffer_.ptr
+                        "%x:%s;", arch_.pc_reg_num, 
+                        cast(string) hex_buffer_[0 .. pc_size * 2]
                     ));
                 }
             }
         }
 
-        GDBSTUB_LOG("[EVENT] Target stopped. Sending stop reply: %s", reply.data.ptr);
+        GDBSTUB_LOG("[EVENT] Target stopped. Sending stop reply: %s", reply.data);
         send_packet(reply.data);
     }
 }
