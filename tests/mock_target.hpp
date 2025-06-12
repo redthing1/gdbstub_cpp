@@ -234,21 +234,23 @@ public:
   /**
    * Set breakpoint
    */
-  bool set_breakpoint(size_t addr, gdbstub::breakpoint_type type) {
+  std::optional<gdbstub::gdb_errno> set_breakpoint(size_t addr, gdbstub::breakpoint_type type, size_t kind) {
+    (void) kind; // kind parameter not used in mock but required by interface
     breakpoints[static_cast<uint32_t>(addr)] = type;
-    return true;
+    return std::nullopt; // Success
   }
 
   /**
    * Delete breakpoint
    */
-  bool del_breakpoint(size_t addr, gdbstub::breakpoint_type type) {
+  std::optional<gdbstub::gdb_errno> del_breakpoint(size_t addr, gdbstub::breakpoint_type type, size_t kind) {
+    (void) kind; // kind parameter not used in mock but required by interface
     auto it = breakpoints.find(static_cast<uint32_t>(addr));
     if (it != breakpoints.end() && it->second == type) {
       breakpoints.erase(it);
-      return true;
+      return std::nullopt; // Success
     }
-    return false;
+    return gdbstub::gdb_errno::gdb_EINVAL; // Error - breakpoint not found or type mismatch
   }
 
   /**

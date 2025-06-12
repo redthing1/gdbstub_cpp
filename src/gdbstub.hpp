@@ -27,12 +27,13 @@
  *
  *     // Optional methods (detected automatically)
  *     // std::optional<gdbstub::register_info> get_register_info(int regno) { ... }
- *     bool set_breakpoint(size_t addr, breakpoint_type type) { ... }
- *     bool del_breakpoint(size_t addr, breakpoint_type type) { ... }
+ *     std::optional<gdbstub::gdb_errno> set_breakpoint(size_t addr, gdbstub::breakpoint_type type, size_t kind) { ... }
+ *     std::optional<gdbstub::gdb_errno> del_breakpoint(size_t addr, gdbstub::breakpoint_type type, size_t kind) { ... }
  *     std::optional<gdbstub::host_info> get_host_info() { ... }
  *     std::optional<gdbstub::process_info> get_process_info() { ... }
  *     std::optional<gdbstub::mem_region> get_mem_region_info(size_t addr) { ... }
  *     void on_interrupt() { ... }
+ *     // void on_kill() { ... } // Optional: Called when 'k' (kill) packet is received
  * };
  *
  * // --- To enable writable registers with LLDB, you MUST use the target.xml ---
@@ -119,9 +120,10 @@ namespace gdbstub {
  * @deprecated This is now internal. The public API uses std::optional<stop_reason>.
  */
 enum class gdb_action {
-  none,    ///< No special action, continue debugging normally
-  stop,    ///< Target hit breakpoint or completed step, send stop reply
-  shutdown ///< Target wants to terminate debugging session
+  none,               ///< No special action, continue debugging normally
+  stop,               ///< Target hit breakpoint or completed step, send stop reply
+  shutdown,           ///< Target wants to terminate debugging session
+  no_reply_shutdown   ///< Target wants to terminate without sending a reply (for 'k' kill command)
 };
 
 /**
@@ -250,8 +252,6 @@ struct register_info {
 // Implementation details
 // =============================================================================
 
-namespace detail {
-
 // GDB protocol error codes (subset of standard errno values)
 enum class gdb_errno : int {
   gdb_EPERM = 0x01,  ///< Operation not permitted
@@ -263,7 +263,10 @@ enum class gdb_errno : int {
   gdb_EBUSY = 0x10,  ///< Device or resource busy
   gdb_EINVAL = 0x16, ///< Invalid argument
   gdb_ENOSPC = 0x1c, ///< No space left on device
+  gdb_EOPNOTSUPP_FEATURE = 0x63, // Custom: Operation not supported for this specific feature/type/kind
 };
+
+namespace detail {
 
 // Protocol constants
 constexpr size_t MAX_PACKET_SIZE = 4096;        ///< Maximum packet size we support.
@@ -474,8 +477,8 @@ template <typename T, typename = void> struct has_breakpoints : std::false_type 
 template <typename T>
 struct has_breakpoints<
     T, std::void_t<
-           decltype(std::declval<T&>().set_breakpoint(size_t{}, breakpoint_type{})),
-           decltype(std::declval<T&>().del_breakpoint(size_t{}, breakpoint_type{}))>> : std::true_type {};
+           decltype(std::declval<T&>().set_breakpoint(size_t{}, breakpoint_type{}, size_t{})),
+           decltype(std::declval<T&>().del_breakpoint(size_t{}, breakpoint_type{}, size_t{}))>> : std::true_type {};
 
 template <typename T, typename = void> struct has_cpu_ops : std::false_type {};
 template <typename T>
@@ -504,6 +507,10 @@ template <typename T, typename = void> struct has_process_info : std::false_type
 template <typename T>
 struct has_process_info<T, std::void_t<decltype(std::declval<T&>().get_process_info())>> : std::true_type {};
 
+template <typename T, typename = void> struct has_on_kill : std::false_type {};
+template <typename T>
+struct has_on_kill<T, std::void_t<decltype(std::declval<T&>().on_kill())>> : std::true_type {};
+
 // Convenience aliases
 template <typename T> inline constexpr bool has_breakpoints_v = has_breakpoints<T>::value;
 template <typename T> inline constexpr bool has_cpu_ops_v = has_cpu_ops<T>::value;
@@ -512,6 +519,7 @@ template <typename T> inline constexpr bool has_host_info_v = has_host_info<T>::
 template <typename T> inline constexpr bool has_mem_region_info_v = has_mem_region_info<T>::value;
 template <typename T> inline constexpr bool has_register_info_v = has_register_info<T>::value;
 template <typename T> inline constexpr bool has_process_info_v = has_process_info<T>::value;
+template <typename T> inline constexpr bool has_on_kill_v = has_on_kill<T>::value;
 
 } // namespace detail
 
@@ -1028,8 +1036,8 @@ public:
       }
 
       auto action = process_current_packet();
-      if (action == gdb_action::shutdown) {
-        break;
+      if (action == gdb_action::shutdown || action == gdb_action::no_reply_shutdown) {
+        break; // Exit loop, will lead to stop()
       }
     }
 
@@ -1057,11 +1065,11 @@ public:
         rx_buffer_.mark_ack_sent();
       }
 
-      auto action = process_current_packet();
+      auto action = process_current_packet(); // 'k' handler will not call send_packet()
 
-      if (action == gdb_action::shutdown) {
-        transport_.disconnect();
-        if (on_detach) {
+      if (action == gdb_action::shutdown || action == gdb_action::no_reply_shutdown) {
+        transport_.disconnect(); // For 'k', this is the action after no reply.
+        if (on_detach) { // on_detach might be relevant for 'k' too.
           on_detach();
         }
       }
@@ -1186,7 +1194,7 @@ private:
   /**
    * @brief Send an error response (e.g., "E22").
    */
-  void send_error(detail::gdb_errno error_code) {
+  void send_error(gdb_errno error_code) {
     char buf[8];
     std::snprintf(buf, sizeof(buf), "E%02x", static_cast<int>(error_code));
     GDBSTUB_LOG("[ERROR] Sending error response: %s", buf);
@@ -1304,6 +1312,14 @@ private:
       return handle_detach();
     case '!':
       return handle_extended_mode();
+    case 'k': // Kill request
+      GDBSTUB_LOG("[CMD k] Kill request received.");
+      if constexpr (detail::has_on_kill_v<Target>) {
+        target_.on_kill(); // Notify target if it implements on_kill()
+      }
+      // Per GDB protocol, 'k' packet has no reply.
+      // The session should terminate.
+      return gdb_action::no_reply_shutdown;
 
     default:
       GDBSTUB_LOG("[CMD %c] Unsupported command", cmd);
@@ -1343,14 +1359,14 @@ private:
     for (int i = 0; i < arch_.reg_count; ++i) {
       size_t reg_size = target_.reg_size(i);
       if (reg_size > detail::MAX_REG_SIZE) {
-        send_error(detail::gdb_errno::gdb_EINVAL);
+        send_error(gdb_errno::gdb_EINVAL);
         return gdb_action::none;
       }
       total_hex_size += reg_size * 2;
     }
 
     if (total_hex_size > detail::MAX_PACKET_SIZE) {
-      send_error(detail::gdb_errno::gdb_ENOSPC); // Too large for packet
+      send_error(gdb_errno::gdb_ENOSPC); // Too large for packet
       return gdb_action::none;
     }
 
@@ -1391,13 +1407,13 @@ private:
       }
 
       if (pos + reg_size * 2 > args.size()) {
-        send_error(detail::gdb_errno::gdb_EINVAL);
+        send_error(gdb_errno::gdb_EINVAL);
         return gdb_action::none;
       }
 
       ensure_buffer_size(reg_buffer_, reg_size);
       if (!detail::hex_to_bytes(args.data() + pos, reg_size * 2, reg_buffer_.data())) {
-        send_error(detail::gdb_errno::gdb_EINVAL);
+        send_error(gdb_errno::gdb_EINVAL);
         return gdb_action::none;
       }
 
@@ -1407,7 +1423,7 @@ private:
 
       if (target_.write_reg(i, reg_buffer_.data()) != 0) {
         GDBSTUB_LOG("[ERROR] Target write_reg failed for reg %d", i);
-        send_error(detail::gdb_errno::gdb_EFAULT);
+        send_error(gdb_errno::gdb_EFAULT);
         return gdb_action::none;
       }
       pos += reg_size * 2;
@@ -1421,20 +1437,20 @@ private:
     int regno;
     auto result = std::from_chars(args.data(), args.data() + args.size(), regno, 16);
     if (result.ec != std::errc{} || regno < 0 || regno >= arch_.reg_count) {
-      send_error(detail::gdb_errno::gdb_EINVAL);
+      send_error(gdb_errno::gdb_EINVAL);
       return gdb_action::none;
     }
 
     GDBSTUB_LOG("[CMD p] Reading register %d", regno);
     size_t reg_size = target_.reg_size(regno);
     if (reg_size == 0 || reg_size > detail::MAX_REG_SIZE) {
-      send_error(detail::gdb_errno::gdb_EINVAL);
+      send_error(gdb_errno::gdb_EINVAL);
       return gdb_action::none;
     }
 
     ensure_buffer_size(reg_buffer_, reg_size);
     if (target_.read_reg(regno, reg_buffer_.data()) != 0) {
-      send_error(detail::gdb_errno::gdb_EFAULT);
+      send_error(gdb_errno::gdb_EFAULT);
       return gdb_action::none;
     }
 
@@ -1452,28 +1468,28 @@ private:
   gdb_action handle_write_register(std::string_view args) {
     auto eq_pos = args.find('=');
     if (eq_pos == std::string_view::npos) {
-      send_error(detail::gdb_errno::gdb_EINVAL);
+      send_error(gdb_errno::gdb_EINVAL);
       return gdb_action::none;
     }
 
     int regno;
     auto result = std::from_chars(args.data(), args.data() + eq_pos, regno, 16);
     if (result.ec != std::errc{} || regno < 0 || regno >= arch_.reg_count) {
-      send_error(detail::gdb_errno::gdb_EINVAL);
+      send_error(gdb_errno::gdb_EINVAL);
       return gdb_action::none;
     }
 
     auto hex_data = args.substr(eq_pos + 1);
     size_t reg_size = target_.reg_size(regno);
     if (reg_size == 0 || hex_data.size() != reg_size * 2) {
-      send_error(detail::gdb_errno::gdb_EINVAL);
+      send_error(gdb_errno::gdb_EINVAL);
       return gdb_action::none;
     }
 
     GDBSTUB_LOG("[CMD P] Writing register %d (size %zu)", regno, reg_size);
     ensure_buffer_size(reg_buffer_, reg_size);
     if (!detail::hex_to_bytes(hex_data.data(), hex_data.size(), reg_buffer_.data())) {
-      send_error(detail::gdb_errno::gdb_EINVAL);
+      send_error(gdb_errno::gdb_EINVAL);
       return gdb_action::none;
     }
 
@@ -1483,7 +1499,7 @@ private:
 
     if (target_.write_reg(regno, reg_buffer_.data()) != 0) {
       GDBSTUB_LOG("[ERROR] Target write_reg failed for reg %d", regno);
-      send_error(detail::gdb_errno::gdb_EFAULT);
+      send_error(gdb_errno::gdb_EFAULT);
       return gdb_action::none;
     }
 
@@ -1494,7 +1510,7 @@ private:
   gdb_action handle_read_memory(std::string_view args) {
     auto comma_pos = args.find(',');
     if (comma_pos == std::string_view::npos) {
-      send_error(detail::gdb_errno::gdb_EINVAL);
+      send_error(gdb_errno::gdb_EINVAL);
       return gdb_action::none;
     }
 
@@ -1503,7 +1519,7 @@ private:
     auto len_result = std::from_chars(args.data() + comma_pos + 1, args.data() + args.size(), len, 16);
 
     if (addr_result.ec != std::errc{} || len_result.ec != std::errc{}) {
-      send_error(detail::gdb_errno::gdb_EINVAL);
+      send_error(gdb_errno::gdb_EINVAL);
       return gdb_action::none;
     }
 
@@ -1512,7 +1528,7 @@ private:
     std::vector<uint8_t> data(len);
 
     if (target_.read_mem(addr, len, data.data()) != 0) {
-      send_error(detail::gdb_errno::gdb_EFAULT);
+      send_error(gdb_errno::gdb_EFAULT);
       return gdb_action::none;
     }
 
@@ -1526,13 +1542,13 @@ private:
   gdb_action handle_write_memory(std::string_view args) {
     auto colon_pos = args.find(':');
     if (colon_pos == std::string_view::npos) {
-      send_error(detail::gdb_errno::gdb_EINVAL);
+      send_error(gdb_errno::gdb_EINVAL);
       return gdb_action::none;
     }
 
     auto comma_pos = args.find(',', 0);
     if (comma_pos == std::string_view::npos || comma_pos > colon_pos) {
-      send_error(detail::gdb_errno::gdb_EINVAL);
+      send_error(gdb_errno::gdb_EINVAL);
       return gdb_action::none;
     }
 
@@ -1541,25 +1557,25 @@ private:
     auto len_result = std::from_chars(args.data() + comma_pos + 1, args.data() + colon_pos, len, 16);
 
     if (addr_result.ec != std::errc{} || len_result.ec != std::errc{}) {
-      send_error(detail::gdb_errno::gdb_EINVAL);
+      send_error(gdb_errno::gdb_EINVAL);
       return gdb_action::none;
     }
 
     GDBSTUB_LOG("[CMD M] Writing memory at 0x%zx, length %zu", addr, len);
     auto hex_data = args.substr(colon_pos + 1);
     if (hex_data.size() != len * 2) {
-      send_error(detail::gdb_errno::gdb_EINVAL);
+      send_error(gdb_errno::gdb_EINVAL);
       return gdb_action::none;
     }
 
     std::vector<uint8_t> data(len);
     if (!detail::hex_to_bytes(hex_data.data(), hex_data.size(), data.data())) {
-      send_error(detail::gdb_errno::gdb_EINVAL);
+      send_error(gdb_errno::gdb_EINVAL);
       return gdb_action::none;
     }
 
     if (target_.write_mem(addr, len, data.data()) != 0) {
-      send_error(detail::gdb_errno::gdb_EFAULT);
+      send_error(gdb_errno::gdb_EFAULT);
       return gdb_action::none;
     }
 
@@ -1570,13 +1586,13 @@ private:
   gdb_action handle_write_binary_memory(std::string_view args) {
     auto colon_pos = args.find(':');
     if (colon_pos == std::string_view::npos) {
-      send_error(detail::gdb_errno::gdb_EINVAL);
+      send_error(gdb_errno::gdb_EINVAL);
       return gdb_action::none;
     }
 
     auto comma_pos = args.find(',');
     if (comma_pos == std::string_view::npos || comma_pos > colon_pos) {
-      send_error(detail::gdb_errno::gdb_EINVAL);
+      send_error(gdb_errno::gdb_EINVAL);
       return gdb_action::none;
     }
 
@@ -1585,7 +1601,7 @@ private:
     auto len_result = std::from_chars(args.data() + comma_pos + 1, args.data() + colon_pos, len, 16);
 
     if (addr_result.ec != std::errc{} || len_result.ec != std::errc{}) {
-      send_error(detail::gdb_errno::gdb_EINVAL);
+      send_error(gdb_errno::gdb_EINVAL);
       return gdb_action::none;
     }
 
@@ -1594,12 +1610,12 @@ private:
     size_t actual_len = detail::unescape_binary(data.data(), data.size());
 
     if (actual_len != len) {
-      send_error(detail::gdb_errno::gdb_EINVAL);
+      send_error(gdb_errno::gdb_EINVAL);
       return gdb_action::none;
     }
 
     if (target_.write_mem(addr, len, data.data()) != 0) {
-      send_error(detail::gdb_errno::gdb_EFAULT);
+      send_error(gdb_errno::gdb_EFAULT);
       return gdb_action::none;
     }
 
@@ -1644,15 +1660,22 @@ private:
     if constexpr (detail::has_breakpoints_v<Target>) {
       auto bp = parse_breakpoint_packet(args);
       if (!bp) {
-        send_error(detail::gdb_errno::gdb_EINVAL);
+        send_error(gdb_errno::gdb_EINVAL);
         return gdb_action::none;
       }
       auto [type, addr, kind] = *bp;
-      (void) kind; // kind is unused for now but part of the protocol
-      GDBSTUB_LOG("[CMD Z] Insert breakpoint type %d at 0x%zx", type, addr);
-      bool ok = target_.set_breakpoint(addr, static_cast<breakpoint_type>(type));
-      GDBSTUB_LOG("[CMD Z] Result: %s", ok ? "OK" : "Error");
-      send_packet(ok ? "OK" : ""); // Empty string for not supported, OK for success
+      GDBSTUB_LOG("[CMD Z] Insert breakpoint type %d at 0x%zx, kind 0x%zx", type, addr, kind);
+      auto result = target_.set_breakpoint(addr, static_cast<breakpoint_type>(type), kind);
+      if (!result.has_value()) { // std::nullopt indicates success
+        GDBSTUB_LOG("[CMD Z] Result: OK");
+        send_packet("OK");
+      } else if (result.value() == gdb_errno::gdb_EOPNOTSUPP_FEATURE) {
+        GDBSTUB_LOG("[CMD Z] Result: Not supported for this configuration");
+        send_packet(""); // Specific "feature not supported" reply
+      } else {
+        GDBSTUB_LOG("[CMD Z] Result: Error %02x", static_cast<int>(result.value()));
+        send_error(result.value()); // Other errors
+      }
     } else {
       GDBSTUB_LOG("[CMD Z] Not supported by target");
       send_packet("");
@@ -1664,15 +1687,22 @@ private:
     if constexpr (detail::has_breakpoints_v<Target>) {
       auto bp = parse_breakpoint_packet(args);
       if (!bp) {
-        send_error(detail::gdb_errno::gdb_EINVAL);
+        send_error(gdb_errno::gdb_EINVAL);
         return gdb_action::none;
       }
       auto [type, addr, kind] = *bp;
-      (void) kind; // kind is unused for now but part of the protocol
-      GDBSTUB_LOG("[CMD z] Remove breakpoint type %d at 0x%zx", type, addr);
-      bool ok = target_.del_breakpoint(addr, static_cast<breakpoint_type>(type));
-      GDBSTUB_LOG("[CMD z] Result: %s", ok ? "OK" : "Error");
-      send_packet(ok ? "OK" : "");
+      GDBSTUB_LOG("[CMD z] Remove breakpoint type %d at 0x%zx, kind 0x%zx", type, addr, kind);
+      auto result = target_.del_breakpoint(addr, static_cast<breakpoint_type>(type), kind);
+      if (!result.has_value()) { // std::nullopt indicates success
+        GDBSTUB_LOG("[CMD z] Result: OK");
+        send_packet("OK");
+      } else if (result.value() == gdb_errno::gdb_EOPNOTSUPP_FEATURE) {
+        GDBSTUB_LOG("[CMD z] Result: Not supported for this configuration");
+        send_packet(""); // Specific "feature not supported" reply
+      } else {
+        GDBSTUB_LOG("[CMD z] Result: Error %02x", static_cast<int>(result.value()));
+        send_error(result.value()); // Other errors
+      }
     } else {
       GDBSTUB_LOG("[CMD z] Not supported by target");
       send_packet("");
@@ -1851,7 +1881,7 @@ private:
       GDBSTUB_LOG("[qProcessInfo] Responding with process info.");
       auto info = target_.get_process_info();
       if (!info) {
-        send_error(detail::gdb_errno::gdb_EFAULT);
+        send_error(gdb_errno::gdb_EFAULT);
         return;
       }
       char buf[512];
@@ -1871,7 +1901,7 @@ private:
       size_t addr;
       auto result = std::from_chars(addr_str.data(), addr_str.data() + addr_str.size(), addr, 16);
       if (result.ec != std::errc{}) {
-        send_error(detail::gdb_errno::gdb_EINVAL);
+        send_error(gdb_errno::gdb_EINVAL);
         return;
       }
 
@@ -1885,7 +1915,7 @@ private:
         );
         send_packet(buf);
       } else {
-        send_error(detail::gdb_errno::gdb_EFAULT);
+        send_error(gdb_errno::gdb_EFAULT);
       }
     } else {
       GDBSTUB_LOG("[qMemoryRegionInfo] Not supported by target.");
@@ -1898,18 +1928,18 @@ private:
       int regno;
       auto result = std::from_chars(regno_str.data(), regno_str.data() + regno_str.size(), regno, 16);
       if (result.ec != std::errc{}) {
-        send_error(detail::gdb_errno::gdb_EINVAL);
+        send_error(gdb_errno::gdb_EINVAL);
         return;
       }
       if (regno < 0 || regno >= arch_.reg_count) {
         // This is not an error, it's how GDB discovers the number of registers
-        send_error(detail::gdb_errno::gdb_EINVAL);
+        send_error(gdb_errno::gdb_EINVAL);
         return;
       }
       GDBSTUB_LOG("[qRegisterInfo] Query for register %d", regno);
       auto info = target_.get_register_info(regno);
       if (!info) {
-        send_error(detail::gdb_errno::gdb_EFAULT);
+        send_error(gdb_errno::gdb_EFAULT);
         return;
       }
 
@@ -1957,7 +1987,7 @@ private:
 
       if (actions_str.empty()) {
         GDBSTUB_LOG("[vCont] No actions specified in vCont packet.");
-        send_error(detail::gdb_errno::gdb_EINVAL);
+        send_error(gdb_errno::gdb_EINVAL);
         return gdb_action::none;
       }
 
@@ -2058,7 +2088,7 @@ private:
         auto thread_str = args.substr(1);
         auto result = std::from_chars(thread_str.data(), thread_str.data() + thread_str.size(), thread_id, 16);
         if (result.ec != std::errc{}) {
-          send_error(detail::gdb_errno::gdb_EINVAL);
+          send_error(gdb_errno::gdb_EINVAL);
           return gdb_action::none;
         }
 
@@ -2072,7 +2102,7 @@ private:
         if (cpu_id < arch_.cpu_count) {
           target_.set_cpu(cpu_id);
         } else {
-          send_error(detail::gdb_errno::gdb_EINVAL);
+          send_error(gdb_errno::gdb_EINVAL);
           return gdb_action::none;
         }
       }
