@@ -27,12 +27,15 @@
  *
  *     // Optional methods (detected automatically)
  *     // std::optional<gdbstub::register_info> get_register_info(int regno) { ... }
- *     bool set_breakpoint(size_t addr, breakpoint_type type) { ... }
- *     bool del_breakpoint(size_t addr, breakpoint_type type) { ... }
+     * // Return std::nullopt for success, or a gdbstub::detail::gdb_errno on failure.
+     * // Use gdbstub::detail::gdb_errno::gdb_EOPNOTSUPP_FEATURE for specific unsupported configurations to send an empty reply.
+     * std::optional<gdbstub::detail::gdb_errno> set_breakpoint(size_t addr, gdbstub::breakpoint_type type, size_t kind) { ... }
+     * std::optional<gdbstub::detail::gdb_errno> del_breakpoint(size_t addr, gdbstub::breakpoint_type type, size_t kind) { ... }
  *     std::optional<gdbstub::host_info> get_host_info() { ... }
  *     std::optional<gdbstub::process_info> get_process_info() { ... }
  *     std::optional<gdbstub::mem_region> get_mem_region_info(size_t addr) { ... }
  *     void on_interrupt() { ... }
+     * // void on_kill() { ... } // Optional: Called when 'k' (kill) packet is received
  * };
  *
  * // --- To enable writable registers with LLDB, you MUST use the target.xml ---
@@ -263,6 +266,7 @@ enum class gdb_errno : int {
   gdb_EBUSY = 0x10,  ///< Device or resource busy
   gdb_EINVAL = 0x16, ///< Invalid argument
   gdb_ENOSPC = 0x1c, ///< No space left on device
+  gdb_EOPNOTSUPP_FEATURE = 0x63, // Custom: Operation not supported for this specific feature/type/kind
 };
 
 // Protocol constants
@@ -474,8 +478,8 @@ template <typename T, typename = void> struct has_breakpoints : std::false_type 
 template <typename T>
 struct has_breakpoints<
     T, std::void_t<
-           decltype(std::declval<T&>().set_breakpoint(size_t{}, breakpoint_type{})),
-           decltype(std::declval<T&>().del_breakpoint(size_t{}, breakpoint_type{}))>> : std::true_type {};
+           decltype(std::declval<T&>().set_breakpoint(size_t{}, breakpoint_type{}, size_t{})),
+           decltype(std::declval<T&>().del_breakpoint(size_t{}, breakpoint_type{}, size_t{}))>> : std::true_type {};
 
 template <typename T, typename = void> struct has_cpu_ops : std::false_type {};
 template <typename T>
@@ -506,12 +510,18 @@ struct has_process_info<T, std::void_t<decltype(std::declval<T&>().get_process_i
 
 // Convenience aliases
 template <typename T> inline constexpr bool has_breakpoints_v = has_breakpoints<T>::value;
+
+template <typename T, typename = void> struct has_on_kill : std::false_type {};
+template <typename T>
+struct has_on_kill<T, std::void_t<decltype(std::declval<T&>().on_kill())>> : std::true_type {};
+
 template <typename T> inline constexpr bool has_cpu_ops_v = has_cpu_ops<T>::value;
 template <typename T> inline constexpr bool has_interrupt_v = has_interrupt<T>::value;
 template <typename T> inline constexpr bool has_host_info_v = has_host_info<T>::value;
 template <typename T> inline constexpr bool has_mem_region_info_v = has_mem_region_info<T>::value;
 template <typename T> inline constexpr bool has_register_info_v = has_register_info<T>::value;
 template <typename T> inline constexpr bool has_process_info_v = has_process_info<T>::value;
+template <typename T> inline constexpr bool has_on_kill_v = has_on_kill<T>::value;
 
 } // namespace detail
 
@@ -1028,8 +1038,8 @@ public:
       }
 
       auto action = process_current_packet();
-      if (action == gdb_action::shutdown) {
-        break;
+      if (action == gdb_action::shutdown || action == gdb_action::no_reply_shutdown) {
+        break; // Exit loop, will lead to stop()
       }
     }
 
@@ -1057,11 +1067,11 @@ public:
         rx_buffer_.mark_ack_sent();
       }
 
-      auto action = process_current_packet();
+      auto action = process_current_packet(); // 'k' handler will not call send_packet()
 
-      if (action == gdb_action::shutdown) {
-        transport_.disconnect();
-        if (on_detach) {
+      if (action == gdb_action::shutdown || action == gdb_action::no_reply_shutdown) {
+        transport_.disconnect(); // For 'k', this is the action after no reply.
+        if (on_detach) { // on_detach might be relevant for 'k' too.
           on_detach();
         }
       }
@@ -1304,6 +1314,14 @@ private:
       return handle_detach();
     case '!':
       return handle_extended_mode();
+    case 'k': // Kill request
+      GDBSTUB_LOG("[CMD k] Kill request received.");
+      if constexpr (detail::has_on_kill_v<Target>) {
+        target_.on_kill(); // Notify target if it implements on_kill()
+      }
+      // Per GDB protocol, 'k' packet has no reply.
+      // The session should terminate.
+      return gdb_action::no_reply_shutdown;
 
     default:
       GDBSTUB_LOG("[CMD %c] Unsupported command", cmd);
@@ -1648,11 +1666,18 @@ private:
         return gdb_action::none;
       }
       auto [type, addr, kind] = *bp;
-      (void) kind; // kind is unused for now but part of the protocol
-      GDBSTUB_LOG("[CMD Z] Insert breakpoint type %d at 0x%zx", type, addr);
-      bool ok = target_.set_breakpoint(addr, static_cast<breakpoint_type>(type));
-      GDBSTUB_LOG("[CMD Z] Result: %s", ok ? "OK" : "Error");
-      send_packet(ok ? "OK" : ""); // Empty string for not supported, OK for success
+      GDBSTUB_LOG("[CMD Z] Insert breakpoint type %d at 0x%zx, kind 0x%zx", type, addr, kind);
+      auto result = target_.set_breakpoint(addr, static_cast<breakpoint_type>(type), kind);
+      if (!result.has_value()) { // std::nullopt indicates success
+        GDBSTUB_LOG("[CMD Z] Result: OK");
+        send_packet("OK");
+      } else if (result.value() == detail::gdb_errno::gdb_EOPNOTSUPP_FEATURE) {
+        GDBSTUB_LOG("[CMD Z] Result: Not supported for this configuration");
+        send_packet(""); // Specific "feature not supported" reply
+      } else {
+        GDBSTUB_LOG("[CMD Z] Result: Error %02x", static_cast<int>(result.value()));
+        send_error(result.value()); // Other errors
+      }
     } else {
       GDBSTUB_LOG("[CMD Z] Not supported by target");
       send_packet("");
@@ -1668,11 +1693,18 @@ private:
         return gdb_action::none;
       }
       auto [type, addr, kind] = *bp;
-      (void) kind; // kind is unused for now but part of the protocol
-      GDBSTUB_LOG("[CMD z] Remove breakpoint type %d at 0x%zx", type, addr);
-      bool ok = target_.del_breakpoint(addr, static_cast<breakpoint_type>(type));
-      GDBSTUB_LOG("[CMD z] Result: %s", ok ? "OK" : "Error");
-      send_packet(ok ? "OK" : "");
+      GDBSTUB_LOG("[CMD z] Remove breakpoint type %d at 0x%zx, kind 0x%zx", type, addr, kind);
+      auto result = target_.del_breakpoint(addr, static_cast<breakpoint_type>(type), kind);
+      if (!result.has_value()) { // std::nullopt indicates success
+        GDBSTUB_LOG("[CMD z] Result: OK");
+        send_packet("OK");
+      } else if (result.value() == detail::gdb_errno::gdb_EOPNOTSUPP_FEATURE) {
+        GDBSTUB_LOG("[CMD z] Result: Not supported for this configuration");
+        send_packet(""); // Specific "feature not supported" reply
+      } else {
+        GDBSTUB_LOG("[CMD z] Result: Error %02x", static_cast<int>(result.value()));
+        send_error(result.value()); // Other errors
+      }
     } else {
       GDBSTUB_LOG("[CMD z] Not supported by target");
       send_packet("");
