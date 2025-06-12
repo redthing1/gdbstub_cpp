@@ -39,7 +39,6 @@ int main(int argc, char* argv[]) {
         .cpu_count = 1,
         .reg_count = 33,
         .pc_reg_num = 32,
-        .swap_registers_endianness = true
     };
 
     stub_server = std::make_unique<gdbstub::server<MockTarget>>(target, arch);

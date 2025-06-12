@@ -170,7 +170,6 @@ public:
       uint32_t zero = 0;
       std::memcpy(data, &zero, REG_SIZE);
     } else {
-      printf("Log register %d value: %08x\n", regno, regs[regno]);
       std::memcpy(data, &regs[regno], REG_SIZE);
     }
 
