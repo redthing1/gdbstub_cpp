@@ -707,7 +707,7 @@ version (Posix) {
          * @brief Listen on a Unix domain socket path.
          */
         bool listen(string path) {
-            GDBSTUB_LOG("[UNIX] Starting server on %s", path.ptr);
+            GDBSTUB_LOG("[UNIX] Starting server on %s", path);
             path_ = path;
             try {
                 // Manually unlink previous socket if it exists
@@ -720,7 +720,7 @@ version (Posix) {
                 listen_sock_.listen(1);
                 return true;
             } catch (SocketException e) {
-                GDBSTUB_LOG("[ERROR] Unix socket listen failed: %s", e.msg.ptr);
+                GDBSTUB_LOG("[ERROR] Unix socket listen failed: %s", e.msg);
                 return false;
             }
         }
@@ -1083,7 +1083,7 @@ private:
      */
     void send_error(gdb_errno error_code) {
         string buf = format("E%02x", cast(int) error_code);
-        GDBSTUB_LOG("[ERROR] Sending error response: %s", buf.ptr);
+        GDBSTUB_LOG("[ERROR] Sending error response: %s", buf);
         send_packet(buf);
     }
 
@@ -1767,7 +1767,7 @@ private:
             auto region = target_.get_mem_region_info(addr);
             if (!region.isNull && region.get.size > 0) {
                 send_packet(format(
-                    "start:%0*zx;size:%0*zx;permissions:%s;", (size_t.sizeof * 2),
+                    "start:%0*x;size:%0*x;permissions:%s;", (size_t.sizeof * 2),
                     region.get.start, (size_t.sizeof * 2), region.get.size, region.get.permissions
                 ));
             } else {
@@ -2023,7 +2023,7 @@ private:
         }
 
         if (watch_type_str !is null) {
-            reply.put(format("%s:%0*zx;", watch_type_str, size_t.sizeof * 2, reason.addr));
+            reply.put(format("%s:%0*x;", watch_type_str, size_t.sizeof * 2, reason.addr));
         }
 
         // include the current thread

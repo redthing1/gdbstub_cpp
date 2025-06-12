@@ -26,6 +26,8 @@ void main(string[] args) {
     stdout.flush();
 
     try {
+        target.reset(); // Initialize the target to a known state
+        
         auto arch = arch_info(
             MockTarget.riscv32_target_xml,
             "org.gnu.gdb.riscv.cpu",
