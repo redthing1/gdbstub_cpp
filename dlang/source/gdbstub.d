@@ -30,12 +30,15 @@
  *
  *     // Optional methods (detected automatically)
  *     // Nullable!register_info get_register_info(int regno) { ... }
- *     // bool set_breakpoint(size_t addr, breakpoint_type type) { ... }
- *     // bool del_breakpoint(size_t addr, breakpoint_type type) { ... }
+ *     // Return Nullable!gdb_errno.init for success, or a gdb_errno value on failure.
+ *     // Use gdb_errno.gdb_EOPNOTSUPP_FEATURE for specific unsupported configurations to send an empty reply.
+ *     // Nullable!gdb_errno set_breakpoint(size_t addr, breakpoint_type type, size_t kind) { ... }
+ *     // Nullable!gdb_errno del_breakpoint(size_t addr, breakpoint_type type, size_t kind) { ... }
  *     // Nullable!host_info get_host_info() { ... }
  *     // Nullable!process_info get_process_info() { ... }
  *     // Nullable!mem_region get_mem_region_info(size_t addr) { ... }
  *     // void on_interrupt() { ... }
+ *     // void on_kill() { ... } // Optional: Called when 'k' (kill) packet is received
  * };
  *
  * // --- To enable writable registers with LLDB, you MUST use the target.xml ---
@@ -105,9 +108,10 @@ version (GDBSTUB_DEBUG) {
  * @deprecated This is now internal. The public API uses std.typecons.Nullable!stop_reason.
  */
 enum gdb_action {
-    none,    ///< No special action, continue debugging normally
-    stop,    ///< Target hit breakpoint or completed step, send stop reply
-    shutdown ///< Target wants to terminate debugging session
+    none,               ///< No special action, continue debugging normally
+    stop,               ///< Target hit breakpoint or completed step, send stop reply
+    shutdown,           ///< Target wants to terminate debugging session
+    no_reply_shutdown   ///< Target wants to terminate without sending a reply (for 'k' kill command)
 }
 
 /**
@@ -232,12 +236,6 @@ struct register_info {
     int dwarf_regnum = -1;                    ///< DWARF register number
 }
 
-// =============================================================================
-// Implementation details
-// =============================================================================
-
-private {
-
 // GDB protocol error codes (subset of standard errno values)
 enum gdb_errno : int {
     gdb_EPERM = 0x01,  ///< Operation not permitted
@@ -249,7 +247,14 @@ enum gdb_errno : int {
     gdb_EBUSY = 0x10,  ///< Device or resource busy
     gdb_EINVAL = 0x16, ///< Invalid argument
     gdb_ENOSPC = 0x1c, ///< No space left on device
+    gdb_EOPNOTSUPP_FEATURE = 0x63, // Custom: Operation not supported for this specific feature/type/kind
 }
+
+// =============================================================================
+// Implementation details
+// =============================================================================
+
+private {
 
 // Protocol constants
 enum : size_t {
@@ -355,8 +360,8 @@ void swap_bytes(void* data, size_t size) {
 // D's version is much cleaner using `__traits(compiles)`.
 enum bool has_breakpoints(T) = __traits(compiles, {
     T t;
-    t.set_breakpoint(0, breakpoint_type.software);
-    t.del_breakpoint(0, breakpoint_type.software);
+    t.set_breakpoint(0, breakpoint_type.software, 0);
+    t.del_breakpoint(0, breakpoint_type.software, 0);
 });
 
 enum bool has_cpu_ops(T) = __traits(compiles, {
@@ -366,6 +371,7 @@ enum bool has_cpu_ops(T) = __traits(compiles, {
 });
 
 enum bool has_interrupt(T) = __traits(compiles, (T t) => t.on_interrupt());
+enum bool has_on_kill(T) = __traits(compiles, (T t) => t.on_kill());
 enum bool has_host_info(T) = __traits(compiles, (T t) => t.get_host_info());
 enum bool has_mem_region_info(T) = __traits(compiles, (T t) => t.get_mem_region_info(0));
 enum bool has_register_info(T) = __traits(compiles, (T t) => t.get_register_info(0));
@@ -920,8 +926,8 @@ public:
             }
 
             auto action = process_current_packet();
-            if (action == gdb_action.shutdown) {
-                break;
+            if (action == gdb_action.shutdown || action == gdb_action.no_reply_shutdown) {
+                break; // Exit loop, will lead to stop()
             }
         }
 
@@ -949,11 +955,11 @@ public:
                 rx_buffer_.mark_ack_sent();
             }
 
-            auto action = process_current_packet();
+            auto action = process_current_packet(); // 'k' handler will not call send_packet()
 
-            if (action == gdb_action.shutdown) {
-                transport_.disconnect();
-                if (on_detach) {
+            if (action == gdb_action.shutdown || action == gdb_action.no_reply_shutdown) {
+                transport_.disconnect(); // For 'k', this is the action after no reply.
+                if (on_detach) { // on_detach might be relevant for 'k' too.
                     on_detach();
                 }
             }
@@ -1196,6 +1202,14 @@ private:
             return handle_detach();
         case '!':
             return handle_extended_mode();
+        case 'k': // Kill request
+            GDBSTUB_LOG("[CMD k] Kill request received.");
+            static if (has_on_kill!Target) {
+                target_.on_kill(); // Notify target if it implements on_kill()
+            }
+            // Per GDB protocol, 'k' packet has no reply.
+            // The session should terminate.
+            return gdb_action.no_reply_shutdown;
 
         default:
             GDBSTUB_LOG("[CMD %c] Unsupported command", cmd);
@@ -1548,11 +1562,19 @@ private:
             }
             auto type = bp.get[0];
             auto addr = bp.get[1];
-            // auto kind = bp.get.kind; // kind is unused for now but part of the protocol
-            GDBSTUB_LOG("[CMD Z] Insert breakpoint type %d at 0x%x", type, addr);
-            bool ok = target_.set_breakpoint(addr, cast(breakpoint_type) type);
-            GDBSTUB_LOG("[CMD Z] Result: %s", ok ? "OK" : "Error");
-            send_packet(ok ? "OK" : ""); // Empty string for not supported, OK for success
+            auto kind = bp.get[2];
+            GDBSTUB_LOG("[CMD Z] Insert breakpoint type %d at 0x%x, kind 0x%x", type, addr, kind);
+            auto result = target_.set_breakpoint(addr, cast(breakpoint_type) type, kind);
+            if (result.isNull) { // Nullable!gdb_errno.init indicates success
+                GDBSTUB_LOG("[CMD Z] Result: OK");
+                send_packet("OK");
+            } else if (result.get == gdb_errno.gdb_EOPNOTSUPP_FEATURE) {
+                GDBSTUB_LOG("[CMD Z] Result: Not supported for this configuration");
+                send_packet(""); // Specific "feature not supported" reply
+            } else {
+                GDBSTUB_LOG("[CMD Z] Result: Error %02x", cast(int)result.get);
+                send_error(result.get); // Other errors
+            }
         } else {
             GDBSTUB_LOG("[CMD Z] Not supported by target");
             send_packet("");
@@ -1569,11 +1591,19 @@ private:
             }
             auto type = bp.get[0];
             auto addr = bp.get[1];
-            // auto kind = bp.get.kind; // kind is unused for now but part of the protocol
-            GDBSTUB_LOG("[CMD z] Remove breakpoint type %d at 0x%x", type, addr);
-            bool ok = target_.del_breakpoint(addr, cast(breakpoint_type) type);
-            GDBSTUB_LOG("[CMD z] Result: %s", ok ? "OK" : "Error");
-            send_packet(ok ? "OK" : "");
+            auto kind = bp.get[2];
+            GDBSTUB_LOG("[CMD z] Remove breakpoint type %d at 0x%x, kind 0x%x", type, addr, kind);
+            auto result = target_.del_breakpoint(addr, cast(breakpoint_type) type, kind);
+            if (result.isNull) { // Nullable!gdb_errno.init indicates success
+                GDBSTUB_LOG("[CMD z] Result: OK");
+                send_packet("OK");
+            } else if (result.get == gdb_errno.gdb_EOPNOTSUPP_FEATURE) {
+                GDBSTUB_LOG("[CMD z] Result: Not supported for this configuration");
+                send_packet(""); // Specific "feature not supported" reply
+            } else {
+                GDBSTUB_LOG("[CMD z] Result: Error %02x", cast(int)result.get);
+                send_error(result.get); // Other errors
+            }
         } else {
             GDBSTUB_LOG("[CMD z] Not supported by target");
             send_packet("");

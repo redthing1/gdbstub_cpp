@@ -230,24 +230,26 @@ struct MockTarget {
     }
 
     /**
-     * Set breakpoint
+     * Set breakpoint - updated for new interface
      */
-    bool set_breakpoint(size_t addr, breakpoint_type type) {
+    Nullable!gdb_errno set_breakpoint(size_t addr, breakpoint_type type, size_t kind) {
+        // kind parameter not used in mock but required by interface
         breakpoints[cast(uint)addr] = type;
-        return true;
+        return typeof(return).init; // Success (Nullable!gdb_errno.init)
     }
 
     /**
-     * Delete breakpoint
+     * Delete breakpoint - updated for new interface
      */
-    bool del_breakpoint(size_t addr, breakpoint_type type) {
+    Nullable!gdb_errno del_breakpoint(size_t addr, breakpoint_type type, size_t kind) {
+        // kind parameter not used in mock but required by interface
         uint bp_addr = cast(uint)addr;
         auto bp_ptr = bp_addr in breakpoints;
         if (bp_ptr !is null && *bp_ptr == type) {
             breakpoints.remove(bp_addr);
-            return true;
+            return typeof(return).init; // Success (Nullable!gdb_errno.init)
         }
-        return false;
+        return nullable(gdb_errno.gdb_EINVAL); // Error - breakpoint not found or type mismatch
     }
 
     /**
