@@ -33,8 +33,8 @@ int main(int argc, char* argv[]) {
 
   try {
     gdbstub::arch_info arch = {
-        .target_desc = nullptr,
-        .xml_architecture_name = nullptr,
+        .target_desc = MockTarget::riscv32_target_xml,
+        .xml_architecture_name = "org.gnu.gdb.riscv.cpu",
         .osabi = "bare",
         .cpu_count = 1,
         .reg_count = 33,

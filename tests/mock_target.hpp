@@ -3,8 +3,8 @@
 #include "../src/gdbstub.hpp"
 #include <array>
 #include <cstdint>
-#include <cstdio>
 #include <cstring>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -26,6 +26,51 @@ public:
   static constexpr int PC_REG = 32;
   static constexpr size_t REG_SIZE = 4; // 32-bit registers
 
+  // --- GDB Target Description XML for RISC-V 32-bit ---
+  // This is the modern, standard way to describe the target's registers.
+  // It is required for full compatibility with GDB and LLDB, especially for writable registers.
+  static constexpr const char* riscv32_target_xml =
+      "<?xml version=\"1.0\"?>"
+      "<!DOCTYPE target SYSTEM \"gdb-target.dtd\">"
+      "<target version=\"1.0\">"
+      "  <architecture>riscv:rv32</architecture>"
+      "  <feature name=\"org.gnu.gdb.riscv.cpu\">"
+      "    <reg name=\"x0\" bitsize=\"32\" regnum=\"0\" type=\"int32\" altname=\"zero\"/>"
+      "    <reg name=\"x1\" bitsize=\"32\" regnum=\"1\" type=\"code_ptr\" altname=\"ra\"/>"
+      "    <reg name=\"x2\" bitsize=\"32\" regnum=\"2\" type=\"data_ptr\" altname=\"sp\"/>"
+      "    <reg name=\"x3\" bitsize=\"32\" regnum=\"3\" type=\"data_ptr\" altname=\"gp\"/>"
+      "    <reg name=\"x4\" bitsize=\"32\" regnum=\"4\" type=\"data_ptr\" altname=\"tp\"/>"
+      "    <reg name=\"x5\" bitsize=\"32\" regnum=\"5\" type=\"int32\" altname=\"t0\"/>"
+      "    <reg name=\"x6\" bitsize=\"32\" regnum=\"6\" type=\"int32\" altname=\"t1\"/>"
+      "    <reg name=\"x7\" bitsize=\"32\" regnum=\"7\" type=\"int32\" altname=\"t2\"/>"
+      "    <reg name=\"x8\" bitsize=\"32\" regnum=\"8\" type=\"int32\" altname=\"s0\"/>"
+      "    <reg name=\"x9\" bitsize=\"32\" regnum=\"9\" type=\"int32\" altname=\"s1\"/>"
+      "    <reg name=\"x10\" bitsize=\"32\" regnum=\"10\" type=\"int32\" altname=\"a0\"/>"
+      "    <reg name=\"x11\" bitsize=\"32\" regnum=\"11\" type=\"int32\" altname=\"a1\"/>"
+      "    <reg name=\"x12\" bitsize=\"32\" regnum=\"12\" type=\"int32\" altname=\"a2\"/>"
+      "    <reg name=\"x13\" bitsize=\"32\" regnum=\"13\" type=\"int32\" altname=\"a3\"/>"
+      "    <reg name=\"x14\" bitsize=\"32\" regnum=\"14\" type=\"int32\" altname=\"a4\"/>"
+      "    <reg name=\"x15\" bitsize=\"32\" regnum=\"15\" type=\"int32\" altname=\"a5\"/>"
+      "    <reg name=\"x16\" bitsize=\"32\" regnum=\"16\" type=\"int32\" altname=\"a6\"/>"
+      "    <reg name=\"x17\" bitsize=\"32\" regnum=\"17\" type=\"int32\" altname=\"a7\"/>"
+      "    <reg name=\"x18\" bitsize=\"32\" regnum=\"18\" type=\"int32\" altname=\"s2\"/>"
+      "    <reg name=\"x19\" bitsize=\"32\" regnum=\"19\" type=\"int32\" altname=\"s3\"/>"
+      "    <reg name=\"x20\" bitsize=\"32\" regnum=\"20\" type=\"int32\" altname=\"s4\"/>"
+      "    <reg name=\"x21\" bitsize=\"32\" regnum=\"21\" type=\"int32\" altname=\"s5\"/>"
+      "    <reg name=\"x22\" bitsize=\"32\" regnum=\"22\" type=\"int32\" altname=\"s6\"/>"
+      "    <reg name=\"x23\" bitsize=\"32\" regnum=\"23\" type=\"int32\" altname=\"s7\"/>"
+      "    <reg name=\"x24\" bitsize=\"32\" regnum=\"24\" type=\"int32\" altname=\"s8\"/>"
+      "    <reg name=\"x25\" bitsize=\"32\" regnum=\"25\" type=\"int32\" altname=\"s9\"/>"
+      "    <reg name=\"x26\" bitsize=\"32\" regnum=\"26\" type=\"int32\" altname=\"s10\"/>"
+      "    <reg name=\"x27\" bitsize=\"32\" regnum=\"27\" type=\"int32\" altname=\"s11\"/>"
+      "    <reg name=\"x28\" bitsize=\"32\" regnum=\"28\" type=\"int32\" altname=\"t3\"/>"
+      "    <reg name=\"x29\" bitsize=\"32\" regnum=\"29\" type=\"int32\" altname=\"t4\"/>"
+      "    <reg name=\"x30\" bitsize=\"32\" regnum=\"30\" type=\"int32\" altname=\"t5\"/>"
+      "    <reg name=\"x31\" bitsize=\"32\" regnum=\"31\" type=\"int32\" altname=\"t6\"/>"
+      "    <reg name=\"pc\" bitsize=\"32\" regnum=\"32\" type=\"code_ptr\"/>"
+      "  </feature>"
+      "</target>";
+
   // Register storage (x0-x31 + PC)
   std::array<uint32_t, NUM_REGS> regs{};
 
@@ -39,7 +84,7 @@ public:
   bool running = false;
   bool hit_breakpoint = false;
   uint32_t breakpoint_addr = 0;
-  
+
   // CPU/Thread state (for SMP support)
   int current_cpu = 0;
 
@@ -116,7 +161,6 @@ public:
    * Read register value
    */
   int read_reg(int regno, void* data) {
-    printf("Reading register %d\n", regno);
     if (regno < 0 || regno >= NUM_REGS || !data) {
       return -1;
     }
@@ -231,11 +275,7 @@ public:
    */
   std::optional<gdbstub::process_info> get_process_info() {
     return gdbstub::process_info{
-        .pid = 1,
-        .triple = "riscv32-unknown-elf",
-        .endian = "little",
-        .ostype = "bare",
-        .ptr_size = 4
+        .pid = 1, .triple = "riscv32-unknown-elf", .endian = "little", .ostype = "bare", .ptr_size = 4
     };
   }
 
@@ -267,9 +307,9 @@ public:
   /**
    * Set current CPU/thread ID (required for thread support)
    */
-  void set_cpu(int cpu_id) { 
-    if (cpu_id >= 0 && cpu_id < 1) {  // We only have 1 CPU for now
-      current_cpu = cpu_id; 
+  void set_cpu(int cpu_id) {
+    if (cpu_id >= 0 && cpu_id < 1) { // We only have 1 CPU for now
+      current_cpu = cpu_id;
     }
   }
 
@@ -304,60 +344,4 @@ public:
    * Get number of breakpoints
    */
   size_t get_breakpoint_count() const { return breakpoints.size(); }
-
-  /**
-   * Get register info for qRegisterInfo packets (optional - enhances LLDB experience)
-   */
-  std::optional<gdbstub::register_info> get_register_info(int regno) {
-    if (regno < 0 || regno >= NUM_REGS) {
-      return std::nullopt;
-    }
-
-    gdbstub::register_info info;
-    info.bitsize = REG_SIZE * 8; // 32 bits
-    info.offset = regno * REG_SIZE; // Offset in 'g' packet
-    info.encoding = "uint";
-    info.format = "hex";
-    info.set = "General Purpose Registers";
-
-    if (regno == 0) {
-      info.name = "x0";
-      info.alt_name = "zero";
-      info.generic = "fp"; // Frame pointer (not really, but for demo)
-    } else if (regno == 1) {
-      info.name = "x1";
-      info.alt_name = "ra";
-      info.generic = "ra"; // Return address
-    } else if (regno == 2) {
-      info.name = "x2";
-      info.alt_name = "sp";
-      info.generic = "sp"; // Stack pointer
-    } else if (regno == PC_REG) {
-      info.name = "pc";
-      info.alt_name = "pc";
-      info.generic = "pc"; // Program counter
-      info.set = "Program Counter";
-    } else {
-      // General purpose registers x3-x31
-      // Use a static array to hold all register names
-      static std::array<std::string, 32> reg_names = {
-        "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7",
-        "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15",
-        "x16", "x17", "x18", "x19", "x20", "x21", "x22", "x23",
-        "x24", "x25", "x26", "x27", "x28", "x29", "x30", "x31"
-      };
-      if (regno < 32) {
-        info.name = reg_names[regno].c_str();
-      }
-    }
-
-    // Set DWARF register numbers (RISC-V convention)
-    if (regno < 32) {
-      info.dwarf_regnum = regno;
-    } else if (regno == PC_REG) {
-      info.dwarf_regnum = 32; // PC is DWARF register 32 in RISC-V
-    }
-
-    return info;
-  }
 };
