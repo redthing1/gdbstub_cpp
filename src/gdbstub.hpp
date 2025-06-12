@@ -41,7 +41,6 @@
  * my_emulator emu;
  * gdbstub::arch_info arch = {
  *   // By providing a target_desc, you enable the modern qXfer:features:read protocol.
- *   // This is the *only* standards-compliant way to get writable registers in LLDB.
  *   .target_desc = my_target_xml,
  *   .xml_architecture_name = "org.gnu.gdb.riscv.cpu", // Must match a <feature> in the XML
  *
