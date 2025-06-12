@@ -29,7 +29,7 @@
  *     int read_mem(size_t addr, size_t len, void* data) { ... }
  *     int write_mem(size_t addr, size_t len, const void* data) { ... }
  *
- *     // Optional methods for enhanced features (detected automatically)
+ *     // Optional methods (detected automatically)
  *     bool set_breakpoint(size_t addr, breakpoint_type type) { ... }
  *     bool del_breakpoint(size_t addr, breakpoint_type type) { ... }
  *     gdbstub::host_info get_host_info() { return {"riscv64-unknown-elf", "little", 8}; }
@@ -94,7 +94,10 @@
 // Uncomment to enable packet-level debugging output
 // #define GDBSTUB_DEBUG
 #ifdef GDBSTUB_DEBUG
-#define GDBSTUB_LOG(fmt, ...) printf("[GDBSTUB] " fmt "\n", ##__VA_ARGS__)
+#define GDBSTUB_LOG(fmt, ...)                                                                                          \
+  do {                                                                                                                 \
+    fprintf(stderr, "[GDBSTUB] " fmt "\n", ##__VA_ARGS__);                                                             \
+  } while (0)
 #else
 #define GDBSTUB_LOG(fmt, ...)                                                                                          \
   do {                                                                                                                 \
@@ -112,7 +115,7 @@ namespace gdbstub {
  */
 enum class gdb_action {
   none,    ///< No special action, continue debugging normally
-  resume,  ///< Target hit breakpoint or completed step, send stop reply
+  stop,    ///< Target hit breakpoint or completed step, send stop reply
   shutdown ///< Target wants to terminate debugging session
 };
 
@@ -612,6 +615,7 @@ public:
    * @param address Format: "host:port", e.g., "localhost:1234" or "*:1234".
    */
   bool listen(const char* address) {
+    GDBSTUB_LOG("Starting TCP server on %s", address);
     std::string addr_str(address);
 
     auto colon_pos = addr_str.rfind(':');
@@ -669,11 +673,14 @@ public:
    * @brief Accept an incoming connection.
    */
   bool accept() {
+    GDBSTUB_LOG("Waiting for debugger connection...");
     auto sock = ::accept(listen_sock_.get(), nullptr, nullptr);
     if (sock == detail::invalid_socket) {
+      GDBSTUB_LOG("Failed to accept connection");
       return false;
     }
     conn_sock_ = detail::socket(sock);
+    GDBSTUB_LOG("Debugger connected successfully");
     return true;
   }
 
@@ -749,11 +756,14 @@ public:
   }
 
   bool accept() {
+    GDBSTUB_LOG("Waiting for debugger connection...");
     auto sock = ::accept(listen_sock_.get(), nullptr, nullptr);
     if (sock == detail::invalid_socket) {
+      GDBSTUB_LOG("Failed to accept connection");
       return false;
     }
     conn_sock_ = detail::socket(sock);
+    GDBSTUB_LOG("Debugger connected successfully");
     return true;
   }
 
@@ -1005,6 +1015,7 @@ private:
    * @brief Handle an interrupt signal (^C) from the debugger.
    */
   void handle_interrupt() {
+    GDBSTUB_LOG("Interrupt received (Ctrl+C)");
     if constexpr (detail::has_interrupt_v<Target>) {
       target_.on_interrupt();
     }
@@ -1056,6 +1067,7 @@ private:
   void send_error(detail::gdb_errno error_code) {
     char buf[8];
     std::snprintf(buf, sizeof(buf), "E%02x", static_cast<int>(error_code));
+    GDBSTUB_LOG("Sending error E%02x", static_cast<int>(error_code));
     send_packet(buf);
   }
 
@@ -1109,6 +1121,7 @@ private:
    * @brief Dispatch a command based on the first character of the packet payload.
    */
   gdb_action dispatch_command(std::string_view payload) {
+    GDBSTUB_LOG("RX: %.*s", static_cast<int>(payload.size()), payload.data());
     if (payload.empty()) {
       send_packet("");
       return gdb_action::none;
@@ -1186,6 +1199,7 @@ private:
    * g - Read all registers.
    */
   gdb_action handle_read_all_registers() {
+    GDBSTUB_LOG("Action: Reading all registers");
     size_t total_size = 0;
     for (int i = 0; i < arch_.reg_count; ++i) {
       size_t reg_size = target_.reg_size(i);
@@ -1225,6 +1239,7 @@ private:
    * G - Write all registers.
    */
   gdb_action handle_write_all_registers(std::string_view args) {
+    GDBSTUB_LOG("Action: Writing all registers");
     size_t pos = 0;
     for (int i = 0; i < arch_.reg_count; ++i) {
       size_t reg_size = target_.reg_size(i);
@@ -1261,6 +1276,7 @@ private:
       return gdb_action::none;
     }
 
+    GDBSTUB_LOG("Action: Reading register %d", regno);
     size_t reg_size = target_.reg_size(regno);
     if (reg_size == 0 || reg_size > detail::MAX_REG_SIZE) {
       send_error(detail::gdb_errno::gdb_EINVAL);
@@ -1304,6 +1320,7 @@ private:
       return gdb_action::none;
     }
 
+    GDBSTUB_LOG("Action: Writing register %d (size %zu)", regno, reg_size);
     ensure_buffer_size(reg_buffer_, reg_size);
     if (!detail::hex_to_bytes(hex_data.data(), hex_data.size(), reg_buffer_.data())) {
       send_error(detail::gdb_errno::gdb_EINVAL);
@@ -1311,6 +1328,7 @@ private:
     }
 
     if (target_.write_reg(regno, reg_buffer_.data()) != 0) {
+      GDBSTUB_LOG("Error: target_.write_reg failed");
       send_error(detail::gdb_errno::gdb_EFAULT);
       return gdb_action::none;
     }
@@ -1339,6 +1357,7 @@ private:
     }
 
     len = std::min(len, detail::MAX_MEMORY_READ);
+    GDBSTUB_LOG("Action: Reading memory at 0x%zx, length %zu", addr, len);
     std::vector<uint8_t> data(len);
 
     if (target_.read_mem(addr, len, data.data()) != 0) {
@@ -1378,6 +1397,7 @@ private:
       return gdb_action::none;
     }
 
+    GDBSTUB_LOG("Action: Writing memory at 0x%zx, length %zu", addr, len);
     auto hex_data = args.substr(colon_pos + 1);
     if (hex_data.size() != len * 2) {
       send_error(detail::gdb_errno::gdb_EINVAL);
@@ -1445,6 +1465,7 @@ private:
    * c - Continue execution.
    */
   gdb_action handle_continue() {
+    GDBSTUB_LOG("Action: Continue execution");
     async_io_enabled_.store(true, std::memory_order_relaxed);
     if (on_continue) {
       on_continue();
@@ -1453,7 +1474,7 @@ private:
     auto action = target_.cont();
 
     async_io_enabled_.store(false, std::memory_order_relaxed);
-    if (action == gdb_action::resume) {
+    if (action == gdb_action::stop) {
       send_stop_reply();
       if (on_break) {
         on_break();
@@ -1466,13 +1487,14 @@ private:
    * s - Step one instruction.
    */
   gdb_action handle_step() {
+    GDBSTUB_LOG("Action: Step one instruction");
     if (on_continue) {
       on_continue();
     }
 
     auto action = target_.stepi();
 
-    if (action == gdb_action::resume) {
+    if (action == gdb_action::stop) {
       send_stop_reply();
       if (on_break) {
         on_break();
@@ -1520,7 +1542,9 @@ private:
       }
       auto [type, addr, kind] = *bp;
       (void) kind; // kind is unused for now but part of the protocol
+      GDBSTUB_LOG("Action: Inserting breakpoint type %d at 0x%zx", type, addr);
       bool ok = target_.set_breakpoint(addr, static_cast<breakpoint_type>(type));
+      GDBSTUB_LOG("Result: %s", ok ? "OK" : "Error");
       send_packet(ok ? "OK" : "E22"); // E22 is EINVAL
     } else {
       send_packet(""); // Not supported
@@ -1540,7 +1564,9 @@ private:
       }
       auto [type, addr, kind] = *bp;
       (void) kind; // kind is unused for now but part of the protocol
+      GDBSTUB_LOG("Action: Removing breakpoint type %d at 0x%zx", type, addr);
       bool ok = target_.del_breakpoint(addr, static_cast<breakpoint_type>(type));
+      GDBSTUB_LOG("Result: %s", ok ? "OK" : "Error");
       send_packet(ok ? "OK" : "E22"); // E22 is EINVAL
     } else {
       send_packet(""); // Not supported
@@ -1554,6 +1580,7 @@ private:
   gdb_action handle_query(std::string_view args) {
     auto colon_pos = args.find(':');
     auto query_name = colon_pos != std::string_view::npos ? args.substr(0, colon_pos) : args;
+    GDBSTUB_LOG("Action: Query '%.*s'", static_cast<int>(query_name.size()), query_name.data());
 
     if (query_name == "Supported") {
       // qSupported - GDB/LLDB's feature negotiation packet.
@@ -1700,9 +1727,11 @@ private:
       }
 
       auto region = target_.get_mem_region_info(addr);
-      if (region.size > 0) {
+      if (region && region->size > 0) {
         char buf[256];
-        snprintf(buf, sizeof(buf), "start:%zx;size:%zx;permissions:%s;", region.start, region.size, region.permissions);
+        snprintf(
+            buf, sizeof(buf), "start:%zx;size:%zx;permissions:%s;", region->start, region->size, region->permissions
+        );
         send_packet(buf);
       } else {
         send_error(detail::gdb_errno::gdb_EFAULT); // No such region
