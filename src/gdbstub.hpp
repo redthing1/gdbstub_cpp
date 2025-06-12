@@ -26,19 +26,25 @@
  *     int write_mem(size_t addr, size_t len, const void* data) { ... }
  *
  *     // Optional methods (detected automatically)
+ *     // std::optional<gdbstub::register_info> get_register_info(int regno) { ... }
  *     bool set_breakpoint(size_t addr, breakpoint_type type) { ... }
  *     bool del_breakpoint(size_t addr, breakpoint_type type) { ... }
  *     std::optional<gdbstub::host_info> get_host_info() { ... }
  *     std::optional<gdbstub::process_info> get_process_info() { ... }
  *     std::optional<gdbstub::mem_region> get_mem_region_info(size_t addr) { ... }
- *     std::optional<gdbstub::register_info> get_register_info(int regno) { ... }
  *     void on_interrupt() { ... }
  * };
  *
+ * // --- To enable writable registers with LLDB, you MUST use the target.xml ---
+ * const char* my_target_xml = "<?xml ... </target>"; // See GDB docs for format
+ *
  * my_emulator emu;
  * gdbstub::arch_info arch = {
- *   .target_desc = "...", // User-provided GDB target.xml
- *   .xml_architecture_name = "riscv", // For 'xmlRegisters' GDB feature
+ *   // By providing a target_desc, you enable the modern qXfer:features:read protocol.
+ *   // This is the *only* standards-compliant way to get writable registers in LLDB.
+ *   .target_desc = my_target_xml,
+ *   .xml_architecture_name = "org.gnu.gdb.riscv.cpu", // Must match a <feature> in the XML
+ *
  *   .osabi = "bare",
  *   .reg_count = 33,
  *   .pc_reg_num = 32
@@ -173,11 +179,12 @@ enum class breakpoint_type {
  */
 struct arch_info {
   /// The full XML content for GDB's target description.
-  /// The user is responsible for creating this valid XML string.
+  /// Providing this enables the modern `qXfer:features:read` protocol.
   const char* target_desc = nullptr;
 
-  /// The name GDB uses to identify the register set in the XML.
-  /// e.g., "riscv", "org.gnu.gdb.i386.core". This is used for 'xmlRegisters=...'.
+  /// The name GDB/LLDB uses to identify the register set in the XML.
+  /// Must match a <feature name="..."> in your target_desc XML.
+  /// e.g., "org.gnu.gdb.riscv.cpu".
   const char* xml_architecture_name = nullptr;
 
   /// Optional OS ABI string, e.g., "GNU/Linux", "bare".
