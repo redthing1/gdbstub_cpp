@@ -28,6 +28,7 @@
  *     // Optional methods (detected automatically)
  *     bool set_breakpoint(size_t addr, breakpoint_type type) { ... }
  *     bool del_breakpoint(size_t addr, breakpoint_type type) { ... }
+ *     std::optional<gdbstub::host_info> get_host_info() { ... }
  *     std::optional<gdbstub::process_info> get_process_info() { ... }
  *     std::optional<gdbstub::mem_region> get_mem_region_info(size_t addr) { ... }
  *     std::optional<gdbstub::register_info> get_register_info(int regno) { ... }
@@ -185,6 +186,19 @@ struct arch_info {
   int cpu_count = 1;   ///< Number of CPUs/cores for SMP systems.
   int reg_count = 0;   ///< Number of registers in the target architecture.
   int pc_reg_num = -1; ///< Register number of the Program Counter (PC).
+};
+
+/**
+ * @brief Information about the host system, for `qHostInfo`.
+ */
+struct host_info {
+  const char* triple = "unknown-unknown-unknown"; ///< Target triple.
+  const char* endian = "little";                  ///< "little", "big", or "pdp".
+  int ptr_size = 0;                               ///< Pointer size in bytes.
+  const char* hostname = "gdbstub";               ///< Hostname of the target.
+  const char* os_version = nullptr;               ///< OS version string.
+  const char* os_build = nullptr;                 ///< OS build string.
+  const char* os_kernel = nullptr;                ///< OS kernel string.
 };
 
 /**
@@ -455,6 +469,10 @@ template <typename T, typename = void> struct has_interrupt : std::false_type {}
 template <typename T>
 struct has_interrupt<T, std::void_t<decltype(std::declval<T&>().on_interrupt())>> : std::true_type {};
 
+template <typename T, typename = void> struct has_host_info : std::false_type {};
+template <typename T>
+struct has_host_info<T, std::void_t<decltype(std::declval<T&>().get_host_info())>> : std::true_type {};
+
 template <typename T, typename = void> struct has_mem_region_info : std::false_type {};
 template <typename T>
 struct has_mem_region_info<T, std::void_t<decltype(std::declval<T&>().get_mem_region_info(size_t{}))>>
@@ -472,6 +490,7 @@ struct has_process_info<T, std::void_t<decltype(std::declval<T&>().get_process_i
 template <typename T> inline constexpr bool has_breakpoints_v = has_breakpoints<T>::value;
 template <typename T> inline constexpr bool has_cpu_ops_v = has_cpu_ops<T>::value;
 template <typename T> inline constexpr bool has_interrupt_v = has_interrupt<T>::value;
+template <typename T> inline constexpr bool has_host_info_v = has_host_info<T>::value;
 template <typename T> inline constexpr bool has_mem_region_info_v = has_mem_region_info<T>::value;
 template <typename T> inline constexpr bool has_register_info_v = has_register_info<T>::value;
 template <typename T> inline constexpr bool has_process_info_v = has_process_info<T>::value;
@@ -1636,7 +1655,7 @@ private:
 
     if (query_name == "Supported") {
       std::string features;
-      char buf[128];
+      char buf[256];
       snprintf(buf, sizeof(buf), "PacketSize=%zx;vContSupported+", detail::MAX_PACKET_SIZE);
       features = buf;
 
@@ -1646,6 +1665,9 @@ private:
       }
       if constexpr (detail::has_breakpoints_v<Target>) {
         features += ";swbreak+;hwbreak+";
+      }
+      if constexpr (detail::has_host_info_v<Target>) {
+        features += ";qHostInfo+";
       }
       if constexpr (detail::has_register_info_v<Target>) {
         features += ";qRegisterInfo+";
@@ -1685,6 +1707,8 @@ private:
       send_packet("OK");
     } else if (query_name == "Xfer") {
       handle_xfer(args.substr(5)); // Skip "Xfer:"
+    } else if (query_name == "HostInfo") {
+      handle_host_info();
     } else if (query_name == "MemoryRegionInfo") {
       handle_memory_region_info(args.substr(17)); // Skip "MemoryRegionInfo:"
     } else if (query_name.rfind("RegisterInfo", 0) == 0) {
@@ -1751,6 +1775,42 @@ private:
     response += (offset + to_send >= desc.size()) ? 'l' : 'm';
     response.append(desc.data() + offset, to_send);
     send_packet(response);
+  }
+
+  void handle_host_info() {
+    if constexpr (detail::has_host_info_v<Target>) {
+      GDBSTUB_LOG("[qHostInfo] Responding with host info.");
+      auto info = target_.get_host_info();
+      if (!info) {
+        send_packet(""); // Target chose not to provide info.
+        return;
+      }
+      char buf[512];
+      std::string response;
+
+      snprintf(
+          buf, sizeof(buf), "triple:%s;ptrsize:%d;endian:%s;hostname:%s;", info->triple, info->ptr_size, info->endian,
+          info->hostname
+      );
+      response += buf;
+
+      if (info->os_version) {
+        snprintf(buf, sizeof(buf), "os_version:%s;", info->os_version);
+        response += buf;
+      }
+      if (info->os_build) {
+        snprintf(buf, sizeof(buf), "os_build:%s;", info->os_build);
+        response += buf;
+      }
+      if (info->os_kernel) {
+        snprintf(buf, sizeof(buf), "os_kernel:%s;", info->os_kernel);
+        response += buf;
+      }
+      send_packet(response);
+    } else {
+      GDBSTUB_LOG("[qHostInfo] Not supported by target.");
+      send_packet("");
+    }
   }
 
   void handle_process_info() {
