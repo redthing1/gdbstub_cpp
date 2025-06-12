@@ -1847,25 +1847,19 @@ private:
   }
 
   gdb_action handle_v_packet(std::string_view args) {
-    auto semicolon_pos = args.find(';');
-    auto question_pos = args.find('?');
-    auto cmd_end = std::min(semicolon_pos, question_pos);
-    auto cmd_name = args.substr(0, cmd_end);
-
-    GDBSTUB_LOG("[CMD v] Packet: '%.*s'", static_cast<int>(cmd_name.size()), cmd_name.data());
-
-    if (cmd_name == "Cont?") {
+    // Handle 'vCont?' query packet
+    if (args == "Cont?") {
+      GDBSTUB_LOG("[CMD v] Packet: 'Cont?'");
       // Advertise support for basic continue and step actions.
       // 't' (stop) and 'r' (range step) are not supported by this simple stub.
       send_packet("vCont;c;C;s;S");
       return gdb_action::none;
     }
 
-    if (cmd_name == "Cont") {
-      auto actions_str = args.substr(cmd_name.size());
-      if (!actions_str.empty() && actions_str.front() == ';') {
-        actions_str.remove_prefix(1);
-      }
+    // Handle 'vCont;...' resume packet
+    if (args.rfind("Cont;", 0) == 0) {
+      GDBSTUB_LOG("[CMD v] Packet: 'Cont;...'");
+      auto actions_str = args.substr(std::string_view("Cont;").length());
 
       if (actions_str.empty()) {
         GDBSTUB_LOG("[vCont] No actions specified in vCont packet.");
@@ -1881,8 +1875,7 @@ private:
 
       char action_to_perform = 0; // 0 means no action decided yet
 
-      // GDB protocol specifies that for any thread, the leftmost action that applies is taken.
-      // An action applies if it's for a specific thread, for all threads (-1), or has no thread id (default).
+      // GDB protocol: "For each inferior thread, the leftmost action with a matching thread-id is applied."
       std::string_view remainder = actions_str;
       while (!remainder.empty()) {
         auto next_semicolon = remainder.find(';');
@@ -1894,33 +1887,34 @@ private:
 
           bool applies = false;
           if (colon_pos == std::string_view::npos) {
-            // Default action for all threads
+            // Default action for all threads that don't have a specific action
             applies = true;
           } else {
             // Action with a thread-id
             auto thread_id_str = action_part.substr(colon_pos + 1);
-            int thread_id;
+            long thread_id = 0; // Default to a non-matching ID
+
             // The protocol supports "ppid.tid", but this simple stub only handles "tid".
-            // It also supports "-1" for all threads.
+            // A thread-id can be "-1" for all threads.
             if (thread_id_str == "-1") {
               thread_id = -1;
             } else {
+              // Otherwise, it's a positive hex number
               auto res =
                   std::from_chars(thread_id_str.data(), thread_id_str.data() + thread_id_str.size(), thread_id, 16);
               if (res.ec != std::errc{}) {
-                // Invalid thread ID, ignore this action part
-                thread_id = 0; // Does not match any positive thread_id
+                thread_id = 0; // Invalid, won't match
               }
             }
+
             if (thread_id == current_thread_id || thread_id == -1) {
               applies = true;
             }
           }
 
           if (applies) {
-            // Found the leftmost action for the current thread.
             action_to_perform = action_char;
-            break;
+            break; // Found the leftmost action for the current thread.
           }
         }
 
@@ -1943,12 +1937,13 @@ private:
       // Unhandled actions ('t', 'r') or no applicable action for this thread.
       // The GDB spec says other threads remain stopped. For a single-threaded target,
       // this means we do nothing. The safest reply is to report that we are still stopped.
-      GDBSTUB_LOG("[vCont] Unhandled or no applicable action '%c'. Reporting current status.", action_to_perform);
+      GDBSTUB_LOG("[vCont] No applicable action. Reporting current status.");
       send_stop_reply({stop_type::signal, gdb_signal::TRAP});
       return gdb_action::stop;
     }
 
     // Unrecognized 'v' packet
+    GDBSTUB_LOG("[CMD v] Unrecognized v-packet: '%.*s'", static_cast<int>(args.size()), args.data());
     send_packet("");
     return gdb_action::none;
   }
