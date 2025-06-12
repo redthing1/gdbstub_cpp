@@ -1847,7 +1847,8 @@ private:
       if (region && region->size > 0) {
         char buf[256];
         snprintf(
-            buf, sizeof(buf), "start:%zx;size:%zx;permissions:%s;", region->start, region->size, region->permissions
+            buf, sizeof(buf), "start:%0*zx;size:%0*zx;permissions:%s;", (int) (sizeof(region->start) * 2),
+            region->start, (int) (sizeof(region->size) * 2), region->size, region->permissions
         );
         send_packet(buf);
       } else {
@@ -2091,22 +2092,25 @@ private:
     reply = buf;
 
     // include watchpoint information if applicable
+    const char* watch_type_str = nullptr;
     switch (reason.type) {
     case stop_type::write_watch:
-      snprintf(buf, sizeof(buf), "watch:%zx;", reason.addr);
-      reply += buf;
+      watch_type_str = "watch";
       break;
     case stop_type::read_watch:
-      snprintf(buf, sizeof(buf), "rwatch:%zx;", reason.addr);
-      reply += buf;
+      watch_type_str = "rwatch";
       break;
     case stop_type::access_watch:
-      snprintf(buf, sizeof(buf), "awatch:%zx;", reason.addr);
-      reply += buf;
+      watch_type_str = "awatch";
       break;
     default:
       // no extra info for signals or simple breakpoints
       break;
+    }
+
+    if (watch_type_str) {
+      snprintf(buf, sizeof(buf), "%s:%0*zx;", watch_type_str, (int) (sizeof(reason.addr) * 2), reason.addr);
+      reply += buf;
     }
 
     // include the current thread
