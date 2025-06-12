@@ -186,6 +186,8 @@ struct arch_info {
   int cpu_count = 1;   ///< Number of CPUs/cores for SMP systems.
   int reg_count = 0;   ///< Number of registers in the target architecture.
   int pc_reg_num = -1; ///< Register number of the Program Counter (PC).
+
+  bool swap_registers_endianness = false; ///< Byte-swap register data in GDB packets.
 };
 
 /**
@@ -449,6 +451,16 @@ inline size_t unescape_binary(char* data, size_t len) noexcept {
   }
 
   return write_ptr - data;
+}
+
+/**
+ * @brief Byte-swap a region of memory in place.
+ */
+inline void swap_bytes(void* data, size_t size) noexcept {
+  if (size > 1) {
+    auto* p = static_cast<uint8_t*>(data);
+    std::reverse(p, p + size);
+  }
 }
 
 // SFINAE helpers for detecting optional target methods
@@ -1351,6 +1363,9 @@ private:
         // Per GDB docs, 'xx' indicates an unavailable register.
         std::memset(hex_ptr, 'x', reg_size * 2);
       } else {
+        if (arch_.swap_registers_endianness) {
+          detail::swap_bytes(reg_buffer_.data(), reg_size);
+        }
         detail::bytes_to_hex(reg_buffer_.data(), reg_size, hex_ptr);
       }
       hex_ptr += reg_size * 2;
@@ -1378,6 +1393,10 @@ private:
       if (!detail::hex_to_bytes(args.data() + pos, reg_size * 2, reg_buffer_.data())) {
         send_error(detail::gdb_errno::gdb_EINVAL);
         return gdb_action::none;
+      }
+
+      if (arch_.swap_registers_endianness) {
+        detail::swap_bytes(reg_buffer_.data(), reg_size);
       }
 
       if (target_.write_reg(i, reg_buffer_.data()) != 0) {
@@ -1413,6 +1432,10 @@ private:
       return gdb_action::none;
     }
 
+    if (arch_.swap_registers_endianness) {
+      detail::swap_bytes(reg_buffer_.data(), reg_size);
+    }
+
     ensure_buffer_size(hex_buffer_, reg_size * 2 + 1);
     detail::bytes_to_hex(reg_buffer_.data(), reg_size, hex_buffer_.data());
 
@@ -1446,6 +1469,10 @@ private:
     if (!detail::hex_to_bytes(hex_data.data(), hex_data.size(), reg_buffer_.data())) {
       send_error(detail::gdb_errno::gdb_EINVAL);
       return gdb_action::none;
+    }
+
+    if (arch_.swap_registers_endianness) {
+      detail::swap_bytes(reg_buffer_.data(), reg_size);
     }
 
     if (target_.write_reg(regno, reg_buffer_.data()) != 0) {
@@ -2127,6 +2154,9 @@ private:
       if (pc_size > 0 && pc_size <= detail::MAX_REG_SIZE) {
         ensure_buffer_size(reg_buffer_, pc_size);
         if (target_.read_reg(arch_.pc_reg_num, reg_buffer_.data()) == 0) {
+          if (arch_.swap_registers_endianness) {
+            detail::swap_bytes(reg_buffer_.data(), pc_size);
+          }
           ensure_buffer_size(hex_buffer_, pc_size * 2 + 1);
           detail::bytes_to_hex(reg_buffer_.data(), pc_size, hex_buffer_.data());
 
