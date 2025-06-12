@@ -4,10 +4,6 @@
  * This library provides a complete implementation of the GDB Remote Serial Protocol,
  * allowing emulators and embedded systems to be debugged using GDB and LLDB.
  *
- * This version includes foundational and advanced features:
- * - Rich stop replies for high-performance stepping and watchpoint support.
- * - qHostInfo, qMemoryRegionInfo, qRegisterInfo, and qProcessInfo for superior LLDB compatibility.
- * - Dynamic feature reporting based on your Target's capabilities.
  *
  * Features:
  * - Header-only, no dependencies beyond standard C++17
@@ -1019,6 +1015,11 @@ public:
     read_and_process_data(timeout_ms);
 
     if (rx_buffer_.has_complete_packet()) {
+      if (rx_buffer_.needs_ack() && !no_ack_mode_) {
+        send_ack();
+        rx_buffer_.mark_ack_sent();
+      }
+
       auto action = process_current_packet();
 
       if (action == gdb_action::shutdown) {
@@ -1123,7 +1124,7 @@ private:
     }
 
     // Per protocol, ACK/NAK is the first response.
-    if (rx_buffer_.needs_ack()) {
+    if (rx_buffer_.needs_ack() && !no_ack_mode_) {
       send_ack();
       rx_buffer_.mark_ack_sent();
     }
@@ -1167,8 +1168,9 @@ private:
           "[ERROR] Checksum failed for packet: %.*s", static_cast<int>(rx_buffer_.get_packet().size()),
           rx_buffer_.get_packet().data()
       );
-      // A NAK would be sent here, but modern GDB often relies on timeouts.
-      // The simple ACK-first model is maintained for compatibility.
+      if (!no_ack_mode_) {
+        transport_.write(nack, 1);
+      }
       rx_buffer_.consume_packet();
       return gdb_action::none;
     }
@@ -1280,7 +1282,7 @@ private:
     size_t total_hex_size = 0;
     for (int i = 0; i < arch_.reg_count; ++i) {
       size_t reg_size = target_.reg_size(i);
-      if (reg_size == 0 || reg_size > detail::MAX_REG_SIZE) {
+      if (reg_size > detail::MAX_REG_SIZE) {
         send_error(detail::gdb_errno::gdb_EINVAL);
         return gdb_action::none;
       }
@@ -1297,6 +1299,10 @@ private:
 
     for (int i = 0; i < arch_.reg_count; ++i) {
       size_t reg_size = target_.reg_size(i);
+      if (reg_size == 0) {
+        continue;
+      }
+
       ensure_buffer_size(reg_buffer_, reg_size);
 
       if (target_.read_reg(i, reg_buffer_.data()) != 0) {
@@ -1317,6 +1323,10 @@ private:
     size_t pos = 0;
     for (int i = 0; i < arch_.reg_count; ++i) {
       size_t reg_size = target_.reg_size(i);
+      if (reg_size == 0) {
+        continue;
+      }
+
       if (pos + reg_size * 2 > args.size()) {
         send_error(detail::gdb_errno::gdb_EINVAL);
         return gdb_action::none;
@@ -1635,7 +1645,7 @@ private:
 
     if (query_name == "Supported") {
       std::string features;
-      char buf[64];
+      char buf[128];
       snprintf(buf, sizeof(buf), "PacketSize=%zx;vContSupported+", detail::MAX_PACKET_SIZE);
       features = buf;
 
@@ -1802,7 +1812,12 @@ private:
     if constexpr (detail::has_register_info_v<Target>) {
       int regno;
       auto result = std::from_chars(regno_str.data(), regno_str.data() + regno_str.size(), regno, 16);
-      if (result.ec != std::errc{} || regno < 0 || regno >= arch_.reg_count) {
+      if (result.ec != std::errc{}) {
+        send_error(detail::gdb_errno::gdb_EINVAL);
+        return;
+      }
+      if (regno < 0 || regno >= arch_.reg_count) {
+        // This is not an error, it's how GDB discovers the number of registers
         send_error(detail::gdb_errno::gdb_EINVAL);
         return;
       }
@@ -1850,7 +1865,11 @@ private:
     if (cmd_name == "Cont?") {
       send_packet("vCont;c;C;s;S");
     } else if (cmd_name == "Cont") {
-      auto action_str = args.substr(cmd_name.size() + 1);
+      auto action_str = args.substr(cmd_name.size());
+      while (!action_str.empty() && action_str[0] == ';') {
+        action_str = action_str.substr(1);
+      }
+
       if (action_str.empty()) {
         send_error(detail::gdb_errno::gdb_EINVAL);
         return gdb_action::none;
@@ -1879,7 +1898,7 @@ private:
    */
   gdb_action handle_set_thread(std::string_view args) {
     GDBSTUB_LOG("[CMD H] Set thread '%.*s'", static_cast<int>(args.size()), args.data());
-    if (args.size() > 1 && args[0] == 'g') {
+    if (args.size() > 1 && (args[0] == 'g' || args[0] == 'c')) {
       if constexpr (detail::has_cpu_ops_v<Target>) {
         int thread_id;
         auto thread_str = args.substr(1);
@@ -1892,12 +1911,15 @@ private:
         int cpu_id = 0; // default
         if (thread_id > 0) {
           cpu_id = thread_id - 1; // protocol is 1-based, we are 0-based
-        } else if (thread_id == -1) {
-          cpu_id = 0; // gdb's -1 means "all threads", we default to cpu 0
+        } else if (thread_id == -1 || thread_id == 0) {
+          cpu_id = 0; // gdb's -1 (all) or 0 (any) are mapped to cpu 0
         }
 
         if (cpu_id < arch_.cpu_count) {
           target_.set_cpu(cpu_id);
+        } else {
+          send_error(detail::gdb_errno::gdb_EINVAL);
+          return gdb_action::none;
         }
       }
     }
@@ -1920,6 +1942,9 @@ private:
   gdb_action handle_detach() {
     GDBSTUB_LOG("[CMD D] Detach requested. Shutting down.");
     send_packet("OK");
+    if (on_detach) {
+      on_detach();
+    }
     return gdb_action::shutdown;
   }
 
