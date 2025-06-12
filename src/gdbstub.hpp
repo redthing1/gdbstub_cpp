@@ -4,6 +4,11 @@
  * This library provides a complete implementation of the GDB Remote Serial Protocol,
  * allowing emulators and embedded systems to be debugged using GDB and LLDB.
  *
+ * This version includes foundational and advanced features:
+ * - Rich stop replies for high-performance stepping and watchpoint support.
+ * - qHostInfo, qMemoryRegionInfo, qRegisterInfo, and qProcessInfo for superior LLDB compatibility.
+ * - Dynamic feature reporting based on your Target's capabilities.
+ *
  * Features:
  * - Header-only, no dependencies beyond standard C++17
  * - Supports incremental functionality (SFINAE-based feature detection)
@@ -16,8 +21,8 @@
  * ```cpp
  * struct my_emulator {
  *     // Required methods
- *     gdb_action cont() { ... }
- *     gdb_action stepi() { ... }
+ *     std::optional<gdbstub::stop_reason> cont() { ... }
+ *     std::optional<gdbstub::stop_reason> stepi() { ... }
  *     size_t reg_size(int regno) const { ... }
  *     int read_reg(int regno, void* data) { ... }
  *     int write_reg(int regno, const void* data) { ... }
@@ -27,7 +32,7 @@
  *     // Optional methods (detected automatically)
  *     bool set_breakpoint(size_t addr, breakpoint_type type) { ... }
  *     bool del_breakpoint(size_t addr, breakpoint_type type) { ... }
- *     gdbstub::host_info get_host_info() { return {"riscv64-unknown-elf", "little", 8}; }
+ *     std::optional<gdbstub::process_info> get_process_info() { ... }
  *     std::optional<gdbstub::mem_region> get_mem_region_info(size_t addr) { ... }
  *     std::optional<gdbstub::register_info> get_register_info(int regno) { ... }
  *     void on_interrupt() { ... }
@@ -35,18 +40,14 @@
  *
  * my_emulator emu;
  * gdbstub::arch_info arch = {
- *   .target_desc = "...",
+ *   .target_desc = "...", // User-provided GDB target.xml
  *   .xml_architecture_name = "riscv", // For 'xmlRegisters' GDB feature
+ *   .osabi = "bare",
  *   .reg_count = 33,
  *   .pc_reg_num = 32
  * };
  * gdbstub::serve(emu, arch, "localhost:1234");
  * ```
- *
- * Register numbering note:
- * The target is responsible for mapping register numbers to actual registers.
- * For example, in RISC-V, register 32 might be the PC. The target's read_reg
- * and write_reg methods should handle these special cases.
  */
 
 #pragma once
@@ -113,6 +114,7 @@ namespace gdbstub {
 
 /**
  * @brief Actions that target operations can return to control debugger flow.
+ * @deprecated This is now internal. The public API uses std::optional<stop_reason>.
  */
 enum class gdb_action {
   none,    ///< No special action, continue debugging normally
@@ -121,10 +123,45 @@ enum class gdb_action {
 };
 
 /**
+ * @brief GDB/Unix signal numbers for use in stop replies.
+ */
+enum class gdb_signal : int {
+  OK = 0,    ///< Used for successful command completion
+  TRAP = 5,  ///< Trace/breakpoint trap (standard for breakpoints)
+  INT = 2,   ///< Interrupt (e.g., from Ctrl-C)
+  ILL = 4,   ///< Illegal instruction
+  FPE = 8,   ///< Floating point exception
+  BUS = 10,  ///< Bus error
+  SEGV = 11, ///< Segmentation fault
+};
+
+/**
+ * @brief The reason the target stopped, returned by execution commands.
+ */
+enum class stop_type {
+  signal,       ///< Halted due to a signal (e.g., illegal instruction)
+  sw_break,     ///< Halted due to a software breakpoint
+  hw_break,     ///< Halted due to a hardware breakpoint
+  write_watch,  ///< Halted due to a write watchpoint
+  read_watch,   ///< Halted due to a read watchpoint
+  access_watch, ///< Halted due to an access watchpoint
+};
+
+/**
+ * @brief Describes a stop event in the target.
+ * This struct is returned by the Target's cont() and stepi() methods.
+ */
+struct stop_reason {
+  stop_type type = stop_type::signal;
+  /// For `signal` type, this is the `gdb_signal` value.
+  /// For all other types, it is ignored (signal defaults to TRAP).
+  gdb_signal signal = gdb_signal::TRAP;
+  /// For watchpoint types, this is the address that was accessed.
+  size_t addr = 0;
+};
+
+/**
  * @brief Breakpoint types supported by the GDB protocol.
- *
- * Note: To support watchpoints, the Target should handle the corresponding
- * write/read/access watchpoint types in its set/del_breakpoint methods.
  */
 enum class breakpoint_type {
   software = 0,         ///< Software breakpoint (e.g., BKPT instruction)
@@ -135,36 +172,38 @@ enum class breakpoint_type {
 };
 
 /**
- * @brief GDB signal numbers (subset of Unix signals).
- */
-enum class gdb_signal {
-  trap = 5 ///< SIGTRAP - typically used for breakpoint or single-step completion
-};
-
-/**
  * @brief Architecture description for the target system.
  */
 struct arch_info {
-  const char* target_desc = nullptr;           ///< XML target description string.
-  const char* xml_architecture_name = nullptr; ///< Name for the register set in XML, e.g., "riscv", "i386".
-  int cpu_count = 1;                           ///< Number of CPUs/cores for SMP systems.
-  int reg_count = 0;                           ///< Number of registers in the target architecture.
-  int pc_reg_num = -1;                         ///< Register number of the Program Counter (PC).
+  /// The full XML content for GDB's target description.
+  /// The user is responsible for creating this valid XML string.
+  const char* target_desc = nullptr;
+
+  /// The name GDB uses to identify the register set in the XML.
+  /// e.g., "riscv", "org.gnu.gdb.i386.core". This is used for 'xmlRegisters=...'.
+  const char* xml_architecture_name = nullptr;
+
+  /// Optional OS ABI string, e.g., "GNU/Linux", "bare".
+  const char* osabi = nullptr;
+
+  int cpu_count = 1;   ///< Number of CPUs/cores for SMP systems.
+  int reg_count = 0;   ///< Number of registers in the target architecture.
+  int pc_reg_num = -1; ///< Register number of the Program Counter (PC).
 };
 
 /**
- * @brief Information about the host system, used for auto-detection by LLDB.
- *
- * The Target should populate this with its specific details.
+ * @brief Information about the running process, for `qProcessInfo`.
  */
-struct host_info {
-  const char* triple = "unknown-unknown-unknown"; ///< Target triple, e.g., "riscv64-unknown-elf".
+struct process_info {
+  int pid;                                        ///< Process ID.
+  const char* triple = "unknown-unknown-unknown"; ///< Target triple.
   const char* endian = "little";                  ///< "little" or "big".
+  const char* ostype = "unknown";                 ///< OS type string.
   int ptr_size = 0;                               ///< Pointer size in bytes.
 };
 
 /**
- * @brief Describes a region of memory for the qMemoryRegionInfo packet.
+ * @brief Describes a region of memory for the `qMemoryRegionInfo` packet.
  */
 struct mem_region {
   size_t start;            ///< Start address of the region.
@@ -173,9 +212,8 @@ struct mem_region {
 };
 
 /**
- * @brief Detailed information about a single register, for qRegisterInfo.
+ * @brief Detailed information about a single register, for `qRegisterInfo`.
  *
- * This information is used by LLDB to display register information correctly.
  * The `offset` field must be the byte offset of this register within the 'g' packet response.
  */
 struct register_info {
@@ -421,10 +459,6 @@ template <typename T, typename = void> struct has_interrupt : std::false_type {}
 template <typename T>
 struct has_interrupt<T, std::void_t<decltype(std::declval<T&>().on_interrupt())>> : std::true_type {};
 
-template <typename T, typename = void> struct has_host_info : std::false_type {};
-template <typename T>
-struct has_host_info<T, std::void_t<decltype(std::declval<T&>().get_host_info())>> : std::true_type {};
-
 template <typename T, typename = void> struct has_mem_region_info : std::false_type {};
 template <typename T>
 struct has_mem_region_info<T, std::void_t<decltype(std::declval<T&>().get_mem_region_info(size_t{}))>>
@@ -434,13 +468,17 @@ template <typename T, typename = void> struct has_register_info : std::false_typ
 template <typename T>
 struct has_register_info<T, std::void_t<decltype(std::declval<T&>().get_register_info(int{}))>> : std::true_type {};
 
+template <typename T, typename = void> struct has_process_info : std::false_type {};
+template <typename T>
+struct has_process_info<T, std::void_t<decltype(std::declval<T&>().get_process_info())>> : std::true_type {};
+
 // Convenience aliases
 template <typename T> inline constexpr bool has_breakpoints_v = has_breakpoints<T>::value;
 template <typename T> inline constexpr bool has_cpu_ops_v = has_cpu_ops<T>::value;
 template <typename T> inline constexpr bool has_interrupt_v = has_interrupt<T>::value;
-template <typename T> inline constexpr bool has_host_info_v = has_host_info<T>::value;
 template <typename T> inline constexpr bool has_mem_region_info_v = has_mem_region_info<T>::value;
 template <typename T> inline constexpr bool has_register_info_v = has_register_info<T>::value;
+template <typename T> inline constexpr bool has_process_info_v = has_process_info<T>::value;
 
 } // namespace detail
 
@@ -851,10 +889,12 @@ public:
 template <typename Target, typename Transport = tcp_transport> class server {
   // Verify that the Target class implements the required interface.
   static_assert(
-      std::is_invocable_r_v<gdb_action, decltype(&Target::cont), Target*>, "Target must implement: gdb_action cont()"
+      std::is_invocable_r_v<std::optional<stop_reason>, decltype(&Target::cont), Target*>,
+      "Target must implement: std::optional<gdbstub::stop_reason> cont()"
   );
   static_assert(
-      std::is_invocable_r_v<gdb_action, decltype(&Target::stepi), Target*>, "Target must implement: gdb_action stepi()"
+      std::is_invocable_r_v<std::optional<stop_reason>, decltype(&Target::stepi), Target*>,
+      "Target must implement: std::optional<gdbstub::stop_reason> stepi()"
   );
   static_assert(
       std::is_invocable_r_v<size_t, decltype(&Target::reg_size), const Target*, int>,
@@ -1083,9 +1123,6 @@ private:
     }
 
     // Per protocol, ACK/NAK is the first response.
-    // We send ACK here and verify checksum in process_current_packet.
-    // While a stricter implementation might NAK on bad checksum,
-    // modern GDB is lenient and retransmits on timeout.
     if (rx_buffer_.needs_ack()) {
       send_ack();
       rx_buffer_.mark_ack_sent();
@@ -1492,16 +1529,18 @@ private:
       on_continue();
     }
 
-    auto action = target_.cont();
+    auto reason = target_.cont();
 
     async_io_enabled_.store(false, std::memory_order_relaxed);
-    if (action == gdb_action::stop) {
-      send_stop_reply();
+    if (reason) {
+      send_stop_reply(*reason);
       if (on_break) {
         on_break();
       }
+      return gdb_action::stop;
     }
-    return action;
+    // if we are here, target is still running, so no action for the stub
+    return gdb_action::none;
   }
 
   gdb_action handle_step(std::string_view args) {
@@ -1510,15 +1549,19 @@ private:
       on_continue();
     }
 
-    auto action = target_.stepi();
+    auto reason = target_.stepi();
 
-    if (action == gdb_action::stop) {
-      send_stop_reply();
+    if (reason) {
+      send_stop_reply(*reason);
       if (on_break) {
         on_break();
       }
+      return gdb_action::stop;
     }
-    return action;
+    // this path should ideally not be taken for a step, as a step by definition stops.
+    // however, if the target has a pipeline where a step isn't instantaneous,
+    // we return no action.
+    return gdb_action::none;
   }
 
   std::optional<std::tuple<int, size_t, size_t>> parse_breakpoint_packet(std::string_view args) {
@@ -1606,6 +1649,9 @@ private:
       if constexpr (detail::has_register_info_v<Target>) {
         features += ";qRegisterInfo+";
       }
+      if constexpr (detail::has_process_info_v<Target>) {
+        features += ";qProcessInfo+";
+      }
       if (args.find("QStartNoAckMode+") != std::string_view::npos) {
         features += ";QStartNoAckMode+";
       }
@@ -1618,7 +1664,8 @@ private:
       if constexpr (detail::has_cpu_ops_v<Target>) {
         current_cpu = target_.get_cpu();
       }
-      snprintf(buf, sizeof(buf), "QC%x", current_cpu + 1); // GDB threads are 1-based
+      // protocol uses 1-based thread IDs.
+      snprintf(buf, sizeof(buf), "QC%x", current_cpu + 1);
       send_packet(buf);
     } else if (query_name == "fThreadInfo") {
       std::string response = "m";
@@ -1627,7 +1674,7 @@ private:
           response += ',';
         }
         char buf[8];
-        snprintf(buf, sizeof(buf), "%x", i + 1);
+        snprintf(buf, sizeof(buf), "%x", i + 1); // 1-based thread IDs
         response += buf;
       }
       send_packet(response);
@@ -1637,12 +1684,12 @@ private:
       send_packet("OK");
     } else if (query_name == "Xfer") {
       handle_xfer(args.substr(5)); // Skip "Xfer:"
-    } else if (query_name == "HostInfo") {
-      handle_host_info();
     } else if (query_name == "MemoryRegionInfo") {
       handle_memory_region_info(args.substr(17)); // Skip "MemoryRegionInfo:"
     } else if (query_name.rfind("RegisterInfo", 0) == 0) {
       handle_register_info(query_name.substr(12)); // Skip "RegisterInfo"
+    } else if (query_name == "ProcessInfo") {
+      handle_process_info();
     } else {
       GDBSTUB_LOG("[CMD q] Unsupported query: '%.*s'", static_cast<int>(query_name.size()), query_name.data());
       send_packet("");
@@ -1705,15 +1752,22 @@ private:
     send_packet(response);
   }
 
-  void handle_host_info() {
-    if constexpr (detail::has_host_info_v<Target>) {
-      GDBSTUB_LOG("[qHostInfo] Responding with host info.");
-      auto info = target_.get_host_info();
-      char buf[256];
-      snprintf(buf, sizeof(buf), "triple:%s;endian:%s;ptrsize:%d;", info.triple, info.endian, info.ptr_size);
+  void handle_process_info() {
+    if constexpr (detail::has_process_info_v<Target>) {
+      GDBSTUB_LOG("[qProcessInfo] Responding with process info.");
+      auto info = target_.get_process_info();
+      if (!info) {
+        send_error(detail::gdb_errno::gdb_EFAULT);
+        return;
+      }
+      char buf[512];
+      snprintf(
+          buf, sizeof(buf), "pid:%x;triple:%s;endian:%s;ptrsize:%d;ostype:%s;", info->pid, info->triple, info->endian,
+          info->ptr_size, info->ostype
+      );
       send_packet(buf);
     } else {
-      GDBSTUB_LOG("[qHostInfo] Not supported by target.");
+      GDBSTUB_LOG("[qProcessInfo] Not supported by target.");
       send_packet("");
     }
   }
@@ -1815,22 +1869,35 @@ private:
     return gdb_action::none;
   }
 
+  /**
+   * @brief H<op><thread> - set thread for subsequent operations.
+   *
+   * Note on thread/cpu IDs:
+   * The GDB remote protocol uses 1-based, positive integers for thread IDs.
+   * Internally, this stub and the Target interface use 0-based CPU IDs.
+   * This function is the translation layer between the two.
+   */
   gdb_action handle_set_thread(std::string_view args) {
     GDBSTUB_LOG("[CMD H] Set thread '%.*s'", static_cast<int>(args.size()), args.data());
     if (args.size() > 1 && args[0] == 'g') {
       if constexpr (detail::has_cpu_ops_v<Target>) {
-        int cpu_id;
+        int thread_id;
         auto thread_str = args.substr(1);
-        auto result = std::from_chars(thread_str.data(), thread_str.data() + thread_str.size(), cpu_id, 16);
+        auto result = std::from_chars(thread_str.data(), thread_str.data() + thread_str.size(), thread_id, 16);
         if (result.ec != std::errc{}) {
           send_error(detail::gdb_errno::gdb_EINVAL);
           return gdb_action::none;
         }
-        cpu_id -= 1; // GDB is 1-based, we are 0-based
-        if (cpu_id >= 0 && cpu_id < arch_.cpu_count) {
+
+        int cpu_id = 0; // default
+        if (thread_id > 0) {
+          cpu_id = thread_id - 1; // protocol is 1-based, we are 0-based
+        } else if (thread_id == -1) {
+          cpu_id = 0; // gdb's -1 means "all threads", we default to cpu 0
+        }
+
+        if (cpu_id < arch_.cpu_count) {
           target_.set_cpu(cpu_id);
-        } else if (cpu_id == -2) { // -1 in GDB is "all threads"
-          target_.set_cpu(0);      // Default to CPU 0
         }
       }
     }
@@ -1846,7 +1913,7 @@ private:
 
   gdb_action handle_halt_reason() {
     GDBSTUB_LOG("[CMD ?] Halt reason requested.");
-    send_stop_reply();
+    send_stop_reply({stop_type::signal, gdb_signal::TRAP});
     return gdb_action::none;
   }
 
@@ -1865,20 +1932,47 @@ private:
   /**
    * @brief Send a stop reply packet to the debugger.
    *
-   * This packet informs the debugger that the target has stopped.
-   * The format is T<signal_hex_val><key>:<val>;...
-   * Including the thread and PC is a major performance optimization.
+   * This packet informs the debugger that the target has stopped, and why.
+   * It is one of the most important packets for a responsive debugging experience.
+   * Format: T<signal_hex_val><key>:<val>;...
    */
-  void send_stop_reply() {
+  void send_stop_reply(const stop_reason& reason) {
+    std::string reply;
     char buf[128];
+
+    // the signal is always TRAP for breakpoints/watchpoints
+    gdb_signal signal_to_send = (reason.type == stop_type::signal) ? reason.signal : gdb_signal::TRAP;
+    snprintf(buf, sizeof(buf), "T%02x", static_cast<int>(signal_to_send));
+    reply = buf;
+
+    // include watchpoint information if applicable
+    switch (reason.type) {
+    case stop_type::write_watch:
+      snprintf(buf, sizeof(buf), "watch:%zx;", reason.addr);
+      reply += buf;
+      break;
+    case stop_type::read_watch:
+      snprintf(buf, sizeof(buf), "rwatch:%zx;", reason.addr);
+      reply += buf;
+      break;
+    case stop_type::access_watch:
+      snprintf(buf, sizeof(buf), "awatch:%zx;", reason.addr);
+      reply += buf;
+      break;
+    default:
+      // no extra info for signals or simple breakpoints
+      break;
+    }
+
+    // include the current thread
     int current_cpu = 0;
     if constexpr (detail::has_cpu_ops_v<Target>) {
       current_cpu = target_.get_cpu();
     }
+    snprintf(buf, sizeof(buf), "thread:%x;", current_cpu + 1); // 1-based
+    reply += buf;
 
-    snprintf(buf, sizeof(buf), "T%02xthread:%x;", static_cast<int>(gdb_signal::trap), current_cpu + 1);
-    std::string reply = buf;
-
+    // include the program counter for performance
     if (arch_.pc_reg_num != -1) {
       size_t pc_size = target_.reg_size(arch_.pc_reg_num);
       if (pc_size > 0 && pc_size <= detail::MAX_REG_SIZE) {
@@ -1892,6 +1986,7 @@ private:
         }
       }
     }
+
     GDBSTUB_LOG("[EVENT] Target stopped. Sending stop reply: %s", reply.c_str());
     send_packet(reply);
   }
