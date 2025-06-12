@@ -1853,53 +1853,103 @@ private:
     auto cmd_name = args.substr(0, cmd_end);
 
     GDBSTUB_LOG("[CMD v] Packet: '%.*s'", static_cast<int>(cmd_name.size()), cmd_name.data());
+
     if (cmd_name == "Cont?") {
+      // Advertise support for basic continue and step actions.
+      // 't' (stop) and 'r' (range step) are not supported by this simple stub.
       send_packet("vCont;c;C;s;S");
-    } else if (cmd_name == "Cont") {
+      return gdb_action::none;
+    }
+
+    if (cmd_name == "Cont") {
       auto actions_str = args.substr(cmd_name.size());
+      if (!actions_str.empty() && actions_str.front() == ';') {
+        actions_str.remove_prefix(1);
+      }
 
-      bool is_step = false;
-      bool has_action = false;
+      if (actions_str.empty()) {
+        GDBSTUB_LOG("[vCont] No actions specified in vCont packet.");
+        send_error(detail::gdb_errno::gdb_EINVAL);
+        return gdb_action::none;
+      }
 
-      // Iterate through semicolon-separated actions
+      int current_cpu = 0;
+      if constexpr (detail::has_cpu_ops_v<Target>) {
+        current_cpu = target_.get_cpu();
+      }
+      const int current_thread_id = current_cpu + 1; // Protocol is 1-based
+
+      char action_to_perform = 0; // 0 means no action decided yet
+
+      // GDB protocol specifies that for any thread, the leftmost action that applies is taken.
+      // An action applies if it's for a specific thread, for all threads (-1), or has no thread id (default).
       std::string_view remainder = actions_str;
       while (!remainder.empty()) {
-        if (remainder.front() == ';') {
-          remainder.remove_prefix(1);
-        }
         auto next_semicolon = remainder.find(';');
         std::string_view action_part = remainder.substr(0, next_semicolon);
 
         if (!action_part.empty()) {
-          has_action = true;
-          char action_char = action_part[0];
-          // For a simple target, any step action takes precedence over continue actions.
-          if (action_char == 's' || action_char == 'S') {
-            is_step = true;
+          const char action_char = action_part[0];
+          const auto colon_pos = action_part.find(':');
+
+          bool applies = false;
+          if (colon_pos == std::string_view::npos) {
+            // Default action for all threads
+            applies = true;
+          } else {
+            // Action with a thread-id
+            auto thread_id_str = action_part.substr(colon_pos + 1);
+            int thread_id;
+            // The protocol supports "ppid.tid", but this simple stub only handles "tid".
+            // It also supports "-1" for all threads.
+            if (thread_id_str == "-1") {
+              thread_id = -1;
+            } else {
+              auto res =
+                  std::from_chars(thread_id_str.data(), thread_id_str.data() + thread_id_str.size(), thread_id, 16);
+              if (res.ec != std::errc{}) {
+                // Invalid thread ID, ignore this action part
+                thread_id = 0; // Does not match any positive thread_id
+              }
+            }
+            if (thread_id == current_thread_id || thread_id == -1) {
+              applies = true;
+            }
+          }
+
+          if (applies) {
+            // Found the leftmost action for the current thread.
+            action_to_perform = action_char;
+            break;
           }
         }
 
         if (next_semicolon == std::string_view::npos) {
           break;
         }
-        remainder.remove_prefix(next_semicolon);
+        remainder.remove_prefix(next_semicolon + 1);
       }
 
-      if (!has_action) {
-        GDBSTUB_LOG("[vCont] No actions specified in vCont packet.");
-        send_error(detail::gdb_errno::gdb_EINVAL);
-        return gdb_action::none;
-      }
-
-      GDBSTUB_LOG("[vCont] Action determined: %s", is_step ? "step" : "continue");
-      if (is_step) {
+      // The Target interface doesn't support signals, so C/S are treated as c/s.
+      if (action_to_perform == 's' || action_to_perform == 'S') {
+        GDBSTUB_LOG("[vCont] Action determined: step");
         return resume_and_wait([this] { return target_.stepi(); });
-      } else {
+      }
+      if (action_to_perform == 'c' || action_to_perform == 'C') {
+        GDBSTUB_LOG("[vCont] Action determined: continue");
         return resume_and_wait([this] { return target_.cont(); });
       }
-    } else {
-      send_packet("");
+
+      // Unhandled actions ('t', 'r') or no applicable action for this thread.
+      // The GDB spec says other threads remain stopped. For a single-threaded target,
+      // this means we do nothing. The safest reply is to report that we are still stopped.
+      GDBSTUB_LOG("[vCont] Unhandled or no applicable action '%c'. Reporting current status.", action_to_perform);
+      send_stop_reply({stop_type::signal, gdb_signal::TRAP});
+      return gdb_action::stop;
     }
+
+    // Unrecognized 'v' packet
+    send_packet("");
     return gdb_action::none;
   }
 
