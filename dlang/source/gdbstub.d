@@ -69,6 +69,17 @@ import std.conv : to, parse;
 import std.format : format;
 import std.exception : enforce;
 import std.socket; // <-- Use the high-level socket library
+
+// Helper function for socket error handling
+bool wouldHaveBlocked() {
+    version (Windows) {
+        import core.sys.windows.winsock2;
+        return WSAGetLastError() == WSAEWOULDBLOCK;
+    } else {
+        import core.stdc.errno;
+        return errno == EAGAIN || errno == EWOULDBLOCK;
+    }
+}
 import std.string;
 import std.typecons : Nullable, nullable, Tuple, tuple;
 import std.traits;
@@ -615,35 +626,55 @@ public:
     bool connected() const { return conn_sock_ !is null && conn_sock_.isAlive; }
 
     ptrdiff_t read(void* buf, size_t len) {
-        auto slice = (cast(ubyte*)buf)[0 .. len];
-        auto received = conn_sock_.receive(slice);
-        if (received == Socket.ERROR) {
-            if (wouldHaveBlocked()) return 0; // Treat as no data available
-            return -1; // Indicate a real error/disconnect
+        try {
+            auto slice = (cast(ubyte*)buf)[0 .. len];
+            auto received = conn_sock_.receive(slice);
+            if (received == Socket.ERROR) {
+                return -1; // Indicate a real error/disconnect
+            }
+            return received;
+        } catch (SocketException e) {
+            return -1;
         }
-        return received;
     }
 
     ptrdiff_t write(const(void)* buf, size_t len) {
-        size_t total = 0;
-        auto slice = (cast(const(ubyte)*)buf)[0 .. len];
-        while (total < len) {
-            ptrdiff_t n = conn_sock_.send(slice[total .. $]);
-            if (n == Socket.ERROR) {
-                if (wouldHaveBlocked()) continue;
-                return total > 0 ? total : -1;
+        try {
+            size_t total = 0;
+            auto slice = (cast(const(ubyte)*)buf)[0 .. len];
+            while (total < len) {
+                ptrdiff_t n = conn_sock_.send(slice[total .. $]);
+                if (n == Socket.ERROR) {
+                    return total > 0 ? total : -1;
+                }
+                if (n == 0) break; // Connection closed
+                total += n;
             }
-            total += n;
+            return total;
+        } catch (SocketException e) {
+            return -1;
         }
-        return total;
     }
 
     bool readable(int timeout_ms = 0) {
         if (!connected()) return false;
-        auto set = new SocketSet();
-        set.add(conn_sock_);
-        Duration timeout = timeout_ms < 0 ? Duration.max : dur!"msecs"(timeout_ms);
-        return Socket.select(set, null, null, timeout) > 0;
+        try {
+            auto readSet = new SocketSet();
+            readSet.add(conn_sock_);
+            
+            if (timeout_ms < 0) {
+                // Blocking mode - wait indefinitely
+                return Socket.select(readSet, null, null) > 0;
+            } else if (timeout_ms == 0) {
+                // Non-blocking mode
+                return Socket.select(readSet, null, null, dur!"msecs"(0)) > 0;
+            } else {
+                // Timed wait
+                return Socket.select(readSet, null, null, dur!"msecs"(timeout_ms)) > 0;
+            }
+        } catch (SocketException e) {
+            return false;
+        }
     }
 
     void disconnect() {
@@ -710,35 +741,55 @@ version (Posix) {
         bool connected() const { return conn_sock_ !is null && conn_sock_.isAlive; }
 
         ptrdiff_t read(void* buf, size_t len) {
-            auto slice = (cast(ubyte*)buf)[0 .. len];
-            auto received = conn_sock_.receive(slice);
-            if (received == Socket.ERROR) {
-                if (wouldHaveBlocked()) return 0; // Treat as no data available
-                return -1; // Indicate a real error/disconnect
+            try {
+                auto slice = (cast(ubyte*)buf)[0 .. len];
+                auto received = conn_sock_.receive(slice);
+                if (received == Socket.ERROR) {
+                    return -1; // Indicate a real error/disconnect
+                }
+                return received;
+            } catch (SocketException e) {
+                return -1;
             }
-            return received;
         }
 
         ptrdiff_t write(const(void)* buf, size_t len) {
-            size_t total = 0;
-            auto slice = (cast(const(ubyte)*)buf)[0 .. len];
-            while (total < len) {
-                ptrdiff_t n = conn_sock_.send(slice[total .. $]);
-                if (n == Socket.ERROR) {
-                    if (wouldHaveBlocked()) continue;
-                    return total > 0 ? total : -1;
+            try {
+                size_t total = 0;
+                auto slice = (cast(const(ubyte)*)buf)[0 .. len];
+                while (total < len) {
+                    ptrdiff_t n = conn_sock_.send(slice[total .. $]);
+                    if (n == Socket.ERROR) {
+                        return total > 0 ? total : -1;
+                    }
+                    if (n == 0) break; // Connection closed
+                    total += n;
                 }
-                total += n;
+                return total;
+            } catch (SocketException e) {
+                return -1;
             }
-            return total;
         }
 
         bool readable(int timeout_ms = 0) {
             if (!connected()) return false;
-            auto set = new SocketSet();
-            set.add(conn_sock_);
-            Duration timeout = timeout_ms < 0 ? Duration.max : dur!"msecs"(timeout_ms);
-            return Socket.select(set, null, null, timeout) > 0;
+            try {
+                auto readSet = new SocketSet();
+                readSet.add(conn_sock_);
+                
+                if (timeout_ms < 0) {
+                    // Blocking mode - wait indefinitely
+                    return Socket.select(readSet, null, null) > 0;
+                } else if (timeout_ms == 0) {
+                    // Non-blocking mode
+                    return Socket.select(readSet, null, null, dur!"msecs"(0)) > 0;
+                } else {
+                    // Timed wait
+                    return Socket.select(readSet, null, null, dur!"msecs"(timeout_ms)) > 0;
+                }
+            } catch (SocketException e) {
+                return false;
+            }
         }
 
         void disconnect() {
@@ -1324,7 +1375,7 @@ private:
             return gdb_action.none;
         }
 
-        GDBSTUB_LOG("[CMD P] Writing register %d (size %zu)", regno, reg_size);
+        GDBSTUB_LOG("[CMD P] Writing register %d (size %s)", regno, reg_size);
         ensure_buffer_size(reg_buffer_, reg_size);
         if (!hex_to_bytes(hex_data.ptr, hex_data.length, reg_buffer_.ptr)) {
             send_error(gdb_errno.gdb_EINVAL);
@@ -1362,7 +1413,7 @@ private:
         }
 
         len = min(len, MAX_MEMORY_READ);
-        GDBSTUB_LOG("[CMD m] Reading memory at 0x%zx, length %zu", addr, len);
+        GDBSTUB_LOG("[CMD m] Reading memory at 0x%x, length %s", addr, len);
         ubyte[] data = new ubyte[len];
 
         if (target_.read_mem(addr, len, data) != 0) {
@@ -1399,7 +1450,7 @@ private:
             return gdb_action.none;
         }
 
-        GDBSTUB_LOG("[CMD M] Writing memory at 0x%zx, length %zu", addr, len);
+        GDBSTUB_LOG("[CMD M] Writing memory at 0x%x, length %s", addr, len);
         auto hex_data = args[colon_pos + 1 .. $];
         if (hex_data.length != len * 2) {
             send_error(gdb_errno.gdb_EINVAL);
@@ -1443,7 +1494,7 @@ private:
             return gdb_action.none;
         }
 
-        GDBSTUB_LOG("[CMD X] Writing binary memory at 0x%zx, length %zu", addr, len);
+        GDBSTUB_LOG("[CMD X] Writing binary memory at 0x%x, length %s", addr, len);
         char[] data = (cast(char[]) args[colon_pos + 1 .. $]).dup;
         size_t actual_len = unescape_binary(data);
 
@@ -1499,7 +1550,7 @@ private:
             auto type = bp.get[0];
             auto addr = bp.get[1];
             // auto kind = bp.get.kind; // kind is unused for now but part of the protocol
-            GDBSTUB_LOG("[CMD Z] Insert breakpoint type %d at 0x%zx", type, addr);
+            GDBSTUB_LOG("[CMD Z] Insert breakpoint type %d at 0x%x", type, addr);
             bool ok = target_.set_breakpoint(addr, cast(breakpoint_type) type);
             GDBSTUB_LOG("[CMD Z] Result: %s", ok ? "OK" : "Error");
             send_packet(ok ? "OK" : ""); // Empty string for not supported, OK for success
@@ -1520,7 +1571,7 @@ private:
             auto type = bp.get[0];
             auto addr = bp.get[1];
             // auto kind = bp.get.kind; // kind is unused for now but part of the protocol
-            GDBSTUB_LOG("[CMD z] Remove breakpoint type %d at 0x%zx", type, addr);
+            GDBSTUB_LOG("[CMD z] Remove breakpoint type %d at 0x%x", type, addr);
             bool ok = target_.del_breakpoint(addr, cast(breakpoint_type) type);
             GDBSTUB_LOG("[CMD z] Result: %s", ok ? "OK" : "Error");
             send_packet(ok ? "OK" : "");
@@ -1539,7 +1590,7 @@ private:
 
         if (query_name == "Supported") {
             auto features = appender!string;
-            features.put(format("PacketSize=%zx;vContSupported+", MAX_PACKET_SIZE));
+            features.put(format("PacketSize=%x;vContSupported+", MAX_PACKET_SIZE));
 
             if (arch_.target_desc.length > 0 && arch_.xml_architecture_name.length > 0) {
                 features.put(";qXfer:features:read+;xmlRegisters=");
@@ -1640,7 +1691,7 @@ private:
             return;
         }
 
-        GDBSTUB_LOG("[XFER] Read target.xml, offset=%zu, len=%zu", offset, length);
+        GDBSTUB_LOG("[XFER] Read target.xml, offset=%s, len=%s", offset, length);
         string desc = arch_.target_desc;
         if (offset >= desc.length) {
             send_packet("l"); // 'l' indicates end of data.
@@ -1713,7 +1764,7 @@ private:
                 return;
             }
 
-            GDBSTUB_LOG("[qMemoryRegionInfo] Query for address 0x%zx", addr);
+            GDBSTUB_LOG("[qMemoryRegionInfo] Query for address 0x%x", addr);
             auto region = target_.get_mem_region_info(addr);
             if (!region.isNull && region.get.size > 0) {
                 send_packet(format(
