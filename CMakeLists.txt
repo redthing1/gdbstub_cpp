@@ -13,6 +13,9 @@ set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 add_library(gdbstub)
 target_sources(gdbstub PRIVATE
     src/gdbstub/gdbstub.cpp
+    src/gdbstub/rsp_core.cpp
+    src/gdbstub/server.cpp
+    src/gdbstub/transport_tcp.cpp
 )
 set_target_properties(gdbstub PROPERTIES OUTPUT_NAME gdbstub)
 target_include_directories(gdbstub
@@ -33,12 +36,25 @@ add_executable(gdbstub_test)
 target_sources(gdbstub_test PRIVATE
     test/gdbstub/test_main.cpp
     test/gdbstub/test_gdbstub.cpp
+    test/gdbstub/test_server.cpp
+    test/gdbstub/test_toy_emulator.cpp
 )
 set_target_properties(gdbstub_test PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/test
     OUTPUT_NAME gdbstub_test
 )
 target_link_libraries(gdbstub_test PRIVATE gdbstub)
+target_include_directories(gdbstub_test PRIVATE ${CMAKE_SOURCE_DIR}/test)
+
+find_package(Threads REQUIRED)
+target_link_libraries(gdbstub_tool PRIVATE Threads::Threads)
+target_link_libraries(gdbstub_test PRIVATE Threads::Threads)
+
+if (WIN32)
+    target_link_libraries(gdbstub PRIVATE ws2_32)
+    target_link_libraries(gdbstub_tool PRIVATE ws2_32)
+    target_link_libraries(gdbstub_test PRIVATE ws2_32)
+endif()
 
 enable_testing()
 add_test(NAME gdbstub_test COMMAND gdbstub_test)
