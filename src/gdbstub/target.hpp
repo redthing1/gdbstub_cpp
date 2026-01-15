@@ -64,6 +64,7 @@ class memory_map {
 public:
   virtual ~memory_map() = default;
   virtual std::optional<memory_region> region_for(uint64_t addr) = 0;
+  virtual std::vector<memory_region> regions() { return {}; }
 };
 
 class thread_access {
@@ -74,6 +75,7 @@ public:
   virtual target_status set_current_thread(uint64_t tid) = 0;
   virtual std::optional<uint64_t> thread_pc(uint64_t tid) = 0;
   virtual std::optional<std::string> thread_name(uint64_t tid) = 0;
+  virtual std::optional<stop_reason> thread_stop_reason(uint64_t tid) { return std::nullopt; }
 };
 
 struct host_info {
@@ -107,6 +109,16 @@ public:
   virtual std::optional<process_info> get_process_info() = 0;
 };
 
+struct shlib_info {
+  std::optional<uint64_t> info_addr;
+};
+
+class shlib_info_provider {
+public:
+  virtual ~shlib_info_provider() = default;
+  virtual std::optional<shlib_info> get_shlib_info() = 0;
+};
+
 struct target_handles {
   register_access& regs;
   memory_access& mem;
@@ -116,6 +128,7 @@ struct target_handles {
   thread_access* threads = nullptr;
   host_info_provider* host = nullptr;
   process_info_provider* process = nullptr;
+  shlib_info_provider* shlib = nullptr;
 };
 
 } // namespace gdbstub

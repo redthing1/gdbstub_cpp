@@ -56,7 +56,13 @@ template <typename RegT>
 gdbstub::server make_server(gdbstub::toy::emulator<RegT>& emu) {
   auto transport = std::make_unique<gdbstub::transport_tcp>();
   auto arch = make_arch_spec(emu);
-  return gdbstub::server({emu, emu, emu, &emu, &emu, &emu, &emu, &emu}, arch, std::move(transport));
+  gdbstub::target_handles handles{emu, emu, emu};
+  handles.breakpoints = &emu;
+  handles.memory = &emu;
+  handles.threads = &emu;
+  handles.host = &emu;
+  handles.process = &emu;
+  return gdbstub::server(handles, arch, std::move(transport));
 }
 
 } // namespace

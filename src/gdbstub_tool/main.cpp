@@ -73,7 +73,13 @@ int run_server(std::string_view address, gdbstub::toy::execution_mode mode, size
   arch.osabi = options.osabi;
 
   auto transport = std::make_unique<gdbstub::transport_tcp>();
-  gdbstub::server server({emu, emu, emu, &emu, &emu, &emu, &emu, &emu}, arch, std::move(transport));
+  gdbstub::target_handles handles{emu, emu, emu};
+  handles.breakpoints = &emu;
+  handles.memory = &emu;
+  handles.threads = &emu;
+  handles.host = &emu;
+  handles.process = &emu;
+  gdbstub::server server(handles, arch, std::move(transport));
   if (!server.listen(address)) {
     std::cerr << "failed to listen on " << address << "\n";
     return 1;
@@ -84,7 +90,7 @@ int run_server(std::string_view address, gdbstub::toy::execution_mode mode, size
   }
 
   std::cout << "gdbstub_cpp " << gdbstub::version() << "\n";
-  std::cout << "listening on " << address << "\n";
+  std::cout << "listening on " << address << "\n" << std::flush;
   server.serve_forever();
   return 0;
 }

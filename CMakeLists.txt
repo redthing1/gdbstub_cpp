@@ -59,6 +59,19 @@ endif()
 enable_testing()
 add_test(NAME gdbstub_test COMMAND gdbstub_test)
 
+find_program(LLDB_EXECUTABLE lldb)
+find_package(Python3 COMPONENTS Interpreter)
+if(LLDB_EXECUTABLE AND Python3_Interpreter_FOUND)
+    add_test(
+        NAME gdbstub_lldb_e2e
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_SOURCE_DIR}/test/gdbstub/lldb_e2e_test.py
+                --lldb ${LLDB_EXECUTABLE}
+                --gdbstub-tool ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/gdbstub_tool
+    )
+    set_tests_properties(gdbstub_lldb_e2e PROPERTIES LABELS "lldb")
+endif()
+
 find_program(CLANG_FORMAT NAMES clang-format clang-format-17 clang-format-16)
 if(CLANG_FORMAT)
     file(GLOB_RECURSE FORMAT_SOURCES

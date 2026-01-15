@@ -88,10 +88,13 @@ struct mock_target : gdbstub::register_access,
                      gdbstub::memory_map,
                      gdbstub::host_info_provider,
                      gdbstub::process_info_provider,
-                     gdbstub::thread_access {
+                     gdbstub::thread_access,
+                     gdbstub::shlib_info_provider {
   std::array<uint32_t, 3> regs{};
   std::vector<std::byte> memory = std::vector<std::byte>(0x2000);
   std::vector<uint64_t> threads = {1};
+  std::optional<gdbstub::stop_reason> stop_for_threads;
+  std::optional<gdbstub::shlib_info> shlib;
 
   enum class resume_behavior { stop_immediately, run };
 
@@ -171,6 +174,10 @@ struct mock_target : gdbstub::register_access,
     return std::nullopt;
   }
 
+  std::vector<gdbstub::memory_region> regions() override {
+    return {gdbstub::memory_region{0x1000, 0x100, "rwx"}};
+  }
+
   std::optional<gdbstub::host_info> get_host_info() override {
     return gdbstub::host_info{
         "riscv32-unknown-elf", "little", 4, "mock-host", "1.0", "build", "kernel", std::nullopt};
@@ -185,6 +192,9 @@ struct mock_target : gdbstub::register_access,
   gdbstub::target_status set_current_thread(uint64_t) override { return gdbstub::target_status::ok; }
   std::optional<uint64_t> thread_pc(uint64_t) override { return regs[2]; }
   std::optional<std::string> thread_name(uint64_t) override { return std::nullopt; }
+  std::optional<gdbstub::stop_reason> thread_stop_reason(uint64_t) override { return stop_for_threads; }
+
+  std::optional<gdbstub::shlib_info> get_shlib_info() override { return shlib; }
 };
 
 struct parsed_output {
@@ -215,6 +225,22 @@ parsed_output parse_output(std::string_view data) {
   return out;
 }
 
+gdbstub::target_handles make_handles(mock_target& target) {
+  gdbstub::target_handles handles{target, target, target};
+  handles.breakpoints = &target;
+  handles.memory = &target;
+  handles.threads = &target;
+  handles.host = &target;
+  handles.process = &target;
+  handles.shlib = &target;
+  return handles;
+}
+
+std::string unescape_payload(std::string payload) {
+  gdbstub::rsp::unescape_binary(payload);
+  return payload;
+}
+
 parsed_output send_packet(
     gdbstub::server& server,
     loopback_transport& transport,
@@ -238,7 +264,7 @@ TEST_CASE("server responds to qSupported") {
 
   auto transport = std::make_unique<loopback_transport>();
   auto* transport_ptr = transport.get();
-  gdbstub::server server({target, target, target, &target, &target, &target, &target, &target}, arch, std::move(transport));
+  gdbstub::server server(make_handles(target), arch, std::move(transport));
 
   REQUIRE(server.listen("loop"));
   REQUIRE(server.wait_for_connection());
@@ -253,6 +279,44 @@ TEST_CASE("server responds to qSupported") {
   CHECK(payload.find("qXfer:features:read+") != std::string::npos);
 }
 
+TEST_CASE("server reports gdbserver version") {
+  mock_target target;
+  gdbstub::arch_spec arch;
+  arch.reg_count = 3;
+  arch.pc_reg_num = 2;
+
+  auto transport = std::make_unique<loopback_transport>();
+  auto* transport_ptr = transport.get();
+  gdbstub::server server(make_handles(target), arch, std::move(transport));
+
+  REQUIRE(server.listen("loop"));
+  REQUIRE(server.wait_for_connection());
+
+  auto output = send_packet(server, *transport_ptr, "qGDBServerVersion");
+  REQUIRE(output.packets.size() == 1);
+  CHECK(output.packets[0].payload.find("name:gdbstub_cpp") != std::string::npos);
+  CHECK(output.packets[0].payload.find("version:") != std::string::npos);
+}
+
+TEST_CASE("server responds to qThreadStopInfo") {
+  mock_target target;
+  gdbstub::arch_spec arch;
+  arch.reg_count = 3;
+  arch.pc_reg_num = 2;
+
+  auto transport = std::make_unique<loopback_transport>();
+  auto* transport_ptr = transport.get();
+  gdbstub::server server(make_handles(target), arch, std::move(transport));
+
+  REQUIRE(server.listen("loop"));
+  REQUIRE(server.wait_for_connection());
+
+  auto output = send_packet(server, *transport_ptr, "qThreadStopInfo1");
+  REQUIRE(output.packets.size() == 1);
+  CHECK(output.packets[0].payload.rfind("T05", 0) == 0);
+  CHECK(output.packets[0].payload.find("thread:1;") != std::string::npos);
+}
+
 TEST_CASE("server reads and writes registers") {
   mock_target target;
   gdbstub::arch_spec arch;
@@ -261,7 +325,7 @@ TEST_CASE("server reads and writes registers") {
 
   auto transport = std::make_unique<loopback_transport>();
   auto* transport_ptr = transport.get();
-  gdbstub::server server({target, target, target, &target, &target, &target, &target, &target}, arch, std::move(transport));
+  gdbstub::server server(make_handles(target), arch, std::move(transport));
 
   REQUIRE(server.listen("loop"));
   REQUIRE(server.wait_for_connection());
@@ -288,7 +352,7 @@ TEST_CASE("server reads memory") {
 
   auto transport = std::make_unique<loopback_transport>();
   auto* transport_ptr = transport.get();
-  gdbstub::server server({target, target, target, &target, &target, &target, &target, &target}, arch, std::move(transport));
+  gdbstub::server server(make_handles(target), arch, std::move(transport));
 
   REQUIRE(server.listen("loop"));
   REQUIRE(server.wait_for_connection());
@@ -306,7 +370,7 @@ TEST_CASE("server handles no-ack mode") {
 
   auto transport = std::make_unique<loopback_transport>();
   auto* transport_ptr = transport.get();
-  gdbstub::server server({target, target, target, &target, &target, &target, &target, &target}, arch, std::move(transport));
+  gdbstub::server server(make_handles(target), arch, std::move(transport));
 
   REQUIRE(server.listen("loop"));
   REQUIRE(server.wait_for_connection());
@@ -332,7 +396,7 @@ TEST_CASE("server serves target xml via qXfer") {
 
   auto transport = std::make_unique<loopback_transport>();
   auto* transport_ptr = transport.get();
-  gdbstub::server server({target, target, target, &target, &target, &target, &target, &target}, arch, std::move(transport));
+  gdbstub::server server(make_handles(target), arch, std::move(transport));
 
   REQUIRE(server.listen("loop"));
   REQUIRE(server.wait_for_connection());
@@ -350,7 +414,7 @@ TEST_CASE("server sets breakpoints and continues") {
 
   auto transport = std::make_unique<loopback_transport>();
   auto* transport_ptr = transport.get();
-  gdbstub::server server({target, target, target, &target, &target, &target, &target, &target}, arch, std::move(transport));
+  gdbstub::server server(make_handles(target), arch, std::move(transport));
 
   REQUIRE(server.listen("loop"));
   REQUIRE(server.wait_for_connection());
@@ -373,7 +437,7 @@ TEST_CASE("tcp polling integration serves packets") {
   arch.xml_arch_name = "org.gnu.gdb.riscv.cpu";
 
   auto transport = std::make_unique<gdbstub::transport_tcp>();
-  gdbstub::server server({target, target, target, &target, &target, &target, &target, &target}, arch, std::move(transport));
+  gdbstub::server server(make_handles(target), arch, std::move(transport));
 
   constexpr std::string_view k_host = "127.0.0.1";
   auto port = gdbstub::test::listen_on_available_port(server, k_host, 43000, 200);
@@ -410,7 +474,7 @@ TEST_CASE("tcp blocking integration uses serve_forever") {
   arch.pc_reg_num = 2;
 
   auto transport = std::make_unique<gdbstub::transport_tcp>();
-  gdbstub::server server({target, target, target, &target, &target, &target, &target, &target}, arch, std::move(transport));
+  gdbstub::server server(make_handles(target), arch, std::move(transport));
 
   constexpr std::string_view k_host = "127.0.0.1";
   auto port = gdbstub::test::listen_on_available_port(server, k_host, 43200, 200);
@@ -440,7 +504,7 @@ TEST_CASE("tcp async integration sends stop reply") {
   arch.pc_reg_num = 2;
 
   auto transport = std::make_unique<gdbstub::transport_tcp>();
-  gdbstub::server server({target, target, target, &target, &target, &target, &target, &target}, arch, std::move(transport));
+  gdbstub::server server(make_handles(target), arch, std::move(transport));
 
   constexpr std::string_view k_host = "127.0.0.1";
   auto port = gdbstub::test::listen_on_available_port(server, k_host, 43400, 200);
@@ -480,4 +544,148 @@ TEST_CASE("tcp async integration sends stop reply") {
   polling = false;
   poll_thread.join();
   server.stop();
+}
+
+TEST_CASE("server responds to qStructuredDataPlugins") {
+  mock_target target;
+  gdbstub::arch_spec arch;
+  arch.reg_count = 3;
+
+  auto transport = std::make_unique<loopback_transport>();
+  auto* transport_ptr = transport.get();
+  gdbstub::server server(make_handles(target), arch, std::move(transport));
+
+  REQUIRE(server.listen("loop"));
+  REQUIRE(server.wait_for_connection());
+
+  auto out = send_packet(server, *transport_ptr, "qStructuredDataPlugins");
+  REQUIRE(out.ack_count == 1);
+  REQUIRE(out.packets.size() == 1);
+  CHECK(out.packets[0].payload == "[]");
+}
+
+TEST_CASE("server responds to QEnableErrorStrings") {
+  mock_target target;
+  gdbstub::arch_spec arch;
+  arch.reg_count = 3;
+
+  auto transport = std::make_unique<loopback_transport>();
+  auto* transport_ptr = transport.get();
+  gdbstub::server server(make_handles(target), arch, std::move(transport));
+
+  REQUIRE(server.listen("loop"));
+  REQUIRE(server.wait_for_connection());
+
+  auto out = send_packet(server, *transport_ptr, "QEnableErrorStrings");
+  REQUIRE(out.ack_count == 1);
+  REQUIRE(out.packets.size() == 1);
+  CHECK(out.packets[0].payload == "OK");
+}
+
+TEST_CASE("server responds to qShlibInfoAddr when available") {
+  mock_target target;
+  gdbstub::shlib_info info;
+  info.info_addr = 0x11223344;
+  target.shlib = info;
+
+  gdbstub::arch_spec arch;
+  arch.reg_count = 3;
+
+  auto transport = std::make_unique<loopback_transport>();
+  auto* transport_ptr = transport.get();
+  gdbstub::server server(make_handles(target), arch, std::move(transport));
+
+  REQUIRE(server.listen("loop"));
+  REQUIRE(server.wait_for_connection());
+
+  auto out = send_packet(server, *transport_ptr, "qShlibInfoAddr");
+  REQUIRE(out.ack_count == 1);
+  REQUIRE(out.packets.size() == 1);
+  CHECK(out.packets[0].payload == "11223344");
+}
+
+TEST_CASE("server responds to jThreadsInfo") {
+  mock_target target;
+  target.threads = {1, 2};
+  target.stop_for_threads = gdbstub::stop_reason{gdbstub::stop_kind::signal, 5, 0, 0, std::nullopt};
+
+  gdbstub::arch_spec arch;
+  arch.reg_count = 3;
+
+  auto transport = std::make_unique<loopback_transport>();
+  auto* transport_ptr = transport.get();
+  gdbstub::server server(make_handles(target), arch, std::move(transport));
+
+  REQUIRE(server.listen("loop"));
+  REQUIRE(server.wait_for_connection());
+
+  auto out = send_packet(server, *transport_ptr, "jThreadsInfo");
+  REQUIRE(out.ack_count == 1);
+  REQUIRE(out.packets.size() == 1);
+  auto payload = unescape_payload(out.packets[0].payload);
+  CHECK(payload == "[{\"tid\":1,\"reason\":\"signal\",\"signal\":5},{\"tid\":2,\"reason\":\"signal\",\"signal\":5}]");
+}
+
+TEST_CASE("server responds to jThreadExtendedInfo") {
+  mock_target target;
+  gdbstub::arch_spec arch;
+  arch.reg_count = 3;
+
+  auto transport = std::make_unique<loopback_transport>();
+  auto* transport_ptr = transport.get();
+  gdbstub::server server(make_handles(target), arch, std::move(transport));
+
+  REQUIRE(server.listen("loop"));
+  REQUIRE(server.wait_for_connection());
+
+  std::string request_json = "{\"thread\":1}";
+  auto payload = std::string("jThreadExtendedInfo:") + gdbstub::rsp::escape_binary(as_bytes(request_json));
+  auto out = send_packet(server, *transport_ptr, payload);
+  REQUIRE(out.ack_count == 1);
+  REQUIRE(out.packets.size() == 1);
+  auto response = unescape_payload(out.packets[0].payload);
+  CHECK(response == "{\"thread\":1}");
+}
+
+TEST_CASE("server responds to qXfer memory-map read") {
+  mock_target target;
+  gdbstub::arch_spec arch;
+  arch.reg_count = 3;
+
+  auto transport = std::make_unique<loopback_transport>();
+  auto* transport_ptr = transport.get();
+  gdbstub::server server(make_handles(target), arch, std::move(transport));
+
+  REQUIRE(server.listen("loop"));
+  REQUIRE(server.wait_for_connection());
+
+  auto out = send_packet(server, *transport_ptr, "qXfer:memory-map:read::0,200");
+  REQUIRE(out.ack_count == 1);
+  REQUIRE(out.packets.size() == 1);
+  std::string expected = "l<memory-map><memory type=\"ram\" start=\"0x1000\" length=\"0x100\" permissions=\"rwx\"/></memory-map>";
+  CHECK(out.packets[0].payload == expected);
+}
+
+TEST_CASE("server supports binary memory read") {
+  mock_target target;
+  target.memory[0x100] = std::byte{'A'};
+  target.memory[0x101] = std::byte{'$'};
+  target.memory[0x102] = std::byte{'#'};
+  target.memory[0x103] = std::byte{'}'};
+
+  gdbstub::arch_spec arch;
+  arch.reg_count = 3;
+
+  auto transport = std::make_unique<loopback_transport>();
+  auto* transport_ptr = transport.get();
+  gdbstub::server server(make_handles(target), arch, std::move(transport));
+
+  REQUIRE(server.listen("loop"));
+  REQUIRE(server.wait_for_connection());
+
+  auto out = send_packet(server, *transport_ptr, "x100,4");
+  REQUIRE(out.ack_count == 1);
+  REQUIRE(out.packets.size() == 1);
+  auto payload = unescape_payload(out.packets[0].payload);
+  CHECK(payload == "A$#}");
 }

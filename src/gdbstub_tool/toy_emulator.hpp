@@ -152,6 +152,7 @@ public:
       resume_result result;
       result.state = resume_result::state::stopped;
       result.stop = make_signal_stop();
+      last_stop_ = result.stop;
       return result;
     }
 
@@ -159,6 +160,7 @@ public:
       resume_result result;
       result.state = resume_result::state::stopped;
       result.stop = *immediate;
+      last_stop_ = result.stop;
       return result;
     }
 
@@ -167,6 +169,7 @@ public:
     case execution_mode::blocking:
       result.state = resume_result::state::stopped;
       result.stop = run_blocking();
+      last_stop_ = result.stop;
       return result;
     case execution_mode::polling:
       running_.store(true);
@@ -180,6 +183,7 @@ public:
 
     result.state = resume_result::state::stopped;
     result.stop = make_signal_stop();
+    last_stop_ = result.stop;
     return result;
   }
 
@@ -191,6 +195,7 @@ public:
 
   std::optional<stop_reason> poll_stop() override {
     if (auto pending = take_pending_stop()) {
+      last_stop_ = pending;
       return pending;
     }
 
@@ -200,6 +205,7 @@ public:
 
     if (auto stop = step_and_check()) {
       running_.store(false);
+      last_stop_ = stop;
       return stop;
     }
 
@@ -227,6 +233,10 @@ public:
       return std::nullopt;
     }
     return memory_region{0, static_cast<uint64_t>(memory_.size()), "rwx"};
+  }
+
+  std::vector<memory_region> regions() override {
+    return {memory_region{0, static_cast<uint64_t>(memory_.size()), "rwx"}};
   }
 
   std::optional<host_info> get_host_info() override {
@@ -272,6 +282,13 @@ public:
   std::optional<std::string> thread_name(uint64_t tid) override {
     if (tid == current_thread_) {
       return std::string("toy-thread");
+    }
+    return std::nullopt;
+  }
+
+  std::optional<stop_reason> thread_stop_reason(uint64_t tid) override {
+    if (tid == current_thread_) {
+      return last_stop_;
     }
     return std::nullopt;
   }
@@ -322,6 +339,7 @@ private:
       std::lock_guard<std::mutex> lock(stop_mutex_);
       if (!pending_stop_) {
         pending_stop_ = reason;
+        last_stop_ = reason;
         notify = true;
       }
     }
@@ -382,6 +400,7 @@ private:
   std::atomic<bool> stop_requested_{false};
   std::mutex stop_mutex_;
   std::optional<stop_reason> pending_stop_;
+  std::optional<stop_reason> last_stop_;
   std::thread worker_;
   std::function<void(const stop_reason&)> async_callback_;
 };

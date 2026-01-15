@@ -49,6 +49,7 @@ private:
   bool no_ack_mode_ = false;
   bool list_threads_in_stop_reply_ = false;
   bool thread_suffix_enabled_ = false;
+  bool error_strings_enabled_ = false;
   std::optional<stop_reason> last_stop_;
 
   std::mutex stop_mutex_;
@@ -69,6 +70,7 @@ private:
   void handle_read_register(std::string_view args);
   void handle_write_register(std::string_view args);
   void handle_read_memory(std::string_view args);
+  void handle_read_binary_memory(std::string_view args);
   void handle_write_memory(std::string_view args);
   void handle_write_binary_memory(std::string_view args);
   void handle_insert_breakpoint(std::string_view args);
@@ -78,10 +80,14 @@ private:
   void handle_halt_reason();
   void handle_detach();
   void handle_extended_mode();
+  void handle_j_packet(std::string_view payload);
   void handle_xfer(std::string_view args);
   void handle_host_info();
   void handle_process_info();
   void handle_memory_region_info(std::string_view addr_str);
+  void handle_shlib_info_addr();
+  void handle_threads_info();
+  void handle_thread_extended_info(std::string_view args);
 
   void send_ack();
   void send_nack();

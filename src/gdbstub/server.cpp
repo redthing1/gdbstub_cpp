@@ -1,7 +1,10 @@
 #include "gdbstub/server.hpp"
 
+#include "gdbstub/gdbstub.hpp"
+
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <charconv>
 #include <cstdio>
 #include <cstring>
@@ -89,6 +92,108 @@ bool split_thread_suffix(std::string_view payload, std::string_view& base, std::
 
   base = payload.substr(0, pos);
   return true;
+}
+
+std::string escape_json_string(std::string_view value) {
+  std::string out;
+  out.reserve(value.size());
+  for (unsigned char c : value) {
+    switch (c) {
+    case '"':
+      out += "\\\"";
+      break;
+    case '\\':
+      out += "\\\\";
+      break;
+    case '\b':
+      out += "\\b";
+      break;
+    case '\f':
+      out += "\\f";
+      break;
+    case '\n':
+      out += "\\n";
+      break;
+    case '\r':
+      out += "\\r";
+      break;
+    case '\t':
+      out += "\\t";
+      break;
+    default:
+      if (c < 0x20) {
+        char buf[7] = {0};
+        std::snprintf(buf, sizeof(buf), "\\u%04x", c);
+        out += buf;
+      } else {
+        out.push_back(static_cast<char>(c));
+      }
+      break;
+    }
+  }
+  return out;
+}
+
+std::optional<uint64_t> parse_json_thread_id(std::string_view json) {
+  auto key = json.find("\"thread\"");
+  if (key == std::string_view::npos) {
+    return std::nullopt;
+  }
+  auto colon = json.find(':', key + 8);
+  if (colon == std::string_view::npos) {
+    return std::nullopt;
+  }
+  size_t pos = colon + 1;
+  while (pos < json.size() && std::isspace(static_cast<unsigned char>(json[pos])) != 0) {
+    ++pos;
+  }
+  if (pos >= json.size()) {
+    return std::nullopt;
+  }
+  uint64_t tid = 0;
+  auto result = std::from_chars(json.data() + pos, json.data() + json.size(), tid, 10);
+  if (result.ec != std::errc{}) {
+    return std::nullopt;
+  }
+  return tid;
+}
+
+std::string stop_reason_label(stop_kind kind) {
+  switch (kind) {
+  case stop_kind::sw_break:
+  case stop_kind::hw_break:
+    return "breakpoint";
+  case stop_kind::watch_read:
+  case stop_kind::watch_write:
+  case stop_kind::watch_access:
+    return "watchpoint";
+  case stop_kind::exited:
+    return "exited";
+  case stop_kind::signal:
+  default:
+    return "signal";
+  }
+}
+
+std::string build_memory_map_xml(const std::vector<memory_region>& regions) {
+  std::string xml;
+  xml.reserve(128 + regions.size() * 64);
+  xml += "<memory-map>";
+  for (const auto& region : regions) {
+    xml += "<memory type=\"ram\" start=\"0x";
+    xml += hex_u64(region.start);
+    xml += "\" length=\"0x";
+    xml += hex_u64(region.size);
+    xml += "\"";
+    if (!region.permissions.empty()) {
+      xml += " permissions=\"";
+      xml += region.permissions;
+      xml += "\"";
+    }
+    xml += "/>";
+  }
+  xml += "</memory-map>";
+  return xml;
 }
 
 std::string build_thread_list(const std::vector<uint64_t>& threads) {
@@ -300,6 +405,9 @@ void server::handle_packet(std::string_view payload) {
   case 'm':
     handle_read_memory(args);
     break;
+  case 'x':
+    handle_read_binary_memory(args);
+    break;
   case 'M':
     handle_write_memory(args);
     break;
@@ -332,6 +440,9 @@ void server::handle_packet(std::string_view payload) {
     break;
   case 'v':
     handle_v_packet(args);
+    break;
+  case 'j':
+    handle_j_packet(base_payload);
     break;
   case 'H':
     handle_set_thread(args);
@@ -387,9 +498,44 @@ void server::handle_query(std::string_view args) {
       features += ";qProcessInfo+";
     }
     if (target_.memory) {
-      features += ";qMemoryRegionInfo+";
+      features += ";qMemoryRegionInfo+;qXfer:memory-map:read+";
     }
     send_packet(features);
+    return;
+  }
+
+  if (name == "GDBServerVersion") {
+    std::string response = "name:gdbstub_cpp;version:";
+    response += gdbstub::version();
+    response += ";";
+    send_packet(response);
+    return;
+  }
+
+  if (name == "StructuredDataPlugins") {
+    send_packet("[]");
+    return;
+  }
+
+  if (name.rfind("ThreadStopInfo", 0) == 0) {
+    auto tid_str = name.substr(std::string_view("ThreadStopInfo").size());
+    uint64_t tid = 0;
+    if (tid_str.empty() || !parse_hex_u64(tid_str, tid)) {
+      send_error(0x16);
+      return;
+    }
+    std::optional<stop_reason> reason;
+    if (target_.threads) {
+      reason = target_.threads->thread_stop_reason(tid);
+    }
+    auto reply = reason.value_or(last_stop_.value_or(stop_reason{stop_kind::signal, 5}));
+    reply.thread_id = tid;
+    send_stop_reply(reply);
+    return;
+  }
+
+  if (name == "ShlibInfoAddr") {
+    handle_shlib_info_addr();
     return;
   }
 
@@ -452,6 +598,12 @@ void server::handle_set_query(std::string_view args) {
 
   if (args == "ThreadSuffixSupported") {
     thread_suffix_enabled_ = true;
+    send_packet("OK");
+    return;
+  }
+
+  if (args.rfind("EnableErrorStrings", 0) == 0) {
+    error_strings_enabled_ = true;
     send_packet("OK");
     return;
   }
@@ -773,6 +925,31 @@ void server::handle_read_memory(std::string_view args) {
   send_packet(rsp::encode_hex(buffer));
 }
 
+void server::handle_read_binary_memory(std::string_view args) {
+  auto comma = args.find(',');
+  if (comma == std::string_view::npos) {
+    send_error(0x16);
+    return;
+  }
+
+  uint64_t addr = 0;
+  uint64_t len = 0;
+  if (!parse_hex_u64(args.substr(0, comma), addr) || !parse_hex_u64(args.substr(comma + 1), len)) {
+    send_error(0x16);
+    return;
+  }
+
+  len = std::min<uint64_t>(len, k_max_memory_read);
+  std::vector<std::byte> buffer(static_cast<size_t>(len));
+  auto status = target_.mem.read_mem(addr, buffer);
+  if (status != target_status::ok) {
+    send_status_error(status, false);
+    return;
+  }
+
+  send_packet(rsp::escape_binary(std::span<const std::byte>(buffer.data(), buffer.size())));
+}
+
 void server::handle_write_memory(std::string_view args) {
   auto colon = args.find(':');
   auto comma = args.find(',');
@@ -988,44 +1165,223 @@ void server::handle_detach() {
 
 void server::handle_extended_mode() { send_packet("OK"); }
 
-void server::handle_xfer(std::string_view args) {
-  if (args.rfind("features:read:target.xml:", 0) != 0) {
+void server::handle_j_packet(std::string_view payload) {
+  if (payload.rfind("jThreadsInfo", 0) == 0) {
+    handle_threads_info();
+    return;
+  }
+
+  if (payload.rfind("jThreadExtendedInfo:", 0) == 0) {
+    handle_thread_extended_info(payload.substr(std::string_view("jThreadExtendedInfo:").size()));
+    return;
+  }
+
+  send_packet("");
+}
+
+void server::handle_threads_info() {
+  if (!target_.threads) {
     send_packet("");
     return;
   }
 
-  if (arch_.target_xml.empty()) {
-    send_error(0x01);
+  auto ids = thread_ids();
+  std::string json;
+  json.reserve(64 + ids.size() * 32);
+  json.push_back('[');
+  for (size_t i = 0; i < ids.size(); ++i) {
+    if (i > 0) {
+      json.push_back(',');
+    }
+    json.push_back('{');
+    json += "\"tid\":";
+    json += std::to_string(ids[i]);
+
+    std::optional<stop_reason> reason;
+    if (target_.threads) {
+      reason = target_.threads->thread_stop_reason(ids[i]);
+    }
+    if (!reason && last_stop_ && (!last_stop_->thread_id || *last_stop_->thread_id == ids[i])) {
+      reason = last_stop_;
+    }
+    if (reason) {
+      json += ",\"reason\":\"";
+      json += stop_reason_label(reason->kind);
+      json += "\"";
+      if (reason->signal > 0) {
+        json += ",\"signal\":";
+        json += std::to_string(reason->signal);
+      }
+    }
+
+    json.push_back('}');
+  }
+  json.push_back(']');
+
+  auto escaped = rsp::escape_binary(as_bytes(json));
+  send_packet(escaped);
+}
+
+void server::handle_thread_extended_info(std::string_view args) {
+  if (!target_.threads) {
+    send_packet("");
     return;
   }
 
-  auto range = args.substr(25);
-  auto comma = range.find(',');
-  if (comma == std::string_view::npos) {
-    send_error(0x01);
+  std::string request(args);
+  rsp::unescape_binary(request);
+  auto tid = parse_json_thread_id(request);
+  if (!tid) {
+    send_error(0x16);
     return;
   }
 
-  uint64_t offset = 0;
-  uint64_t length = 0;
-  if (!parse_hex_u64(range.substr(0, comma), offset) || !parse_hex_u64(range.substr(comma + 1), length)) {
-    send_error(0x01);
+  auto ids = thread_ids();
+  if (!ids.empty() && std::find(ids.begin(), ids.end(), *tid) == ids.end()) {
+    send_error(0x16);
     return;
   }
 
-  if (offset >= arch_.target_xml.size()) {
-    send_packet("l");
+  std::string json;
+  json.reserve(64);
+  json.push_back('{');
+  json += "\"thread\":";
+  json += std::to_string(*tid);
+
+  if (auto name = target_.threads->thread_name(*tid)) {
+    json += ",\"name\":\"";
+    json += escape_json_string(*name);
+    json += "\"";
+  }
+
+  if (auto reason = target_.threads->thread_stop_reason(*tid)) {
+    json += ",\"reason\":\"";
+    json += stop_reason_label(reason->kind);
+    json += "\"";
+    if (reason->signal > 0) {
+      json += ",\"signal\":";
+      json += std::to_string(reason->signal);
+    }
+  }
+
+  json.push_back('}');
+
+  auto escaped = rsp::escape_binary(as_bytes(json));
+  send_packet(escaped);
+}
+
+void server::handle_shlib_info_addr() {
+  if (!target_.shlib) {
+    send_packet("");
     return;
   }
 
-  size_t available = arch_.target_xml.size() - static_cast<size_t>(offset);
-  size_t to_send = static_cast<size_t>(std::min<uint64_t>(length, available));
+  auto info = target_.shlib->get_shlib_info();
+  if (!info || !info->info_addr) {
+    send_packet("");
+    return;
+  }
 
-  std::string response;
-  response.reserve(to_send + 1);
-  response.push_back(offset + to_send >= arch_.target_xml.size() ? 'l' : 'm');
-  response.append(arch_.target_xml.data() + offset, to_send);
-  send_packet(response);
+  size_t addr_size = 0;
+  if (target_.host) {
+    if (auto host = target_.host->get_host_info()) {
+      if (host->ptr_size > 0) {
+        addr_size = static_cast<size_t>(host->ptr_size);
+      }
+    }
+  }
+  if (addr_size == 0 && arch_.pc_reg_num >= 0) {
+    addr_size = target_.regs.reg_size(arch_.pc_reg_num);
+  }
+  if (addr_size == 0 || addr_size > sizeof(uint64_t)) {
+    addr_size = sizeof(uint64_t);
+  }
+
+  std::vector<std::byte> buffer(addr_size);
+  uint64_t addr = *info->info_addr;
+  for (size_t i = 0; i < addr_size; ++i) {
+    size_t shift = (addr_size - 1 - i) * 8;
+    buffer[i] = std::byte(static_cast<uint8_t>((addr >> shift) & 0xff));
+  }
+
+  send_packet(rsp::encode_hex(buffer));
+}
+
+void server::handle_xfer(std::string_view args) {
+  if (args.rfind("features:read:target.xml:", 0) == 0) {
+    if (arch_.target_xml.empty()) {
+      send_error(0x01);
+      return;
+    }
+
+    auto range = args.substr(25);
+    auto comma = range.find(',');
+    if (comma == std::string_view::npos) {
+      send_error(0x01);
+      return;
+    }
+
+    uint64_t offset = 0;
+    uint64_t length = 0;
+    if (!parse_hex_u64(range.substr(0, comma), offset) || !parse_hex_u64(range.substr(comma + 1), length)) {
+      send_error(0x01);
+      return;
+    }
+
+    if (offset >= arch_.target_xml.size()) {
+      send_packet("l");
+      return;
+    }
+
+    size_t available = arch_.target_xml.size() - static_cast<size_t>(offset);
+    size_t to_send = static_cast<size_t>(std::min<uint64_t>(length, available));
+
+    std::string response;
+    response.reserve(to_send + 1);
+    response.push_back(offset + to_send >= arch_.target_xml.size() ? 'l' : 'm');
+    response.append(arch_.target_xml.data() + offset, to_send);
+    send_packet(response);
+    return;
+  }
+
+  constexpr std::string_view k_memory_map_prefix = "memory-map:read::";
+  if (args.rfind(k_memory_map_prefix, 0) == 0) {
+    if (!target_.memory) {
+      send_packet("");
+      return;
+    }
+
+    auto range = args.substr(k_memory_map_prefix.size());
+    auto comma = range.find(',');
+    if (comma == std::string_view::npos) {
+      send_error(0x01);
+      return;
+    }
+
+    uint64_t offset = 0;
+    uint64_t length = 0;
+    if (!parse_hex_u64(range.substr(0, comma), offset) || !parse_hex_u64(range.substr(comma + 1), length)) {
+      send_error(0x01);
+      return;
+    }
+
+    auto xml = build_memory_map_xml(target_.memory->regions());
+    if (offset >= xml.size()) {
+      send_packet("l");
+      return;
+    }
+
+    size_t available = xml.size() - static_cast<size_t>(offset);
+    size_t to_send = static_cast<size_t>(std::min<uint64_t>(length, available));
+    std::string response;
+    response.reserve(to_send + 1);
+    response.push_back(offset + to_send >= xml.size() ? 'l' : 'm');
+    response.append(xml.data() + offset, to_send);
+    send_packet(response);
+    return;
+  }
+
+  send_packet("");
 }
 
 void server::handle_host_info() {
