@@ -79,6 +79,7 @@ int run_server(std::string_view address, gdbstub::toy::execution_mode mode, size
   handles.threads = &emu;
   handles.host = &emu;
   handles.process = &emu;
+  handles.shlib = &emu;
   gdbstub::server server(handles, arch, std::move(transport));
   if (!server.listen(address)) {
     std::cerr << "failed to listen on " << address << "\n";

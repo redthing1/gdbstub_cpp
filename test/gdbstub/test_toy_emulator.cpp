@@ -62,6 +62,7 @@ gdbstub::server make_server(gdbstub::toy::emulator<RegT>& emu) {
   handles.threads = &emu;
   handles.host = &emu;
   handles.process = &emu;
+  handles.shlib = &emu;
   return gdbstub::server(handles, arch, std::move(transport));
 }
 

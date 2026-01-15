@@ -33,6 +33,7 @@ class emulator final : public register_access,
                        public memory_map,
                        public host_info_provider,
                        public process_info_provider,
+                       public shlib_info_provider,
                        public thread_access {
 public:
   struct options {
@@ -46,6 +47,7 @@ public:
     std::string triple = "toy-unknown-elf";
     std::string endian = "little";
     std::string osabi = "none";
+    std::optional<uint64_t> shlib_info_addr;
   };
 
   explicit emulator(options opts) : options_(std::move(opts)) {
@@ -152,7 +154,7 @@ public:
       resume_result result;
       result.state = resume_result::state::stopped;
       result.stop = make_signal_stop();
-      last_stop_ = result.stop;
+      set_last_stop(result.stop);
       return result;
     }
 
@@ -160,7 +162,7 @@ public:
       resume_result result;
       result.state = resume_result::state::stopped;
       result.stop = *immediate;
-      last_stop_ = result.stop;
+      set_last_stop(result.stop);
       return result;
     }
 
@@ -169,7 +171,7 @@ public:
     case execution_mode::blocking:
       result.state = resume_result::state::stopped;
       result.stop = run_blocking();
-      last_stop_ = result.stop;
+      set_last_stop(result.stop);
       return result;
     case execution_mode::polling:
       running_.store(true);
@@ -183,7 +185,7 @@ public:
 
     result.state = resume_result::state::stopped;
     result.stop = make_signal_stop();
-    last_stop_ = result.stop;
+    set_last_stop(result.stop);
     return result;
   }
 
@@ -195,7 +197,6 @@ public:
 
   std::optional<stop_reason> poll_stop() override {
     if (auto pending = take_pending_stop()) {
-      last_stop_ = pending;
       return pending;
     }
 
@@ -205,7 +206,7 @@ public:
 
     if (auto stop = step_and_check()) {
       running_.store(false);
-      last_stop_ = stop;
+      set_last_stop(*stop);
       return stop;
     }
 
@@ -258,6 +259,15 @@ public:
     return info;
   }
 
+  std::optional<shlib_info> get_shlib_info() override {
+    if (!options_.shlib_info_addr) {
+      return std::nullopt;
+    }
+    shlib_info info;
+    info.info_addr = options_.shlib_info_addr;
+    return info;
+  }
+
   std::vector<uint64_t> thread_ids() override { return threads_; }
 
   uint64_t current_thread() const override { return current_thread_; }
@@ -288,7 +298,7 @@ public:
 
   std::optional<stop_reason> thread_stop_reason(uint64_t tid) override {
     if (tid == current_thread_) {
-      return last_stop_;
+      return get_last_stop();
     }
     return std::nullopt;
   }
@@ -337,9 +347,9 @@ private:
     bool notify = false;
     {
       std::lock_guard<std::mutex> lock(stop_mutex_);
+      last_stop_ = reason;
       if (!pending_stop_) {
         pending_stop_ = reason;
-        last_stop_ = reason;
         notify = true;
       }
     }
@@ -356,6 +366,16 @@ private:
     auto stop = pending_stop_;
     pending_stop_.reset();
     return stop;
+  }
+
+  void set_last_stop(const stop_reason& reason) {
+    std::lock_guard<std::mutex> lock(stop_mutex_);
+    last_stop_ = reason;
+  }
+
+  std::optional<stop_reason> get_last_stop() {
+    std::lock_guard<std::mutex> lock(stop_mutex_);
+    return last_stop_;
   }
 
   void start_async() {
