@@ -1,37 +1,101 @@
-.vscode
-.claude
-claude/
-CLAUDE*
+*.lc
+*.msgpack
+*.json
 
-# Build directories
-build*/
-cmake-build-*/
+*.bin
+*.exports
+test_build/
+test_*/
+debug_*/
+debug/
 
-# Generated files
-*.o
-*.a
-*.so
-*.dylib
-*.dll
-*.exe
-
-# IDE files
-.vscode/
+# IDEs
 .idea/
-*.swp
-*.swo
-*~
+.vscode/
+.agent/
+temp/
+tmp/
 
-# OS files
-.DS_Store
-Thumbs.db
+build/
+build-*/
 
-# Temporary files
-/tmp/
-*.tmp
+# Created by https://www.toptal.com/developers/gitignore/api/c,c++,cmake,meson,linux,windows,macos,python,lua
+# Edit at https://www.toptal.com/developers/gitignore?templates=c,c++,cmake,meson,linux,windows,macos,python,lua
 
-# Created by https://www.toptal.com/developers/gitignore/api/cmake,linux,macos
-# Edit at https://www.toptal.com/developers/gitignore?templates=cmake,linux,macos
+.vscode
+
+### C ###
+# Prerequisites
+*.d
+
+# Object files
+*.o
+*.ko
+*.obj
+*.elf
+
+# Linker output
+*.ilk
+*.map
+*.exp
+
+# Precompiled Headers
+*.gch
+*.pch
+
+# Libraries
+*.lib
+*.a
+*.la
+*.lo
+
+# Shared objects (inc. Windows DLLs)
+*.dll
+*.so
+*.so.*
+*.dylib
+
+# Executables
+*.exe
+*.out
+*.app
+*.i*86
+*.x86_64
+*.hex
+
+# Debug files
+*.dSYM/
+*.su
+*.idb
+*.pdb
+
+# Kernel Module Compile Results
+*.mod*
+*.cmd
+.tmp_versions/
+modules.order
+Module.symvers
+Mkfile.old
+dkms.conf
+
+### C++ ###
+# Prerequisites
+
+# Compiled Object files
+*.slo
+
+# Precompiled Headers
+
+# Compiled Dynamic libraries
+
+# Fortran module files
+*.mod
+*.smod
+
+# Compiled Static libraries
+*.lai
+
+# Executables
 
 ### CMake ###
 CMakeLists.txt.user
@@ -47,8 +111,6 @@ CTestTestfile.cmake
 _deps
 
 ### CMake Patch ###
-CMakeUserPresets.json
-
 # External projects
 *-prefix/
 
@@ -66,6 +128,28 @@ CMakeUserPresets.json
 
 # .nfs files are created when an open file is removed but is still being accessed
 .nfs*
+
+### Lua ###
+# Compiled Lua sources
+luac.out
+
+# luarocks build files
+*.src.rock
+*.zip
+*.tar.gz
+
+# Object files
+*.os
+
+# Precompiled Headers
+
+# Libraries
+*.def
+
+# Shared objects (inc. Windows DLLs)
+
+# Executables
+
 
 ### macOS ###
 # General
@@ -100,10 +184,27 @@ Temporary Items
 # iCloud generated files
 *.icloud
 
-# End of https://www.toptal.com/developers/gitignore/api/cmake,linux,macos
+### Meson ###
+# subproject directories
+/subprojects/*
+!/subprojects/*.wrap
 
-# Created by https://www.toptal.com/developers/gitignore/api/python
-# Edit at https://www.toptal.com/developers/gitignore?templates=python
+# Meson Directories
+meson-logs
+meson-private
+
+# Meson Files
+meson_benchmark_setup.dat
+meson_test_setup.dat
+sanitycheckcpp.cc     # C++ specific
+sanitycheckcpp.exe    # C++ specific
+
+# Ninja
+build.ninja
+.ninja_deps
+.ninja_logs
+
+# Misc
 
 ### Python ###
 # Byte-compiled / optimized / DLL files
@@ -112,7 +213,6 @@ __pycache__/
 *$py.class
 
 # C extensions
-*.so
 
 # Distribution / packaging
 .Python
@@ -122,7 +222,6 @@ dist/
 downloads/
 eggs/
 .eggs/
-lib/
 lib64/
 parts/
 sdist/
@@ -277,4 +376,52 @@ poetry.toml
 # LSP config files
 pyrightconfig.json
 
-# End of https://www.toptal.com/developers/gitignore/api/python
+### Windows ###
+# Windows thumbnail cache files
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+
+# Dump file
+*.stackdump
+
+# Folder config file
+[Dd]esktop.ini
+
+# Recycle Bin used on file shares
+$RECYCLE.BIN/
+
+# Windows Installer files
+*.cab
+*.msi
+*.msix
+*.msm
+*.msp
+
+# Windows shortcuts
+*.lnk
+
+# Test results and artifacts
+*_results.json
+test_results.json
+gdb_*_results.json
+test/*_report*.json
+test/remote_debug/*_report*.json
+
+# LLVM IR files
+*.ll
+*.bc
+
+# Assembly and trace files  
+*.s
+*.trace
+
+# Compilation artifacts
+*.opt.ll
+*.obf.ll
+
+# Local manual CLI run artifacts (ExecPlan evidence; not checked in)
+tmp/semaweave_cli_checks/
+
+# End of https://www.toptal.com/developers/gitignore/api/c,c++,cmake,meson,linux,windows,macos,python,lua

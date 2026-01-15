@@ -1,10 +1,22 @@
 # gdbstub_cpp
 
-a modern gdbstub library
+a c++20 gdb rsp server library, focused on lldb
 
-## troubleshooting
+## build
 
-run lldb with debug packets
-```sh
-lldb --no-lldbinit -o "log enable gdb-remote packets" -o "gdb-remote 127.0.0.1:23666"
+```bash
+cmake -G Ninja -B build-release
+cmake --build build-release --parallel
+```
+
+## test
+
+```bash
+ctest --test-dir build-release --output-on-failure
+```
+
+## format
+
+```bash
+cmake --build build-release --target gdbstub_cpp-format
 ```

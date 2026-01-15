@@ -1,70 +1,62 @@
-cmake_minimum_required(VERSION 3.15)
-project(gdbstub_cpp VERSION 1.0.0 LANGUAGES CXX)
+cmake_minimum_required(VERSION 3.20)
+project(gdbstub_cpp VERSION 0.1.0 LANGUAGES CXX)
 
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-# Create the header-only library target
-add_library(gdbstub INTERFACE)
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
+set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
+
+add_library(gdbstub)
+target_sources(gdbstub PRIVATE
+    src/gdbstub/gdbstub.cpp
+)
+set_target_properties(gdbstub PROPERTIES OUTPUT_NAME gdbstub)
+target_include_directories(gdbstub
+    PUBLIC
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/lib/third_party
+)
+target_compile_features(gdbstub PUBLIC cxx_std_20)
 add_library(gdbstub::gdbstub ALIAS gdbstub)
 
-# Set include directories
-target_include_directories(gdbstub INTERFACE
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>
-    $<INSTALL_INTERFACE:include>
+add_executable(gdbstub_tool)
+target_sources(gdbstub_tool PRIVATE
+    src/gdbstub_tool/main.cpp
 )
+target_link_libraries(gdbstub_tool PRIVATE gdbstub)
 
-# Platform-specific libraries
-if(WIN32)
-    target_link_libraries(gdbstub INTERFACE ws2_32)
-endif()
-
-# Export the target for use by submodules/consumers
-include(CMakePackageConfigHelpers)
-
-# Install the header file
-install(FILES src/gdbstub.hpp
-    DESTINATION include
+add_executable(gdbstub_test)
+target_sources(gdbstub_test PRIVATE
+    test/gdbstub/test_main.cpp
+    test/gdbstub/test_gdbstub.cpp
 )
-
-# Install the library target
-install(TARGETS gdbstub
-    EXPORT gdbstub-targets
-    INCLUDES DESTINATION include
+set_target_properties(gdbstub_test PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/test
+    OUTPUT_NAME gdbstub_test
 )
+target_link_libraries(gdbstub_test PRIVATE gdbstub)
 
-# Install the export set
-install(EXPORT gdbstub-targets
-    FILE gdbstub-targets.cmake
-    NAMESPACE gdbstub::
-    DESTINATION lib/cmake/gdbstub
-)
+enable_testing()
+add_test(NAME gdbstub_test COMMAND gdbstub_test)
 
-# Create package config file
-configure_package_config_file(
-    "${CMAKE_CURRENT_SOURCE_DIR}/cmake/gdbstub-config.cmake.in"
-    "${CMAKE_CURRENT_BINARY_DIR}/gdbstub-config.cmake"
-    INSTALL_DESTINATION lib/cmake/gdbstub
-)
+find_program(CLANG_FORMAT NAMES clang-format clang-format-17 clang-format-16)
+if(CLANG_FORMAT)
+    file(GLOB_RECURSE FORMAT_SOURCES
+        ${CMAKE_SOURCE_DIR}/src/*.cpp
+        ${CMAKE_SOURCE_DIR}/src/*.hpp
+        ${CMAKE_SOURCE_DIR}/test/*.cpp
+        ${CMAKE_SOURCE_DIR}/test/*.hpp
+    )
 
-# Create package version file
-write_basic_package_version_file(
-    "${CMAKE_CURRENT_BINARY_DIR}/gdbstub-config-version.cmake"
-    VERSION ${PROJECT_VERSION}
-    COMPATIBILITY SameMajorVersion
-)
-
-# Install package config files
-install(FILES
-    "${CMAKE_CURRENT_BINARY_DIR}/gdbstub-config.cmake"
-    "${CMAKE_CURRENT_BINARY_DIR}/gdbstub-config-version.cmake"
-    DESTINATION lib/cmake/gdbstub
-)
-
-# Enable testing
-option(GDBSTUB_BUILD_TESTS "Build gdbstub tests" ON)
-if(GDBSTUB_BUILD_TESTS)
-    enable_testing()
-    add_subdirectory(tests)
+    list(FILTER FORMAT_SOURCES EXCLUDE REGEX "/lib/third_party/")
+    add_custom_target(gdbstub_cpp-format
+        COMMAND ${CLANG_FORMAT} -i ${FORMAT_SOURCES}
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+        COMMENT "formatting source files"
+        VERBATIM
+    )
 endif()
