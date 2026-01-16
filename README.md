@@ -47,7 +47,7 @@ cmake --build build-release --parallel
 ctest --test-dir build-release --output-on-failure
 ```
 
-## toy modules
+## a sample target
 
 minimal demo target under `src/gdbstub_tool/toy/`:
 
@@ -58,13 +58,12 @@ minimal demo target under `src/gdbstub_tool/toy/`:
 - `runner.hpp` blocking/polling/async execution.
 - `target.hpp` gdbstub adapter that composes the pieces.
 
-## toy server
-
+run debug server:
 ```bash
 ./build-release/bin/gdbstub_tool --listen 127.0.0.1:5555 --arch 32 --mode polling
 ```
 
-## lldb (interactive)
+## lldb
 
 connect with lldb:
 
@@ -91,8 +90,6 @@ to log into a file:
 lldb -O "log enable -f /tmp/lldb-gdb-remote.log gdb-remote packets" -O "gdb-remote 127.0.0.1:5555"
 ```
 
-## format
+## reference
 
-```bash
-cmake --build build-release --target gdbstub_cpp-format
-```
+protocol specifications and documentation under [doc](./doc).
