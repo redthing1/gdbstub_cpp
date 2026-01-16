@@ -157,7 +157,7 @@ def run_lldb(
     commands: list[str],
     timeout: float,
 ) -> subprocess.CompletedProcess[str]:
-    args = [lldb_path, "-b"]
+    args = [lldb_path, "--no-lldbinit", "-b"]
     for cmd in commands:
         args.extend(["-o", cmd])
     return subprocess.run(args, text=True, capture_output=True, timeout=timeout)
