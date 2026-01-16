@@ -1,8 +1,10 @@
 #include "doctest/doctest.hpp"
 
 #include <chrono>
+#include <span>
 #include <string_view>
 
+#include "gdbstub/rsp_core.hpp"
 #include "gdbstub/tcp_test_client.hpp"
 #include "gdbstub/toy_session.hpp"
 
@@ -34,6 +36,10 @@ gdbstub::test::client_reply send_and_wait(
   auto reply = gdbstub::test::wait_for_reply(session.server(), session.client(), timeout);
   REQUIRE(reply.has_value());
   return *reply;
+}
+
+std::span<const std::byte> as_bytes(std::string_view text) {
+  return {reinterpret_cast<const std::byte*>(text.data()), text.size()};
 }
 
 } // namespace
@@ -110,6 +116,33 @@ TEST_CASE("toy emulator 64-bit reads and writes registers") {
 
   auto read_back = send_and_wait(session, "p0");
   CHECK(read_back.payload == "0100000000000000");
+}
+
+TEST_CASE("toy emulator writes and reads memory packets") {
+  auto cfg = make_config(32, gdbstub::toy::execution_mode::blocking);
+  cfg.reg_count = 2;
+  cfg.pc_reg_num = 0;
+  cfg.start_pc = 0x1000;
+
+  gdbstub::test::toy_session session(cfg);
+  REQUIRE(session.listen_and_connect(k_host, k_port_base + 700, k_port_sweep));
+
+  auto write_hex = send_and_wait(session, "M1010,4:01020304");
+  CHECK(write_hex.payload == "OK");
+
+  auto read_hex = send_and_wait(session, "m1010,4");
+  CHECK(read_hex.payload == "01020304");
+
+  std::string data = "A$#}";
+  std::string payload = "X1014,4:";
+  payload += gdbstub::rsp::escape_binary(as_bytes(data));
+  auto write_bin = send_and_wait(session, payload);
+  CHECK(write_bin.payload == "OK");
+
+  auto read_bin = send_and_wait(session, "x1014,4");
+  std::string bin_payload = read_bin.payload;
+  gdbstub::rsp::unescape_binary(bin_payload);
+  CHECK(bin_payload == "A$#}");
 }
 
 TEST_CASE("toy emulator reports multiple threads and honors selection") {

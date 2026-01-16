@@ -79,6 +79,12 @@ TEST_CASE("hex encoding round-trips") {
   CHECK(decoded == data);
 }
 
+TEST_CASE("hex decoding rejects invalid input") {
+  std::array<std::byte, 2> out{};
+  CHECK_FALSE(gdbstub::rsp::decode_hex("0", out));
+  CHECK_FALSE(gdbstub::rsp::decode_hex("zz", out));
+}
+
 TEST_CASE("binary escaping round-trips") {
   std::array<std::byte, 5> data = {
       std::byte{'$'}, std::byte{'#'}, std::byte{'}'}, std::byte{0x11}, std::byte{0x7f},

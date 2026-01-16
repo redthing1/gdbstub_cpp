@@ -48,6 +48,35 @@ class PacketEvent:
     payload: str
 
 
+@dataclass(frozen=True)
+class E2EInputs:
+    arch_bits: int
+    reg_name: str
+    reg_value_hex: str
+    mem_write_hex: str
+    mem_write_bin: str
+    mem_read_hex: str
+    mem_read_bin: str
+
+    @property
+    def arch_name(self) -> str:
+        return "riscv32" if self.arch_bits == 32 else "riscv64"
+
+
+def make_inputs(arch_bits: int) -> E2EInputs:
+    reg_name = "r1"
+    reg_value_hex = "0x11223344" if arch_bits == 32 else "0x1122334455667788"
+    return E2EInputs(
+        arch_bits=arch_bits,
+        reg_name=reg_name,
+        reg_value_hex=reg_value_hex,
+        mem_write_hex="M1010,4:01020304",
+        mem_write_bin="X1014,4:ABCD",
+        mem_read_hex="m1010,4",
+        mem_read_bin="x1014,4",
+    )
+
+
 def start_process(args: list[str]) -> ProcessResult:
     proc = subprocess.Popen(
         args,
@@ -91,21 +120,30 @@ def wait_for_output_line(
 
 
 def build_lldb_commands(
-    arch: str,
+    inputs: E2EInputs,
     host: str,
     port: int,
     log_path: str,
-    reg_name: str,
-    reg_value_hex: str,
 ) -> list[str]:
     return [
-        f"settings set target.default-arch {arch}",
+        f"settings set target.default-arch {inputs.arch_name}",
         f"log enable -f {log_path} gdb-remote packets",
         f"gdb-remote {host}:{port}",
         "register read",
-        f"register write {reg_name} {reg_value_hex}",
-        f"register read {reg_name}",
-        "memory read --format x --count 4 0x1000",
+        f"register write {inputs.reg_name} {inputs.reg_value_hex}",
+        f"register read {inputs.reg_name}",
+        "process plugin packet send qHostInfo",
+        "process plugin packet send qProcessInfo",
+        "process plugin packet send qMemoryRegionInfo:1000",
+        "process plugin packet send qXfer:memory-map:read::0,200",
+        "process plugin packet send vCont?",
+        "process plugin packet send QListThreadsInStopReply",
+        "process plugin packet send QThreadSuffixSupported",
+        f"process plugin packet send {inputs.mem_write_hex}",
+        f"process plugin packet send {inputs.mem_write_bin}",
+        f"process plugin packet send {inputs.mem_read_hex}",
+        f"process plugin packet send {inputs.mem_read_bin}",
+        "memory read --format x --count 4 0x1010",
         "breakpoint set --address 0x1008",
         "continue",
         "stepi",
@@ -180,9 +218,48 @@ def require_output_match(
         errors.append(f"missing output: {label}")
 
 
-def check_lldb_output(stdout: str, reg_name: str, reg_value_hex: str) -> list[str]:
+def strip_ansi(text: str) -> str:
+    ansi_re = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+    return ansi_re.sub("", text)
+
+
+def parse_packet_responses(stdout: str) -> dict[str, list[str]]:
+    responses: dict[str, list[str]] = {}
+    last_packet: Optional[str] = None
+    for line in stdout.splitlines():
+        match_packet = re.match(r"\s*packet:\s*(.+)\s*$", line, re.IGNORECASE)
+        if match_packet:
+            last_packet = match_packet.group(1).strip()
+            continue
+        match_response = re.match(r"\s*response:\s*(.*)\s*$", line, re.IGNORECASE)
+        if match_response and last_packet is not None:
+            responses.setdefault(last_packet, []).append(match_response.group(1).strip())
+            last_packet = None
+    return responses
+
+
+def require_packet_response(
+    packet: str,
+    response_pattern: str,
+    responses: dict[str, list[str]],
+    label: str,
+    errors: list[str],
+) -> None:
+    candidates = responses.get(packet)
+    if not candidates:
+        errors.append(f"missing output: {label}")
+        return
+    if not any(
+        re.search(response_pattern, candidate, re.IGNORECASE) for candidate in candidates
+    ):
+        errors.append(f"missing output: {label}")
+
+
+def check_lldb_output(stdout: str, inputs: E2EInputs) -> list[str]:
+    stdout = strip_ansi(stdout)
     errors: list[str] = []
-    reg_value = reg_value_hex.lower().removeprefix("0x")
+    reg_value = inputs.reg_value_hex.lower().removeprefix("0x")
+    responses = parse_packet_responses(stdout)
     require_output_match(r"\bpc\s*=\s*0x0*1000\b", stdout, "pc = 0x1000", errors)
     require_output_match(
         r"Breakpoint 1: address = 0x0*1008",
@@ -191,15 +268,75 @@ def check_lldb_output(stdout: str, reg_name: str, reg_value_hex: str) -> list[st
         errors,
     )
     require_output_match(
-        rf"\b{re.escape(reg_name)}\s*=\s*0x0*{re.escape(reg_value)}\b",
+        rf"\b{re.escape(inputs.reg_name)}\s*=\s*0x0*{re.escape(reg_value)}\b",
         stdout,
-        f"{reg_name} = 0x{reg_value}",
+        f"{inputs.reg_name} = 0x{reg_value}",
         errors,
     )
     if "stop reason = breakpoint" not in stdout:
         errors.append("missing output: stop reason = breakpoint")
     if "thread #1" not in stdout:
         errors.append("missing output: thread #1")
+
+    require_packet_response(
+        "qHostInfo", r".*hostname:", responses, "qHostInfo response", errors
+    )
+    require_packet_response(
+        "qProcessInfo", r".*pid:", responses, "qProcessInfo response", errors
+    )
+    require_packet_response(
+        "qMemoryRegionInfo:1000",
+        r"start:.*permissions:",
+        responses,
+        "qMemoryRegionInfo response",
+        errors,
+    )
+    require_packet_response(
+        "qXfer:memory-map:read::0,200",
+        r".*<memory-map",
+        responses,
+        "memory-map response",
+        errors,
+    )
+    require_packet_response("vCont?", r"vCont;", responses, "vCont response", errors)
+    require_packet_response(
+        "QListThreadsInStopReply",
+        r"OK",
+        responses,
+        "QListThreadsInStopReply response",
+        errors,
+    )
+    require_packet_response(
+        "QThreadSuffixSupported",
+        r"OK",
+        responses,
+        "QThreadSuffixSupported response",
+        errors,
+    )
+    require_packet_response(
+        inputs.mem_write_hex, r"OK", responses, "memory write hex response", errors
+    )
+    require_packet_response(
+        inputs.mem_write_bin,
+        r"OK",
+        responses,
+        "memory write binary response",
+        errors,
+    )
+    require_packet_response(
+        inputs.mem_read_hex,
+        r"01020304",
+        responses,
+        "memory read hex response",
+        errors,
+    )
+    require_packet_response(
+        inputs.mem_read_bin,
+        r"ABCD",
+        responses,
+        "memory read binary response",
+        errors,
+    )
     return errors
 
 
@@ -243,6 +380,11 @@ def check_rsp_log(log_text: str) -> list[str]:
     ):
         errors.append("missing memory read packet")
 
+    if not has_event(
+        events, "send", lambda payload: payload.startswith("M") or payload.startswith("X")
+    ):
+        errors.append("missing memory write packet")
+
     if not response_after(
         events,
         lambda payload: payload.startswith("Z0,1008"),
@@ -256,6 +398,48 @@ def check_rsp_log(log_text: str) -> list[str]:
         lambda payload: payload.startswith("T"),
     ):
         errors.append("missing stop reply after continue")
+
+    if not response_after(
+        events,
+        lambda payload: payload == "vCont?",
+        lambda payload: payload.startswith("vCont"),
+    ):
+        errors.append("missing vCont? response")
+
+    if not response_after(
+        events,
+        lambda payload: payload == "QListThreadsInStopReply",
+        lambda payload: payload == "OK",
+    ):
+        errors.append("missing QListThreadsInStopReply response")
+
+    if not response_after(
+        events,
+        lambda payload: payload == "QThreadSuffixSupported",
+        lambda payload: payload == "OK",
+    ):
+        errors.append("missing QThreadSuffixSupported response")
+
+    if not response_after(
+        events,
+        lambda payload: payload.startswith("qMemoryRegionInfo:"),
+        lambda payload: payload.startswith("start:"),
+    ):
+        errors.append("missing qMemoryRegionInfo response")
+
+    if not response_after(
+        events,
+        lambda payload: payload.startswith("qXfer:memory-map:read::"),
+        lambda payload: "<memory-map" in payload,
+    ):
+        errors.append("missing memory-map response")
+
+    if not has_event(
+        events,
+        "read",
+        lambda payload: payload.startswith("T") and "threads:" in payload,
+    ):
+        errors.append("missing threads list in stop reply")
 
     if not (
         has_event(events, "send", lambda payload: payload.startswith("qfThreadInfo"))
@@ -284,7 +468,6 @@ def check_rsp_log(log_text: str) -> list[str]:
     for optional_packet in (
         "qStructuredDataPlugins",
         "qShlibInfoAddr",
-        "qXfer:memory-map:read::",
     ):
         if has_event(
             events, "send", lambda payload, p=optional_packet: payload.startswith(p)
@@ -299,34 +482,23 @@ def check_rsp_log(log_text: str) -> list[str]:
     return errors
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description="LLDB end-to-end test for gdbstub_cpp")
-    parser.add_argument("--lldb", required=True, help="Path to lldb executable")
-    parser.add_argument("--gdbstub-tool", required=True, help="Path to gdbstub_tool")
-    parser.add_argument("--arch", choices=["32", "64"], default="32")
-    parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--timeout", type=float, default=25.0)
-    args = parser.parse_args()
-
-    gdbstub_tool = os.path.abspath(args.gdbstub_tool)
-    if not os.path.exists(gdbstub_tool):
-        print(f"gdbstub_tool not found: {gdbstub_tool}")
-        return 1
-
-    arch_bits = int(args.arch)
-    arch_name = "riscv32" if arch_bits == 32 else "riscv64"
-    reg_name = "r1"
-    reg_value_hex = "0x11223344" if arch_bits == 32 else "0x1122334455667788"
-
-    port = next_available_port(args.host)
+def run_mode(
+    mode: str,
+    gdbstub_tool: str,
+    lldb_path: str,
+    host: str,
+    timeout: float,
+    inputs: E2EInputs,
+) -> tuple[bool, str, str, str, list[str], list[str]]:
+    port = next_available_port(host)
     tool_args = [
         gdbstub_tool,
         "--listen",
-        f"{args.host}:{port}",
+        f"{host}:{port}",
         "--arch",
-        str(arch_bits),
+        str(inputs.arch_bits),
         "--mode",
-        "polling",
+        mode,
     ]
 
     tool_result = start_process(tool_args)
@@ -336,25 +508,15 @@ def main() -> int:
     if ready_line is None:
         tool_output = tool_result.drain_output()
         tool_result.terminate(timeout=5)
-        print("gdbstub_tool did not start listening in time")
-        if tool_output:
-            print("--- gdbstub_tool output ---")
-            print(tool_output)
-        return 1
+        return False, tool_output, "", "", [f"{mode}: gdbstub_tool did not start"], []
 
     with tempfile.TemporaryDirectory() as temp_dir:
-        log_path = os.path.join(temp_dir, "lldb-gdb-remote.log")
-        commands = build_lldb_commands(
-            arch_name,
-            args.host,
-            port,
-            log_path,
-            reg_name,
-            reg_value_hex,
-        )
+        log_path = os.path.join(temp_dir, f"lldb-gdb-remote-{mode}.log")
+        commands = build_lldb_commands(inputs, host, port, log_path)
 
+        mode_timeout = timeout * 1.5 if mode == "async" else timeout
         try:
-            lldb_result = run_lldb(args.lldb, commands, args.timeout)
+            lldb_result = run_lldb(lldb_path, commands, mode_timeout)
         except subprocess.TimeoutExpired:
             lldb_result = None
 
@@ -376,34 +538,97 @@ def main() -> int:
             stderr += "\nmissing lldb gdb-remote log\n"
 
         output_errors = (
-            check_lldb_output(stdout, reg_name, reg_value_hex) if success else []
+            check_lldb_output(stdout, inputs)
+            if success
+            else []
         )
         log_errors = check_rsp_log(log_text) if log_text else []
         if output_errors or log_errors:
             success = False
 
-        if not success:
-            if lldb_result is None:
-                print("lldb timed out")
-            if output_errors:
-                for error in output_errors:
-                    print(error)
-            if log_errors:
-                for error in log_errors:
-                    print(error)
-            print("--- lldb stdout ---")
-            print(stdout)
-            print("--- lldb stderr ---")
-            print(stderr)
-            if log_text:
-                print("--- lldb gdb-remote log (tail) ---")
-                print("".join(log_text.splitlines()[-40:]))
-        else:
-            print("--- lldb gdb-remote log (tail) ---")
-            print("".join(log_text.splitlines()[-20:]))
-
     tool_result.terminate(timeout=5)
-    return 0 if success else 1
+    return success, stdout, stderr, log_text, output_errors, log_errors
+
+
+def report_failure(
+    mode: str,
+    stdout: str,
+    stderr: str,
+    log_text: str,
+    output_errors: list[str],
+    log_errors: list[str],
+) -> None:
+    print(f"--- mode {mode} failed ---")
+    if output_errors:
+        for error in output_errors:
+            print(error)
+    if log_errors:
+        for error in log_errors:
+            print(error)
+    print("--- lldb stdout ---")
+    print(stdout)
+    print("--- lldb stderr ---")
+    print(stderr)
+    if log_text:
+        print("--- lldb gdb-remote log (tail) ---")
+        print("".join(log_text.splitlines()[-40:]))
+
+
+def report_success(mode: str, log_text: str) -> None:
+    print(f"--- mode {mode} lldb gdb-remote log (tail) ---")
+    print("".join(log_text.splitlines()[-20:]))
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="LLDB end-to-end test for gdbstub_cpp")
+    parser.add_argument("--lldb", required=True, help="Path to lldb executable")
+    parser.add_argument("--gdbstub-tool", required=True, help="Path to gdbstub_tool")
+    parser.add_argument("--arch", choices=["32", "64"], default="32")
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--timeout", type=float, default=25.0)
+    parser.add_argument(
+        "--mode",
+        choices=["blocking", "polling", "async", "all"],
+        default="all",
+        help="Execution mode to test (default: all).",
+    )
+    args = parser.parse_args()
+
+    gdbstub_tool = os.path.abspath(args.gdbstub_tool)
+    if not os.path.exists(gdbstub_tool):
+        print(f"gdbstub_tool not found: {gdbstub_tool}")
+        return 1
+
+    arch_bits = int(args.arch)
+    inputs = make_inputs(arch_bits)
+
+    modes = ["blocking", "polling", "async"] if args.mode == "all" else [args.mode]
+    overall_success = True
+
+    for mode in modes:
+        (
+            success,
+            stdout,
+            stderr,
+            log_text,
+            output_errors,
+            log_errors,
+        ) = run_mode(
+            mode,
+            gdbstub_tool,
+            args.lldb,
+            args.host,
+            args.timeout,
+            inputs,
+        )
+
+        if not success:
+            overall_success = False
+            report_failure(mode, stdout, stderr, log_text, output_errors, log_errors)
+        else:
+            report_success(mode, log_text)
+
+    return 0 if overall_success else 1
 
 
 if __name__ == "__main__":
