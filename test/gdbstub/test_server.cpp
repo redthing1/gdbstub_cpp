@@ -82,15 +82,7 @@ private:
   std::vector<std::byte> outgoing_;
 };
 
-struct mock_target : gdbstub::register_access,
-                     gdbstub::memory_access,
-                     gdbstub::run_control,
-                     gdbstub::breakpoint_access,
-                     gdbstub::memory_map,
-                     gdbstub::host_info_provider,
-                     gdbstub::process_info_provider,
-                     gdbstub::thread_access,
-                     gdbstub::shlib_info_provider {
+struct mock_state {
   std::array<uint32_t, 3> regs{};
   std::vector<std::byte> memory = std::vector<std::byte>(0x2000);
   std::vector<uint64_t> threads = {1};
@@ -99,8 +91,8 @@ struct mock_target : gdbstub::register_access,
   std::optional<gdbstub::shlib_info> shlib;
   std::optional<gdbstub::resume_request> last_resume;
   std::optional<uint64_t> last_set_thread;
-  std::optional<gdbstub::breakpoint_access::spec> last_breakpoint;
-  std::optional<gdbstub::breakpoint_access::spec> last_removed_breakpoint;
+  std::optional<gdbstub::breakpoint_spec> last_breakpoint;
+  std::optional<gdbstub::breakpoint_spec> last_removed_breakpoint;
   gdbstub::target_status breakpoint_status = gdbstub::target_status::ok;
   bool interrupt_called = false;
   uint64_t current_tid = 1;
@@ -109,15 +101,19 @@ struct mock_target : gdbstub::register_access,
 
   resume_behavior resume_behavior = resume_behavior::stop_immediately;
 
-  mock_target() { regs[2] = 0x1000; }
+  mock_state() { regs[2] = 0x1000; }
+};
 
-  size_t reg_size(int) const override { return 4; }
+struct mock_regs {
+  mock_state& state;
 
-  gdbstub::target_status read_reg(int regno, std::span<std::byte> out) override {
-    if (regno < 0 || regno >= static_cast<int>(regs.size()) || out.size() != 4) {
+  size_t reg_size(int) const { return 4; }
+
+  gdbstub::target_status read_reg(int regno, std::span<std::byte> out) {
+    if (regno < 0 || regno >= static_cast<int>(state.regs.size()) || out.size() != 4) {
       return gdbstub::target_status::invalid;
     }
-    uint32_t value = regs[static_cast<size_t>(regno)];
+    uint32_t value = state.regs[static_cast<size_t>(regno)];
     out[0] = std::byte(value & 0xff);
     out[1] = std::byte((value >> 8) & 0xff);
     out[2] = std::byte((value >> 16) & 0xff);
@@ -125,42 +121,50 @@ struct mock_target : gdbstub::register_access,
     return gdbstub::target_status::ok;
   }
 
-  gdbstub::target_status write_reg(int regno, std::span<const std::byte> data) override {
-    if (regno < 0 || regno >= static_cast<int>(regs.size()) || data.size() != 4) {
+  gdbstub::target_status write_reg(int regno, std::span<const std::byte> data) {
+    if (regno < 0 || regno >= static_cast<int>(state.regs.size()) || data.size() != 4) {
       return gdbstub::target_status::invalid;
     }
     uint32_t value = static_cast<uint32_t>(data[0]) |
                      (static_cast<uint32_t>(data[1]) << 8) |
                      (static_cast<uint32_t>(data[2]) << 16) |
                      (static_cast<uint32_t>(data[3]) << 24);
-    regs[static_cast<size_t>(regno)] = value;
+    state.regs[static_cast<size_t>(regno)] = value;
     return gdbstub::target_status::ok;
   }
+};
 
-  gdbstub::target_status read_mem(uint64_t addr, std::span<std::byte> out) override {
-    if (addr + out.size() > memory.size()) {
+struct mock_mem {
+  mock_state& state;
+
+  gdbstub::target_status read_mem(uint64_t addr, std::span<std::byte> out) {
+    if (addr + out.size() > state.memory.size()) {
       return gdbstub::target_status::fault;
     }
-    std::memcpy(out.data(), memory.data() + addr, out.size());
+    std::memcpy(out.data(), state.memory.data() + addr, out.size());
     return gdbstub::target_status::ok;
   }
 
-  gdbstub::target_status write_mem(uint64_t addr, std::span<const std::byte> data) override {
-    if (addr + data.size() > memory.size()) {
+  gdbstub::target_status write_mem(uint64_t addr, std::span<const std::byte> data) {
+    if (addr + data.size() > state.memory.size()) {
       return gdbstub::target_status::fault;
     }
-    std::memcpy(memory.data() + addr, data.data(), data.size());
+    std::memcpy(state.memory.data() + addr, data.data(), data.size());
     return gdbstub::target_status::ok;
   }
+};
 
-  gdbstub::resume_result resume(const gdbstub::resume_request& request) override {
-    last_resume = request;
+struct mock_run {
+  mock_state& state;
+
+  gdbstub::resume_result resume(const gdbstub::resume_request& request) {
+    state.last_resume = request;
     if (request.action == gdbstub::resume_action::step) {
-      regs[2] += 4;
+      state.regs[2] += 4;
     }
 
     gdbstub::resume_result result;
-    if (resume_behavior == resume_behavior::run) {
+    if (state.resume_behavior == mock_state::resume_behavior::run) {
       result.state = gdbstub::resume_result::state::running;
       return result;
     }
@@ -170,58 +174,90 @@ struct mock_target : gdbstub::register_access,
     return result;
   }
 
-  void interrupt() override { interrupt_called = true; }
+  void interrupt() { state.interrupt_called = true; }
 
-  gdbstub::target_status set_breakpoint(const gdbstub::breakpoint_access::spec& request) override {
-    last_breakpoint = request;
-    return breakpoint_status;
-  }
-  gdbstub::target_status remove_breakpoint(const gdbstub::breakpoint_access::spec& request) override {
-    last_removed_breakpoint = request;
-    return breakpoint_status;
+  std::optional<gdbstub::stop_reason> poll_stop() { return std::nullopt; }
+};
+
+struct mock_breakpoints {
+  mock_state& state;
+
+  gdbstub::target_status set_breakpoint(const gdbstub::breakpoint_spec& request) {
+    state.last_breakpoint = request;
+    return state.breakpoint_status;
   }
 
-  std::optional<gdbstub::memory_region> region_for(uint64_t addr) override {
+  gdbstub::target_status remove_breakpoint(const gdbstub::breakpoint_spec& request) {
+    state.last_removed_breakpoint = request;
+    return state.breakpoint_status;
+  }
+};
+
+struct mock_memory_map {
+  std::optional<gdbstub::memory_region> region_for(uint64_t addr) {
     if (addr >= 0x1000 && addr < 0x1100) {
       return gdbstub::memory_region{0x1000, 0x100, "rwx"};
     }
     return std::nullopt;
   }
 
-  std::vector<gdbstub::memory_region> regions() override {
-    return {gdbstub::memory_region{0x1000, 0x100, "rwx"}};
-  }
+  std::vector<gdbstub::memory_region> regions() { return {gdbstub::memory_region{0x1000, 0x100, "rwx"}}; }
+};
 
-  std::optional<gdbstub::host_info> get_host_info() override {
-    return gdbstub::host_info{
-        "riscv32-unknown-elf", "little", 4, "mock-host", "1.0", "build", "kernel", std::nullopt};
-  }
+struct mock_threads {
+  mock_state& state;
 
-  std::optional<gdbstub::process_info> get_process_info() override {
-    return gdbstub::process_info{42, "riscv32-unknown-elf", "little", 4, "bare"};
-  }
-
-  std::vector<uint64_t> thread_ids() override { return threads; }
-  uint64_t current_thread() const override { return current_tid; }
-  gdbstub::target_status set_current_thread(uint64_t tid) override {
-    current_tid = tid;
-    last_set_thread = tid;
+  std::vector<uint64_t> thread_ids() { return state.threads; }
+  uint64_t current_thread() const { return state.current_tid; }
+  gdbstub::target_status set_current_thread(uint64_t tid) {
+    state.current_tid = tid;
+    state.last_set_thread = tid;
     return gdbstub::target_status::ok;
   }
-  std::optional<uint64_t> thread_pc(uint64_t tid) override {
-    if (!thread_pcs.empty()) {
-      auto it = thread_pcs.find(tid);
-      if (it != thread_pcs.end()) {
+  std::optional<uint64_t> thread_pc(uint64_t tid) {
+    if (!state.thread_pcs.empty()) {
+      auto it = state.thread_pcs.find(tid);
+      if (it != state.thread_pcs.end()) {
         return it->second;
       }
       return std::nullopt;
     }
-    return regs[2];
+    return state.regs[2];
   }
-  std::optional<std::string> thread_name(uint64_t) override { return std::nullopt; }
-  std::optional<gdbstub::stop_reason> thread_stop_reason(uint64_t) override { return stop_for_threads; }
+  std::optional<std::string> thread_name(uint64_t) { return std::nullopt; }
+  std::optional<gdbstub::stop_reason> thread_stop_reason(uint64_t) { return state.stop_for_threads; }
+};
 
-  std::optional<gdbstub::shlib_info> get_shlib_info() override { return shlib; }
+struct mock_host {
+  std::optional<gdbstub::host_info> get_host_info() {
+    return gdbstub::host_info{
+        "riscv32-unknown-elf", "little", 4, "mock-host", "1.0", "build", "kernel", std::nullopt};
+  }
+};
+
+struct mock_process {
+  std::optional<gdbstub::process_info> get_process_info() {
+    return gdbstub::process_info{42, "riscv32-unknown-elf", "little", 4, "bare"};
+  }
+};
+
+struct mock_shlib {
+  mock_state& state;
+
+  std::optional<gdbstub::shlib_info> get_shlib_info() { return state.shlib; }
+};
+
+struct mock_components {
+  mock_state& state;
+  mock_regs regs{state};
+  mock_mem mem{state};
+  mock_run run{state};
+  mock_breakpoints breakpoints{state};
+  mock_memory_map memory_map{};
+  mock_threads threads{state};
+  mock_host host{};
+  mock_process process{};
+  mock_shlib shlib{state};
 };
 
 struct parsed_output {
@@ -252,15 +288,18 @@ parsed_output parse_output(std::string_view data) {
   return out;
 }
 
-gdbstub::target_handles make_handles(mock_target& target) {
-  gdbstub::target_handles handles{target, target, target};
-  handles.breakpoints = &target;
-  handles.memory = &target;
-  handles.threads = &target;
-  handles.host = &target;
-  handles.process = &target;
-  handles.shlib = &target;
-  return handles;
+gdbstub::target make_target(mock_components& target) {
+  return gdbstub::make_target(
+      target.regs,
+      target.mem,
+      target.run,
+      target.breakpoints,
+      target.threads,
+      target.memory_map,
+      target.host,
+      target.process,
+      target.shlib
+  );
 }
 
 std::string unescape_payload(std::string payload) {
@@ -282,7 +321,8 @@ parsed_output send_packet(
 } // namespace
 
 TEST_CASE("server responds to qSupported") {
-  mock_target target;
+  mock_state state;
+  mock_components target(state);
   gdbstub::arch_spec arch;
   arch.reg_count = 3;
   arch.pc_reg_num = 2;
@@ -291,7 +331,7 @@ TEST_CASE("server responds to qSupported") {
 
   auto transport = std::make_unique<loopback_transport>();
   auto* transport_ptr = transport.get();
-  gdbstub::server server(make_handles(target), arch, std::move(transport));
+  gdbstub::server server(make_target(target), arch, std::move(transport));
 
   REQUIRE(server.listen("loop"));
   REQUIRE(server.wait_for_connection());
@@ -307,14 +347,15 @@ TEST_CASE("server responds to qSupported") {
 }
 
 TEST_CASE("server reports gdbserver version") {
-  mock_target target;
+  mock_state state;
+  mock_components target(state);
   gdbstub::arch_spec arch;
   arch.reg_count = 3;
   arch.pc_reg_num = 2;
 
   auto transport = std::make_unique<loopback_transport>();
   auto* transport_ptr = transport.get();
-  gdbstub::server server(make_handles(target), arch, std::move(transport));
+  gdbstub::server server(make_target(target), arch, std::move(transport));
 
   REQUIRE(server.listen("loop"));
   REQUIRE(server.wait_for_connection());
@@ -326,14 +367,15 @@ TEST_CASE("server reports gdbserver version") {
 }
 
 TEST_CASE("server responds to qThreadStopInfo") {
-  mock_target target;
+  mock_state state;
+  mock_components target(state);
   gdbstub::arch_spec arch;
   arch.reg_count = 3;
   arch.pc_reg_num = 2;
 
   auto transport = std::make_unique<loopback_transport>();
   auto* transport_ptr = transport.get();
-  gdbstub::server server(make_handles(target), arch, std::move(transport));
+  gdbstub::server server(make_target(target), arch, std::move(transport));
 
   REQUIRE(server.listen("loop"));
   REQUIRE(server.wait_for_connection());
@@ -345,14 +387,15 @@ TEST_CASE("server responds to qThreadStopInfo") {
 }
 
 TEST_CASE("server reads and writes registers") {
-  mock_target target;
+  mock_state state;
+  mock_components target(state);
   gdbstub::arch_spec arch;
   arch.reg_count = 3;
   arch.pc_reg_num = 2;
 
   auto transport = std::make_unique<loopback_transport>();
   auto* transport_ptr = transport.get();
-  gdbstub::server server(make_handles(target), arch, std::move(transport));
+  gdbstub::server server(make_target(target), arch, std::move(transport));
 
   REQUIRE(server.listen("loop"));
   REQUIRE(server.wait_for_connection());
@@ -367,8 +410,9 @@ TEST_CASE("server reads and writes registers") {
 }
 
 TEST_CASE("server reads and writes all registers") {
-  mock_target target;
-  target.regs = {0x11223344, 0x55667788, 0x99aabbcc};
+  mock_state state;
+  mock_components target(state);
+  state.regs = {0x11223344, 0x55667788, 0x99aabbcc};
 
   gdbstub::arch_spec arch;
   arch.reg_count = 3;
@@ -376,7 +420,7 @@ TEST_CASE("server reads and writes all registers") {
 
   auto transport = std::make_unique<loopback_transport>();
   auto* transport_ptr = transport.get();
-  gdbstub::server server(make_handles(target), arch, std::move(transport));
+  gdbstub::server server(make_target(target), arch, std::move(transport));
 
   REQUIRE(server.listen("loop"));
   REQUIRE(server.wait_for_connection());
@@ -388,20 +432,21 @@ TEST_CASE("server reads and writes all registers") {
   auto write_out = send_packet(server, *transport_ptr, "G0102030405060708090a0b0c");
   REQUIRE(write_out.packets.size() == 1);
   CHECK(write_out.packets[0].payload == "OK");
-  CHECK(target.regs[0] == 0x04030201);
-  CHECK(target.regs[1] == 0x08070605);
-  CHECK(target.regs[2] == 0x0c0b0a09);
+  CHECK(state.regs[0] == 0x04030201);
+  CHECK(state.regs[1] == 0x08070605);
+  CHECK(state.regs[2] == 0x0c0b0a09);
 }
 
 TEST_CASE("server rejects malformed G packets") {
-  mock_target target;
+  mock_state state;
+  mock_components target(state);
   gdbstub::arch_spec arch;
   arch.reg_count = 3;
   arch.pc_reg_num = 2;
 
   auto transport = std::make_unique<loopback_transport>();
   auto* transport_ptr = transport.get();
-  gdbstub::server server(make_handles(target), arch, std::move(transport));
+  gdbstub::server server(make_target(target), arch, std::move(transport));
 
   REQUIRE(server.listen("loop"));
   REQUIRE(server.wait_for_connection());
@@ -412,19 +457,20 @@ TEST_CASE("server rejects malformed G packets") {
 }
 
 TEST_CASE("server reads memory") {
-  mock_target target;
+  mock_state state;
+  mock_components target(state);
   gdbstub::arch_spec arch;
   arch.reg_count = 3;
   arch.pc_reg_num = 2;
 
-  target.memory[0x1000] = std::byte{0xaa};
-  target.memory[0x1001] = std::byte{0xbb};
-  target.memory[0x1002] = std::byte{0xcc};
-  target.memory[0x1003] = std::byte{0xdd};
+  state.memory[0x1000] = std::byte{0xaa};
+  state.memory[0x1001] = std::byte{0xbb};
+  state.memory[0x1002] = std::byte{0xcc};
+  state.memory[0x1003] = std::byte{0xdd};
 
   auto transport = std::make_unique<loopback_transport>();
   auto* transport_ptr = transport.get();
-  gdbstub::server server(make_handles(target), arch, std::move(transport));
+  gdbstub::server server(make_target(target), arch, std::move(transport));
 
   REQUIRE(server.listen("loop"));
   REQUIRE(server.wait_for_connection());
@@ -435,14 +481,15 @@ TEST_CASE("server reads memory") {
 }
 
 TEST_CASE("server writes memory in hex and binary forms") {
-  mock_target target;
+  mock_state state;
+  mock_components target(state);
   gdbstub::arch_spec arch;
   arch.reg_count = 3;
   arch.pc_reg_num = 2;
 
   auto transport = std::make_unique<loopback_transport>();
   auto* transport_ptr = transport.get();
-  gdbstub::server server(make_handles(target), arch, std::move(transport));
+  gdbstub::server server(make_target(target), arch, std::move(transport));
 
   REQUIRE(server.listen("loop"));
   REQUIRE(server.wait_for_connection());
@@ -450,10 +497,10 @@ TEST_CASE("server writes memory in hex and binary forms") {
   auto hex_out = send_packet(server, *transport_ptr, "M1000,4:01020304");
   REQUIRE(hex_out.packets.size() == 1);
   CHECK(hex_out.packets[0].payload == "OK");
-  CHECK(target.memory[0x1000] == std::byte{0x01});
-  CHECK(target.memory[0x1001] == std::byte{0x02});
-  CHECK(target.memory[0x1002] == std::byte{0x03});
-  CHECK(target.memory[0x1003] == std::byte{0x04});
+  CHECK(state.memory[0x1000] == std::byte{0x01});
+  CHECK(state.memory[0x1001] == std::byte{0x02});
+  CHECK(state.memory[0x1002] == std::byte{0x03});
+  CHECK(state.memory[0x1003] == std::byte{0x04});
 
   std::string data = "A$#}";
   std::string payload = "X1000,4:";
@@ -461,21 +508,22 @@ TEST_CASE("server writes memory in hex and binary forms") {
   auto bin_out = send_packet(server, *transport_ptr, payload);
   REQUIRE(bin_out.packets.size() == 1);
   CHECK(bin_out.packets[0].payload == "OK");
-  CHECK(target.memory[0x1000] == std::byte{'A'});
-  CHECK(target.memory[0x1001] == std::byte{'$'});
-  CHECK(target.memory[0x1002] == std::byte{'#'});
-  CHECK(target.memory[0x1003] == std::byte{'}'});
+  CHECK(state.memory[0x1000] == std::byte{'A'});
+  CHECK(state.memory[0x1001] == std::byte{'$'});
+  CHECK(state.memory[0x1002] == std::byte{'#'});
+  CHECK(state.memory[0x1003] == std::byte{'}'});
 }
 
 TEST_CASE("server reports memory faults") {
-  mock_target target;
+  mock_state state;
+  mock_components target(state);
   gdbstub::arch_spec arch;
   arch.reg_count = 3;
   arch.pc_reg_num = 2;
 
   auto transport = std::make_unique<loopback_transport>();
   auto* transport_ptr = transport.get();
-  gdbstub::server server(make_handles(target), arch, std::move(transport));
+  gdbstub::server server(make_target(target), arch, std::move(transport));
 
   REQUIRE(server.listen("loop"));
   REQUIRE(server.wait_for_connection());
@@ -486,14 +534,15 @@ TEST_CASE("server reports memory faults") {
 }
 
 TEST_CASE("server handles no-ack mode") {
-  mock_target target;
+  mock_state state;
+  mock_components target(state);
   gdbstub::arch_spec arch;
   arch.reg_count = 3;
   arch.pc_reg_num = 2;
 
   auto transport = std::make_unique<loopback_transport>();
   auto* transport_ptr = transport.get();
-  gdbstub::server server(make_handles(target), arch, std::move(transport));
+  gdbstub::server server(make_target(target), arch, std::move(transport));
 
   REQUIRE(server.listen("loop"));
   REQUIRE(server.wait_for_connection());
@@ -510,15 +559,16 @@ TEST_CASE("server handles no-ack mode") {
 }
 
 TEST_CASE("server supports thread suffix on register packets") {
-  mock_target target;
-  target.threads = {1, 2};
+  mock_state state;
+  mock_components target(state);
+  state.threads = {1, 2};
   gdbstub::arch_spec arch;
   arch.reg_count = 3;
   arch.pc_reg_num = 2;
 
   auto transport = std::make_unique<loopback_transport>();
   auto* transport_ptr = transport.get();
-  gdbstub::server server(make_handles(target), arch, std::move(transport));
+  gdbstub::server server(make_target(target), arch, std::move(transport));
 
   REQUIRE(server.listen("loop"));
   REQUIRE(server.wait_for_connection());
@@ -529,12 +579,13 @@ TEST_CASE("server supports thread suffix on register packets") {
 
   auto read = send_packet(server, *transport_ptr, "p0;thread:2;");
   REQUIRE(read.packets.size() == 1);
-  CHECK(target.last_set_thread.has_value());
-  CHECK(target.last_set_thread.value() == 2);
+  CHECK(state.last_set_thread.has_value());
+  CHECK(state.last_set_thread.value() == 2);
 }
 
 TEST_CASE("server serves target xml via qXfer") {
-  mock_target target;
+  mock_state state;
+  mock_components target(state);
   gdbstub::arch_spec arch;
   arch.reg_count = 3;
   arch.pc_reg_num = 2;
@@ -543,7 +594,7 @@ TEST_CASE("server serves target xml via qXfer") {
 
   auto transport = std::make_unique<loopback_transport>();
   auto* transport_ptr = transport.get();
-  gdbstub::server server(make_handles(target), arch, std::move(transport));
+  gdbstub::server server(make_target(target), arch, std::move(transport));
 
   REQUIRE(server.listen("loop"));
   REQUIRE(server.wait_for_connection());
@@ -554,14 +605,15 @@ TEST_CASE("server serves target xml via qXfer") {
 }
 
 TEST_CASE("server sets breakpoints and continues") {
-  mock_target target;
+  mock_state state;
+  mock_components target(state);
   gdbstub::arch_spec arch;
   arch.reg_count = 3;
   arch.pc_reg_num = 2;
 
   auto transport = std::make_unique<loopback_transport>();
   auto* transport_ptr = transport.get();
-  gdbstub::server server(make_handles(target), arch, std::move(transport));
+  gdbstub::server server(make_target(target), arch, std::move(transport));
 
   REQUIRE(server.listen("loop"));
   REQUIRE(server.wait_for_connection());
@@ -569,10 +621,10 @@ TEST_CASE("server sets breakpoints and continues") {
   auto bp = send_packet(server, *transport_ptr, "Z0,1000,4");
   REQUIRE(bp.packets.size() == 1);
   CHECK(bp.packets[0].payload == "OK");
-  REQUIRE(target.last_breakpoint.has_value());
-  CHECK(target.last_breakpoint->type == gdbstub::breakpoint_access::type::software);
-  CHECK(target.last_breakpoint->addr == 0x1000);
-  CHECK(target.last_breakpoint->length == 4);
+  REQUIRE(state.last_breakpoint.has_value());
+  CHECK(state.last_breakpoint->type == gdbstub::breakpoint_type::software);
+  CHECK(state.last_breakpoint->addr == 0x1000);
+  CHECK(state.last_breakpoint->length == 4);
 
   auto cont = send_packet(server, *transport_ptr, "c");
   REQUIRE(cont.packets.size() == 1);
@@ -580,59 +632,62 @@ TEST_CASE("server sets breakpoints and continues") {
 }
 
 TEST_CASE("server parses vCont actions and signals") {
-  mock_target target;
+  mock_state state;
+  mock_components target(state);
   gdbstub::arch_spec arch;
   arch.reg_count = 3;
   arch.pc_reg_num = 2;
 
   auto transport = std::make_unique<loopback_transport>();
   auto* transport_ptr = transport.get();
-  gdbstub::server server(make_handles(target), arch, std::move(transport));
+  gdbstub::server server(make_target(target), arch, std::move(transport));
 
   REQUIRE(server.listen("loop"));
   REQUIRE(server.wait_for_connection());
 
   auto cont = send_packet(server, *transport_ptr, "vCont;c");
   REQUIRE(cont.packets.size() == 1);
-  REQUIRE(target.last_resume.has_value());
-  CHECK(target.last_resume->action == gdbstub::resume_action::cont);
-  CHECK_FALSE(target.last_resume->signal.has_value());
+  REQUIRE(state.last_resume.has_value());
+  CHECK(state.last_resume->action == gdbstub::resume_action::cont);
+  CHECK_FALSE(state.last_resume->signal.has_value());
 
   auto step = send_packet(server, *transport_ptr, "vCont;S0a");
   REQUIRE(step.packets.size() == 1);
-  REQUIRE(target.last_resume.has_value());
-  CHECK(target.last_resume->action == gdbstub::resume_action::step);
-  REQUIRE(target.last_resume->signal.has_value());
-  CHECK(target.last_resume->signal.value() == 0x0a);
+  REQUIRE(state.last_resume.has_value());
+  CHECK(state.last_resume->action == gdbstub::resume_action::step);
+  REQUIRE(state.last_resume->signal.has_value());
+  CHECK(state.last_resume->signal.value() == 0x0a);
 }
 
 TEST_CASE("server handles continue with signal and address") {
-  mock_target target;
+  mock_state state;
+  mock_components target(state);
   gdbstub::arch_spec arch;
   arch.reg_count = 3;
   arch.pc_reg_num = 2;
 
   auto transport = std::make_unique<loopback_transport>();
   auto* transport_ptr = transport.get();
-  gdbstub::server server(make_handles(target), arch, std::move(transport));
+  gdbstub::server server(make_target(target), arch, std::move(transport));
 
   REQUIRE(server.listen("loop"));
   REQUIRE(server.wait_for_connection());
 
   auto out = send_packet(server, *transport_ptr, "C05;1234");
   REQUIRE(out.packets.size() == 1);
-  REQUIRE(target.last_resume.has_value());
-  CHECK(target.last_resume->action == gdbstub::resume_action::cont);
-  REQUIRE(target.last_resume->signal.has_value());
-  CHECK(target.last_resume->signal.value() == 0x05);
-  REQUIRE(target.last_resume->addr.has_value());
-  CHECK(target.last_resume->addr.value() == 0x1234);
+  REQUIRE(state.last_resume.has_value());
+  CHECK(state.last_resume->action == gdbstub::resume_action::cont);
+  REQUIRE(state.last_resume->signal.has_value());
+  CHECK(state.last_resume->signal.value() == 0x05);
+  REQUIRE(state.last_resume->addr.has_value());
+  CHECK(state.last_resume->addr.value() == 0x1234);
 }
 
 TEST_CASE("server includes thread list in stop reply when enabled") {
-  mock_target target;
-  target.threads = {1, 2};
-  target.thread_pcs = {{1, 0x1111}, {2, 0x2222}};
+  mock_state state;
+  mock_components target(state);
+  state.threads = {1, 2};
+  state.thread_pcs = {{1, 0x1111}, {2, 0x2222}};
 
   gdbstub::arch_spec arch;
   arch.reg_count = 3;
@@ -640,7 +695,7 @@ TEST_CASE("server includes thread list in stop reply when enabled") {
 
   auto transport = std::make_unique<loopback_transport>();
   auto* transport_ptr = transport.get();
-  gdbstub::server server(make_handles(target), arch, std::move(transport));
+  gdbstub::server server(make_target(target), arch, std::move(transport));
 
   REQUIRE(server.listen("loop"));
   REQUIRE(server.wait_for_connection());
@@ -659,8 +714,9 @@ TEST_CASE("server includes thread list in stop reply when enabled") {
 }
 
 TEST_CASE("server reports unsupported watchpoints") {
-  mock_target target;
-  target.breakpoint_status = gdbstub::target_status::unsupported;
+  mock_state state;
+  mock_components target(state);
+  state.breakpoint_status = gdbstub::target_status::unsupported;
 
   gdbstub::arch_spec arch;
   arch.reg_count = 3;
@@ -668,7 +724,7 @@ TEST_CASE("server reports unsupported watchpoints") {
 
   auto transport = std::make_unique<loopback_transport>();
   auto* transport_ptr = transport.get();
-  gdbstub::server server(make_handles(target), arch, std::move(transport));
+  gdbstub::server server(make_target(target), arch, std::move(transport));
 
   REQUIRE(server.listen("loop"));
   REQUIRE(server.wait_for_connection());
@@ -676,12 +732,13 @@ TEST_CASE("server reports unsupported watchpoints") {
   auto out = send_packet(server, *transport_ptr, "Z2,1000,4");
   REQUIRE(out.packets.size() == 1);
   CHECK(out.packets[0].payload.empty());
-  REQUIRE(target.last_breakpoint.has_value());
-  CHECK(target.last_breakpoint->type == gdbstub::breakpoint_access::type::watch_write);
+  REQUIRE(state.last_breakpoint.has_value());
+  CHECK(state.last_breakpoint->type == gdbstub::breakpoint_type::watch_write);
 }
 
 TEST_CASE("tcp polling integration serves packets") {
-  mock_target target;
+  mock_state state;
+  mock_components target(state);
   gdbstub::arch_spec arch;
   arch.reg_count = 3;
   arch.pc_reg_num = 2;
@@ -689,7 +746,7 @@ TEST_CASE("tcp polling integration serves packets") {
   arch.xml_arch_name = "org.gnu.gdb.riscv.cpu";
 
   auto transport = std::make_unique<gdbstub::transport_tcp>();
-  gdbstub::server server(make_handles(target), arch, std::move(transport));
+  gdbstub::server server(make_target(target), arch, std::move(transport));
 
   constexpr std::string_view k_host = "127.0.0.1";
   auto port = gdbstub::test::listen_on_available_port(server, k_host, 43000, 200);
@@ -720,13 +777,14 @@ TEST_CASE("tcp polling integration serves packets") {
 }
 
 TEST_CASE("tcp blocking integration uses serve_forever") {
-  mock_target target;
+  mock_state state;
+  mock_components target(state);
   gdbstub::arch_spec arch;
   arch.reg_count = 3;
   arch.pc_reg_num = 2;
 
   auto transport = std::make_unique<gdbstub::transport_tcp>();
-  gdbstub::server server(make_handles(target), arch, std::move(transport));
+  gdbstub::server server(make_target(target), arch, std::move(transport));
 
   constexpr std::string_view k_host = "127.0.0.1";
   auto port = gdbstub::test::listen_on_available_port(server, k_host, 43200, 200);
@@ -749,14 +807,15 @@ TEST_CASE("tcp blocking integration uses serve_forever") {
 }
 
 TEST_CASE("tcp async integration sends stop reply") {
-  mock_target target;
-  target.resume_behavior = mock_target::resume_behavior::run;
+  mock_state state;
+  mock_components target(state);
+  state.resume_behavior = mock_state::resume_behavior::run;
   gdbstub::arch_spec arch;
   arch.reg_count = 3;
   arch.pc_reg_num = 2;
 
   auto transport = std::make_unique<gdbstub::transport_tcp>();
-  gdbstub::server server(make_handles(target), arch, std::move(transport));
+  gdbstub::server server(make_target(target), arch, std::move(transport));
 
   constexpr std::string_view k_host = "127.0.0.1";
   auto port = gdbstub::test::listen_on_available_port(server, k_host, 43400, 200);
@@ -799,13 +858,14 @@ TEST_CASE("tcp async integration sends stop reply") {
 }
 
 TEST_CASE("server responds to memory region info queries") {
-  mock_target target;
+  mock_state state;
+  mock_components target(state);
   gdbstub::arch_spec arch;
   arch.reg_count = 3;
 
   auto transport = std::make_unique<loopback_transport>();
   auto* transport_ptr = transport.get();
-  gdbstub::server server(make_handles(target), arch, std::move(transport));
+  gdbstub::server server(make_target(target), arch, std::move(transport));
 
   REQUIRE(server.listen("loop"));
   REQUIRE(server.wait_for_connection());
@@ -821,14 +881,15 @@ TEST_CASE("server responds to memory region info queries") {
 }
 
 TEST_CASE("server checks thread liveness") {
-  mock_target target;
-  target.threads = {1, 2};
+  mock_state state;
+  mock_components target(state);
+  state.threads = {1, 2};
   gdbstub::arch_spec arch;
   arch.reg_count = 3;
 
   auto transport = std::make_unique<loopback_transport>();
   auto* transport_ptr = transport.get();
-  gdbstub::server server(make_handles(target), arch, std::move(transport));
+  gdbstub::server server(make_target(target), arch, std::move(transport));
 
   REQUIRE(server.listen("loop"));
   REQUIRE(server.wait_for_connection());
@@ -843,13 +904,14 @@ TEST_CASE("server checks thread liveness") {
 }
 
 TEST_CASE("server handles interrupt packets") {
-  mock_target target;
+  mock_state state;
+  mock_components target(state);
   gdbstub::arch_spec arch;
   arch.reg_count = 3;
 
   auto transport = std::make_unique<loopback_transport>();
   auto* transport_ptr = transport.get();
-  gdbstub::server server(make_handles(target), arch, std::move(transport));
+  gdbstub::server server(make_target(target), arch, std::move(transport));
 
   REQUIRE(server.listen("loop"));
   REQUIRE(server.wait_for_connection());
@@ -858,17 +920,18 @@ TEST_CASE("server handles interrupt packets") {
   transport_ptr->push_incoming(interrupt);
   server.poll(std::chrono::milliseconds(0));
 
-  CHECK(target.interrupt_called);
+  CHECK(state.interrupt_called);
 }
 
 TEST_CASE("server responds to qStructuredDataPlugins") {
-  mock_target target;
+  mock_state state;
+  mock_components target(state);
   gdbstub::arch_spec arch;
   arch.reg_count = 3;
 
   auto transport = std::make_unique<loopback_transport>();
   auto* transport_ptr = transport.get();
-  gdbstub::server server(make_handles(target), arch, std::move(transport));
+  gdbstub::server server(make_target(target), arch, std::move(transport));
 
   REQUIRE(server.listen("loop"));
   REQUIRE(server.wait_for_connection());
@@ -880,13 +943,14 @@ TEST_CASE("server responds to qStructuredDataPlugins") {
 }
 
 TEST_CASE("server responds to QEnableErrorStrings") {
-  mock_target target;
+  mock_state state;
+  mock_components target(state);
   gdbstub::arch_spec arch;
   arch.reg_count = 3;
 
   auto transport = std::make_unique<loopback_transport>();
   auto* transport_ptr = transport.get();
-  gdbstub::server server(make_handles(target), arch, std::move(transport));
+  gdbstub::server server(make_target(target), arch, std::move(transport));
 
   REQUIRE(server.listen("loop"));
   REQUIRE(server.wait_for_connection());
@@ -898,17 +962,18 @@ TEST_CASE("server responds to QEnableErrorStrings") {
 }
 
 TEST_CASE("server responds to qShlibInfoAddr when available") {
-  mock_target target;
+  mock_state state;
+  mock_components target(state);
   gdbstub::shlib_info info;
   info.info_addr = 0x11223344;
-  target.shlib = info;
+  state.shlib = info;
 
   gdbstub::arch_spec arch;
   arch.reg_count = 3;
 
   auto transport = std::make_unique<loopback_transport>();
   auto* transport_ptr = transport.get();
-  gdbstub::server server(make_handles(target), arch, std::move(transport));
+  gdbstub::server server(make_target(target), arch, std::move(transport));
 
   REQUIRE(server.listen("loop"));
   REQUIRE(server.wait_for_connection());
@@ -920,16 +985,17 @@ TEST_CASE("server responds to qShlibInfoAddr when available") {
 }
 
 TEST_CASE("server responds to jThreadsInfo") {
-  mock_target target;
-  target.threads = {1, 2};
-  target.stop_for_threads = gdbstub::stop_reason{gdbstub::stop_kind::signal, 5, 0, 0, std::nullopt};
+  mock_state state;
+  mock_components target(state);
+  state.threads = {1, 2};
+  state.stop_for_threads = gdbstub::stop_reason{gdbstub::stop_kind::signal, 5, 0, 0, std::nullopt};
 
   gdbstub::arch_spec arch;
   arch.reg_count = 3;
 
   auto transport = std::make_unique<loopback_transport>();
   auto* transport_ptr = transport.get();
-  gdbstub::server server(make_handles(target), arch, std::move(transport));
+  gdbstub::server server(make_target(target), arch, std::move(transport));
 
   REQUIRE(server.listen("loop"));
   REQUIRE(server.wait_for_connection());
@@ -942,13 +1008,14 @@ TEST_CASE("server responds to jThreadsInfo") {
 }
 
 TEST_CASE("server responds to jThreadExtendedInfo") {
-  mock_target target;
+  mock_state state;
+  mock_components target(state);
   gdbstub::arch_spec arch;
   arch.reg_count = 3;
 
   auto transport = std::make_unique<loopback_transport>();
   auto* transport_ptr = transport.get();
-  gdbstub::server server(make_handles(target), arch, std::move(transport));
+  gdbstub::server server(make_target(target), arch, std::move(transport));
 
   REQUIRE(server.listen("loop"));
   REQUIRE(server.wait_for_connection());
@@ -963,13 +1030,14 @@ TEST_CASE("server responds to jThreadExtendedInfo") {
 }
 
 TEST_CASE("server responds to qXfer memory-map read") {
-  mock_target target;
+  mock_state state;
+  mock_components target(state);
   gdbstub::arch_spec arch;
   arch.reg_count = 3;
 
   auto transport = std::make_unique<loopback_transport>();
   auto* transport_ptr = transport.get();
-  gdbstub::server server(make_handles(target), arch, std::move(transport));
+  gdbstub::server server(make_target(target), arch, std::move(transport));
 
   REQUIRE(server.listen("loop"));
   REQUIRE(server.wait_for_connection());
@@ -982,18 +1050,19 @@ TEST_CASE("server responds to qXfer memory-map read") {
 }
 
 TEST_CASE("server supports binary memory read") {
-  mock_target target;
-  target.memory[0x100] = std::byte{'A'};
-  target.memory[0x101] = std::byte{'$'};
-  target.memory[0x102] = std::byte{'#'};
-  target.memory[0x103] = std::byte{'}'};
+  mock_state state;
+  mock_components target(state);
+  state.memory[0x100] = std::byte{'A'};
+  state.memory[0x101] = std::byte{'$'};
+  state.memory[0x102] = std::byte{'#'};
+  state.memory[0x103] = std::byte{'}'};
 
   gdbstub::arch_spec arch;
   arch.reg_count = 3;
 
   auto transport = std::make_unique<loopback_transport>();
   auto* transport_ptr = transport.get();
-  gdbstub::server server(make_handles(target), arch, std::move(transport));
+  gdbstub::server server(make_target(target), arch, std::move(transport));
 
   REQUIRE(server.listen("loop"));
   REQUIRE(server.wait_for_connection());

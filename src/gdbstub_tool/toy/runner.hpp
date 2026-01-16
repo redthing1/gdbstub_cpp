@@ -2,12 +2,11 @@
 
 #include <atomic>
 #include <chrono>
-#include <functional>
 #include <mutex>
 #include <optional>
 #include <thread>
 
-#include "gdbstub/rsp_types.hpp"
+#include "gdbstub/target.hpp"
 #include "gdbstub_tool/toy/machine.hpp"
 #include "gdbstub_tool/toy/threads.hpp"
 #include "gdbstub_tool/toy/types.hpp"
@@ -16,9 +15,9 @@ namespace gdbstub::toy {
 
 class stop_tracker {
 public:
-  void set_callback(std::function<void(const stop_reason&)> callback) {
+  void set_notifier(stop_notifier notifier) {
     std::lock_guard<std::mutex> lock(mutex_);
-    callback_ = std::move(callback);
+    notifier_ = notifier;
   }
 
   void record_stop(const stop_reason& reason) {
@@ -27,19 +26,19 @@ public:
   }
 
   void queue_stop(const stop_reason& reason) {
-    std::function<void(const stop_reason&)> callback;
+    stop_notifier notifier;
     bool notify = false;
     {
       std::lock_guard<std::mutex> lock(mutex_);
       last_stop_ = reason;
       if (!pending_stop_) {
         pending_stop_ = reason;
-        callback = callback_;
+        notifier = notifier_;
         notify = true;
       }
     }
-    if (notify && callback) {
-      callback(reason);
+    if (notify && notifier.notify) {
+      notifier(reason);
     }
   }
 
@@ -62,7 +61,7 @@ private:
   std::mutex mutex_;
   std::optional<stop_reason> pending_stop_;
   std::optional<stop_reason> last_stop_;
-  std::function<void(const stop_reason&)> callback_;
+  stop_notifier notifier_{};
 };
 
 class runner {
@@ -78,9 +77,7 @@ public:
   void set_max_steps(size_t max_steps) { max_steps_ = max_steps; }
   size_t max_steps() const { return max_steps_; }
 
-  void set_async_callback(std::function<void(const stop_reason&)> callback) {
-    stops_.set_callback(std::move(callback));
-  }
+  void set_stop_notifier(stop_notifier notifier) { stops_.set_notifier(notifier); }
 
   resume_result resume(const resume_request& request) {
     auto thread_id = threads_.current_thread();

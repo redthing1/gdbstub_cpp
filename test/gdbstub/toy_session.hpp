@@ -18,14 +18,7 @@ class toy_session {
 public:
   explicit toy_session(gdbstub::toy::config cfg) : mode_(cfg.mode), target_(std::move(cfg)) {
     auto transport = std::make_unique<gdbstub::transport_tcp>();
-    server_ = std::make_unique<gdbstub::server>(target_.handles(), target_.make_arch_spec(), std::move(transport));
-    if (mode_ == gdbstub::toy::execution_mode::async) {
-      target_.set_async_callback([this](const gdbstub::stop_reason& reason) {
-        if (server_) {
-          server_->notify_stop(reason);
-        }
-      });
-    }
+    server_ = std::make_unique<gdbstub::server>(target_.make_target(), target_.make_arch_spec(), std::move(transport));
   }
 
   toy_session(const toy_session&) = delete;
@@ -62,9 +55,6 @@ public:
   }
 
   void shutdown() {
-    if (mode_ == gdbstub::toy::execution_mode::async) {
-      target_.set_async_callback({});
-    }
     client_.close();
     if (server_) {
       server_->stop();

@@ -14,22 +14,23 @@
 
 namespace gdbstub::toy {
 
-class target final : public register_access,
-                     public memory_access,
-                     public run_control,
-                     public breakpoint_access,
-                     public memory_map,
-                     public host_info_provider,
-                     public process_info_provider,
-                     public shlib_info_provider,
-                     public thread_access {
+class target final {
 public:
   explicit target(config cfg)
       : config_(std::move(cfg)),
         layout_(config_),
         machine_(config_),
         threads_(config_.thread_ids),
-        runner_(machine_, threads_, config_.mode, config_.max_steps) {}
+        runner_(machine_, threads_, config_.mode, config_.max_steps),
+        regs_(layout_, machine_),
+        mem_(machine_),
+        run_(runner_),
+        breakpoints_(machine_),
+        thread_api_(threads_, machine_, runner_),
+        memory_map_(machine_),
+        host_(config_),
+        process_(config_),
+        shlib_(config_) {}
 
   const layout& layout_spec() const { return layout_; }
 
@@ -43,15 +44,8 @@ public:
     return spec;
   }
 
-  target_handles handles() {
-    target_handles out{*this, *this, *this};
-    out.breakpoints = this;
-    out.memory = this;
-    out.threads = this;
-    out.host = this;
-    out.process = this;
-    out.shlib = this;
-    return out;
+  gdbstub::target make_target() {
+    return gdbstub::make_target(regs_, mem_, run_, breakpoints_, thread_api_, memory_map_, host_, process_, shlib_);
   }
 
   void set_mode(execution_mode mode) {
@@ -59,122 +53,200 @@ public:
     runner_.set_mode(mode);
   }
 
-  void set_async_callback(std::function<void(const stop_reason&)> callback) {
-    runner_.set_async_callback(std::move(callback));
-  }
-
   void set_reg(int regno, uint64_t value) { machine_.set_reg(regno, value); }
   uint64_t reg_value(int regno) const { return machine_.reg_value(regno); }
 
-  size_t reg_size(int regno) const override { return layout_.reg_size(regno); }
-
-  target_status read_reg(int regno, std::span<std::byte> out) override {
-    return machine_.read_reg(regno, out);
-  }
-
-  target_status write_reg(int regno, std::span<const std::byte> data) override {
-    return machine_.write_reg(regno, data);
-  }
-
-  target_status read_mem(uint64_t addr, std::span<std::byte> out) override {
-    return machine_.read_mem(addr, out);
-  }
-
-  target_status write_mem(uint64_t addr, std::span<const std::byte> data) override {
-    return machine_.write_mem(addr, data);
-  }
-
-  resume_result resume(const resume_request& request) override { return runner_.resume(request); }
-  void interrupt() override { runner_.interrupt(); }
-  std::optional<stop_reason> poll_stop() override { return runner_.poll_stop(); }
-
-  target_status set_breakpoint(const breakpoint_access::spec& request) override {
-    if (request.type != breakpoint_access::type::software && request.type != breakpoint_access::type::hardware) {
-      return target_status::unsupported;
-    }
-    machine_.add_breakpoint(request.addr);
-    return target_status::ok;
-  }
-
-  target_status remove_breakpoint(const breakpoint_access::spec& request) override {
-    if (request.type != breakpoint_access::type::software && request.type != breakpoint_access::type::hardware) {
-      return target_status::unsupported;
-    }
-    machine_.remove_breakpoint(request.addr);
-    return target_status::ok;
-  }
-
-  std::optional<memory_region> region_for(uint64_t addr) override {
-    if (addr >= machine_.memory_size()) {
-      return std::nullopt;
-    }
-    return memory_region{0, static_cast<uint64_t>(machine_.memory_size()), "rwx"};
-  }
-
-  std::vector<memory_region> regions() override {
-    return {memory_region{0, static_cast<uint64_t>(machine_.memory_size()), "rwx"}};
-  }
-
-  std::optional<host_info> get_host_info() override {
-    host_info info;
-    info.triple = config_.triple;
-    info.endian = config_.endian;
-    info.ptr_size = static_cast<int>(config_.reg_bits / 8);
-    info.hostname = config_.hostname;
-    return info;
-  }
-
-  std::optional<process_info> get_process_info() override {
-    process_info info;
-    info.pid = config_.pid;
-    info.triple = config_.triple;
-    info.endian = config_.endian;
-    info.ptr_size = static_cast<int>(config_.reg_bits / 8);
-    info.ostype = config_.osabi;
-    return info;
-  }
-
-  std::optional<shlib_info> get_shlib_info() override {
-    if (!config_.shlib_info_addr) {
-      return std::nullopt;
-    }
-    shlib_info info;
-    info.info_addr = config_.shlib_info_addr;
-    return info;
-  }
-
-  std::vector<uint64_t> thread_ids() override { return threads_.ids(); }
-  uint64_t current_thread() const override { return threads_.current_thread(); }
-
-  target_status set_current_thread(uint64_t tid) override { return threads_.set_current_thread(tid); }
-
-  std::optional<uint64_t> thread_pc(uint64_t tid) override {
-    if (tid == threads_.current_thread()) {
-      return machine_.pc();
-    }
-    return std::nullopt;
-  }
-
-  std::optional<std::string> thread_name(uint64_t tid) override {
-    if (tid == threads_.current_thread()) {
-      return std::string("toy-thread");
-    }
-    return std::nullopt;
-  }
-
-  std::optional<stop_reason> thread_stop_reason(uint64_t tid) override {
-    if (tid == threads_.current_thread()) {
-      return runner_.last_stop();
-    }
-    return std::nullopt;
-  }
-
 private:
+  class regs_component {
+  public:
+    regs_component(layout& layout, machine& machine) : layout_(layout), machine_(machine) {}
+
+    size_t reg_size(int regno) const { return layout_.reg_size(regno); }
+
+    target_status read_reg(int regno, std::span<std::byte> out) { return machine_.read_reg(regno, out); }
+
+    target_status write_reg(int regno, std::span<const std::byte> data) { return machine_.write_reg(regno, data); }
+
+  private:
+    layout& layout_;
+    machine& machine_;
+  };
+
+  class mem_component {
+  public:
+    explicit mem_component(machine& machine) : machine_(machine) {}
+
+    target_status read_mem(uint64_t addr, std::span<std::byte> out) { return machine_.read_mem(addr, out); }
+
+    target_status write_mem(uint64_t addr, std::span<const std::byte> data) { return machine_.write_mem(addr, data); }
+
+  private:
+    machine& machine_;
+  };
+
+  class run_component {
+  public:
+    explicit run_component(runner& runner) : runner_(runner) {}
+
+    resume_result resume(const resume_request& request) { return runner_.resume(request); }
+
+    void interrupt() { runner_.interrupt(); }
+
+    std::optional<stop_reason> poll_stop() { return runner_.poll_stop(); }
+
+    void set_stop_notifier(stop_notifier notifier) { runner_.set_stop_notifier(notifier); }
+
+  private:
+    runner& runner_;
+  };
+
+  class breakpoints_component {
+  public:
+    explicit breakpoints_component(machine& machine) : machine_(machine) {}
+
+    target_status set_breakpoint(const breakpoint_spec& request) {
+      if (request.type != breakpoint_type::software && request.type != breakpoint_type::hardware) {
+        return target_status::unsupported;
+      }
+      machine_.add_breakpoint(request.addr);
+      return target_status::ok;
+    }
+
+    target_status remove_breakpoint(const breakpoint_spec& request) {
+      if (request.type != breakpoint_type::software && request.type != breakpoint_type::hardware) {
+        return target_status::unsupported;
+      }
+      machine_.remove_breakpoint(request.addr);
+      return target_status::ok;
+    }
+
+  private:
+    machine& machine_;
+  };
+
+  class threads_component {
+  public:
+    threads_component(threads& threads, machine& machine, runner& runner)
+        : threads_(threads), machine_(machine), runner_(runner) {}
+
+    std::vector<uint64_t> thread_ids() { return threads_.ids(); }
+
+    uint64_t current_thread() const { return threads_.current_thread(); }
+
+    target_status set_current_thread(uint64_t tid) { return threads_.set_current_thread(tid); }
+
+    std::optional<uint64_t> thread_pc(uint64_t tid) {
+      if (tid == threads_.current_thread()) {
+        return machine_.pc();
+      }
+      return std::nullopt;
+    }
+
+    std::optional<std::string> thread_name(uint64_t tid) {
+      if (tid == threads_.current_thread()) {
+        return std::string("toy-thread");
+      }
+      return std::nullopt;
+    }
+
+    std::optional<stop_reason> thread_stop_reason(uint64_t tid) {
+      if (tid == threads_.current_thread()) {
+        return runner_.last_stop();
+      }
+      return std::nullopt;
+    }
+
+  private:
+    threads& threads_;
+    machine& machine_;
+    runner& runner_;
+  };
+
+  class memory_map_component {
+  public:
+    explicit memory_map_component(machine& machine) : machine_(machine) {}
+
+    std::optional<memory_region> region_for(uint64_t addr) {
+      if (addr >= machine_.memory_size()) {
+        return std::nullopt;
+      }
+      return memory_region{0, static_cast<uint64_t>(machine_.memory_size()), "rwx"};
+    }
+
+    std::vector<memory_region> regions() {
+      return {memory_region{0, static_cast<uint64_t>(machine_.memory_size()), "rwx"}};
+    }
+
+  private:
+    machine& machine_;
+  };
+
+  class host_component {
+  public:
+    explicit host_component(const config& cfg) : config_(cfg) {}
+
+    std::optional<host_info> get_host_info() {
+      host_info info;
+      info.triple = config_.triple;
+      info.endian = config_.endian;
+      info.ptr_size = static_cast<int>(config_.reg_bits / 8);
+      info.hostname = config_.hostname;
+      return info;
+    }
+
+  private:
+    const config& config_;
+  };
+
+  class process_component {
+  public:
+    explicit process_component(const config& cfg) : config_(cfg) {}
+
+    std::optional<process_info> get_process_info() {
+      process_info info;
+      info.pid = config_.pid;
+      info.triple = config_.triple;
+      info.endian = config_.endian;
+      info.ptr_size = static_cast<int>(config_.reg_bits / 8);
+      info.ostype = config_.osabi;
+      return info;
+    }
+
+  private:
+    const config& config_;
+  };
+
+  class shlib_component {
+  public:
+    explicit shlib_component(const config& cfg) : config_(cfg) {}
+
+    std::optional<shlib_info> get_shlib_info() {
+      if (!config_.shlib_info_addr) {
+        return std::nullopt;
+      }
+      shlib_info info;
+      info.info_addr = config_.shlib_info_addr;
+      return info;
+    }
+
+  private:
+    const config& config_;
+  };
+
   config config_;
   layout layout_;
   machine machine_;
   threads threads_;
   runner runner_;
+  regs_component regs_;
+  mem_component mem_;
+  run_component run_;
+  breakpoints_component breakpoints_;
+  threads_component thread_api_;
+  memory_map_component memory_map_;
+  host_component host_;
+  process_component process_;
+  shlib_component shlib_;
 };
 
 } // namespace gdbstub::toy

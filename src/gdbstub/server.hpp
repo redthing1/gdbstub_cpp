@@ -27,7 +27,8 @@ struct arch_spec {
 
 class server {
 public:
-  server(target_handles target, arch_spec arch, std::unique_ptr<transport> transport);
+  server(target target, arch_spec arch, std::unique_ptr<transport> transport);
+  ~server();
 
   bool listen(std::string_view address);
   bool wait_for_connection();
@@ -40,7 +41,7 @@ public:
 private:
   enum class exec_state { halted, running };
 
-  target_handles target_;
+  target_view target_;
   arch_spec arch_;
   std::unique_ptr<transport> transport_;
   rsp::stream_parser parser_;

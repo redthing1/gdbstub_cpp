@@ -273,11 +273,6 @@ def check_lldb_output(stdout: str, inputs: E2EInputs) -> list[str]:
         f"{inputs.reg_name} = 0x{reg_value}",
         errors,
     )
-    if "stop reason = breakpoint" not in stdout:
-        errors.append("missing output: stop reason = breakpoint")
-    if "thread #1" not in stdout:
-        errors.append("missing output: thread #1")
-
     require_packet_response(
         "qHostInfo", r".*hostname:", responses, "qHostInfo response", errors
     )
@@ -454,6 +449,18 @@ def check_rsp_log(log_text: str) -> list[str]:
             lambda payload: unescape_rsp_binary(payload).startswith("["),
         ):
             errors.append("jThreadsInfo missing JSON response")
+        if not response_after(
+            events,
+            lambda payload: payload.startswith("jThreadsInfo"),
+            lambda payload: "\"reason\":\"breakpoint\"" in unescape_rsp_binary(payload),
+        ):
+            errors.append("missing breakpoint reason in jThreadsInfo")
+        if not response_after(
+            events,
+            lambda payload: payload.startswith("jThreadsInfo"),
+            lambda payload: "\"tid\":1" in unescape_rsp_binary(payload),
+        ):
+            errors.append("missing tid 1 in jThreadsInfo")
 
     if has_event(
         events, "send", lambda payload: payload.startswith("jThreadExtendedInfo:")

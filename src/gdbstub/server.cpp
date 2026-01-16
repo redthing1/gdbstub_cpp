@@ -223,31 +223,43 @@ uint8_t error_code_for_status(target_status status) {
   }
 }
 
-std::optional<breakpoint_access::type> parse_breakpoint_type(int value) {
+std::optional<breakpoint_type> parse_breakpoint_type(int value) {
   switch (value) {
   case 0:
-    return breakpoint_access::type::software;
+    return breakpoint_type::software;
   case 1:
-    return breakpoint_access::type::hardware;
+    return breakpoint_type::hardware;
   case 2:
-    return breakpoint_access::type::watch_write;
+    return breakpoint_type::watch_write;
   case 3:
-    return breakpoint_access::type::watch_read;
+    return breakpoint_type::watch_read;
   case 4:
-    return breakpoint_access::type::watch_access;
+    return breakpoint_type::watch_access;
   default:
     return std::nullopt;
   }
 }
 
+void notify_stop_thunk(void* ctx, const stop_reason& reason) {
+  static_cast<server*>(ctx)->notify_stop(reason);
+}
+
 } // namespace
 
-server::server(target_handles target, arch_spec arch, std::unique_ptr<transport> transport)
-    : target_(target), arch_(std::move(arch)), transport_(std::move(transport)) {}
+server::server(target target, arch_spec arch, std::unique_ptr<transport> transport)
+    : target_(target.view()), arch_(std::move(arch)), transport_(std::move(transport)) {}
+
+server::~server() { stop(); }
 
 bool server::listen(std::string_view address) { return transport_->listen(address); }
 
-bool server::wait_for_connection() { return transport_->accept(); }
+bool server::wait_for_connection() {
+  bool accepted = transport_->accept();
+  if (accepted) {
+    target_.run.set_stop_notifier(stop_notifier{this, notify_stop_thunk});
+  }
+  return accepted;
+}
 
 bool server::has_connection() const { return transport_->connected(); }
 
@@ -287,7 +299,10 @@ void server::notify_stop(stop_reason reason) {
   pending_stops_.push(std::move(reason));
 }
 
-void server::stop() { transport_->close(); }
+void server::stop() {
+  target_.run.set_stop_notifier({});
+  transport_->close();
+}
 
 bool server::read_and_process(std::chrono::milliseconds timeout) {
   if (!transport_->readable(timeout)) {
@@ -497,7 +512,7 @@ void server::handle_query(std::string_view args) {
     if (target_.process) {
       features += ";qProcessInfo+";
     }
-    if (target_.memory) {
+    if (target_.memory_map) {
       features += ";qMemoryRegionInfo+;qXfer:memory-map:read+";
     }
     send_packet(features);
@@ -1056,7 +1071,7 @@ void server::handle_insert_breakpoint(std::string_view args) {
     return;
   }
 
-  breakpoint_access::spec request{*type, addr, static_cast<uint32_t>(kind)};
+  breakpoint_spec request{*type, addr, static_cast<uint32_t>(kind)};
   auto status = target_.breakpoints->set_breakpoint(request);
   if (status == target_status::unsupported) {
     send_packet("");
@@ -1101,7 +1116,7 @@ void server::handle_remove_breakpoint(std::string_view args) {
     return;
   }
 
-  breakpoint_access::spec request{*type, addr, static_cast<uint32_t>(kind)};
+  breakpoint_spec request{*type, addr, static_cast<uint32_t>(kind)};
   auto status = target_.breakpoints->remove_breakpoint(request);
   if (status == target_status::unsupported) {
     send_packet("");
@@ -1346,7 +1361,7 @@ void server::handle_xfer(std::string_view args) {
 
   constexpr std::string_view k_memory_map_prefix = "memory-map:read::";
   if (args.rfind(k_memory_map_prefix, 0) == 0) {
-    if (!target_.memory) {
+    if (!target_.memory_map) {
       send_packet("");
       return;
     }
@@ -1365,7 +1380,7 @@ void server::handle_xfer(std::string_view args) {
       return;
     }
 
-    auto xml = build_memory_map_xml(target_.memory->regions());
+    auto xml = build_memory_map_xml(target_.memory_map->regions());
     if (offset >= xml.size()) {
       send_packet("l");
       return;
@@ -1442,7 +1457,7 @@ void server::handle_process_info() {
 }
 
 void server::handle_memory_region_info(std::string_view addr_str) {
-  if (!target_.memory) {
+  if (!target_.memory_map) {
     send_packet("");
     return;
   }
@@ -1453,7 +1468,7 @@ void server::handle_memory_region_info(std::string_view addr_str) {
     return;
   }
 
-  auto region = target_.memory->region_for(addr);
+  auto region = target_.memory_map->region_for(addr);
   if (!region) {
     send_error(0x0e);
     return;

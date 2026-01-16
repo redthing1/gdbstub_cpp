@@ -25,18 +25,13 @@ std::optional<gdbstub::toy::execution_mode> parse_mode(std::string_view text) {
 }
 
 int run_server(std::string_view address, gdbstub::toy::config cfg) {
-  auto mode = cfg.mode;
   gdbstub::toy::target target(std::move(cfg));
 
   auto transport = std::make_unique<gdbstub::transport_tcp>();
-  gdbstub::server server(target.handles(), target.make_arch_spec(), std::move(transport));
+  gdbstub::server server(target.make_target(), target.make_arch_spec(), std::move(transport));
   if (!server.listen(address)) {
     std::cerr << "failed to listen on " << address << "\n";
     return 1;
-  }
-
-  if (mode == gdbstub::toy::execution_mode::async) {
-    target.set_async_callback([&server](const gdbstub::stop_reason& reason) { server.notify_stop(reason); });
   }
 
   std::cout << "gdbstub_cpp " << gdbstub::version() << "\n";

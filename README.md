@@ -9,16 +9,16 @@ a c++20 gdb rsp server library, focused on lldb
 
 ## integration
 
-1. implement the minimum target interface: `register_access`, `memory_access`, `run_control`.
-2. optionally implement breakpoints, threads, etc.
+1. implement the required capability objects: `regs`, `mem`, `run`.
+2. optionally implement `breakpoints`, `threads`, `memory_map`, `host`, `process`, `shlib`.
 3. build an `arch_spec` (target xml + reg count + pc reg number).
-4. create a `server` with your `target_handles`, `arch_spec`, and a `transport`.
+4. create a `server` with `make_target(...)`, `arch_spec`, and a `transport`.
 5. `listen()` + `wait_for_connection()`, then either `serve_forever()` or call `poll()` periodically.
 
 here's a minimal sketch:
 
 ```cpp
-gdbstub::target_handles handles{regs, mem, run}
+auto target = gdbstub::make_target(regs, mem, run);
 gdbstub::arch_spec arch{
   .target_xml = target_xml,
   .xml_arch_name = xml_arch_name,
@@ -28,7 +28,7 @@ gdbstub::arch_spec arch{
 };
 
 auto transport = std::make_unique<gdbstub::transport_tcp>();
-gdbstub::server server(handles, arch, std::move(transport));
+gdbstub::server server(target, arch, std::move(transport));
 server.listen("127.0.0.1:5555");
 server.wait_for_connection();
 server.serve_forever();

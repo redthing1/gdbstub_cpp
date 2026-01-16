@@ -20,8 +20,9 @@ target_sources(gdbstub PRIVATE
 set_target_properties(gdbstub PROPERTIES OUTPUT_NAME gdbstub)
 target_include_directories(gdbstub
     PUBLIC
-        ${CMAKE_SOURCE_DIR}/src
-        ${CMAKE_SOURCE_DIR}/lib/third_party
+        $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/src>
+        $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/lib/third_party>
+        $<INSTALL_INTERFACE:include>
 )
 target_compile_features(gdbstub PUBLIC cxx_std_20)
 add_library(gdbstub::gdbstub ALIAS gdbstub)
@@ -45,7 +46,7 @@ set_target_properties(gdbstub_test PROPERTIES
     OUTPUT_NAME gdbstub_test
 )
 target_link_libraries(gdbstub_test PRIVATE gdbstub)
-target_include_directories(gdbstub_test PRIVATE ${CMAKE_SOURCE_DIR}/test)
+target_include_directories(gdbstub_test PRIVATE ${PROJECT_SOURCE_DIR}/test)
 
 find_package(Threads REQUIRED)
 target_link_libraries(gdbstub_tool PRIVATE Threads::Threads)
@@ -63,7 +64,7 @@ add_test(NAME gdbstub_test COMMAND gdbstub_test)
 find_program(LLDB_EXECUTABLE lldb)
 find_package(Python3 COMPONENTS Interpreter)
 if(LLDB_EXECUTABLE AND Python3_Interpreter_FOUND)
-    set(LLDB_E2E_SCRIPT ${CMAKE_SOURCE_DIR}/test/gdbstub/lldb_e2e_test.py)
+    set(LLDB_E2E_SCRIPT ${PROJECT_SOURCE_DIR}/test/gdbstub/lldb_e2e_test.py)
     foreach(mode IN ITEMS blocking polling async)
         add_test(
             NAME gdbstub_lldb_e2e_${mode}
@@ -80,16 +81,16 @@ endif()
 find_program(CLANG_FORMAT NAMES clang-format clang-format-17 clang-format-16)
 if(CLANG_FORMAT)
     file(GLOB_RECURSE FORMAT_SOURCES
-        ${CMAKE_SOURCE_DIR}/src/*.cpp
-        ${CMAKE_SOURCE_DIR}/src/*.hpp
-        ${CMAKE_SOURCE_DIR}/test/*.cpp
-        ${CMAKE_SOURCE_DIR}/test/*.hpp
+        ${PROJECT_SOURCE_DIR}/src/*.cpp
+        ${PROJECT_SOURCE_DIR}/src/*.hpp
+        ${PROJECT_SOURCE_DIR}/test/*.cpp
+        ${PROJECT_SOURCE_DIR}/test/*.hpp
     )
 
     list(FILTER FORMAT_SOURCES EXCLUDE REGEX "/lib/third_party/")
     add_custom_target(gdbstub_cpp-format
         COMMAND ${CLANG_FORMAT} -i ${FORMAT_SOURCES}
-        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
         COMMENT "formatting source files"
         VERBATIM
     )
