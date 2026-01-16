@@ -66,11 +66,18 @@ minimal demo target under `src/gdbstub_tool/toy/`:
 
 ## lldb (interactive)
 
-if you are using the toy server, set a default arch and connect:
+connect with lldb:
 
 ```bash
-lldb -O "settings set target.default-arch riscv32" -O "gdb-remote 127.0.0.1:5555"
+lldb -O "gdb-remote 127.0.0.1:5555"
 ```
+
+if disassembly looks wrong, set a default arch:
+`settings set target.default-arch riscv32`
+
+gdbstub_cpp serves `target.xml` and also supports lldb's `qRegisterInfo` fallback.
+if the lldb build doesn't know the arch, you may still see registers but
+disassembly/stack can be limited.
 
 to enable RSP packet logging:
 

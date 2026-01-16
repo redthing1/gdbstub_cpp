@@ -70,6 +70,7 @@ private:
   void handle_write_all_registers(std::string_view args);
   void handle_read_register(std::string_view args);
   void handle_write_register(std::string_view args);
+  void handle_register_info(std::string_view args);
   void handle_read_memory(std::string_view args);
   void handle_read_binary_memory(std::string_view args);
   void handle_write_memory(std::string_view args);

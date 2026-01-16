@@ -68,6 +68,21 @@ struct shlib_info {
   std::optional<uint64_t> info_addr;
 };
 
+struct register_info {
+  std::string name;
+  std::optional<std::string> alt_name;
+  int bitsize = 0;
+  std::optional<size_t> offset;
+  std::string encoding;
+  std::string format;
+  std::optional<std::string> set;
+  std::optional<int> gcc_regnum;
+  std::optional<int> dwarf_regnum;
+  std::optional<std::string> generic;
+  std::vector<int> container_regs;
+  std::vector<int> invalidate_regs;
+};
+
 struct regs_view {
   void* ctx = nullptr;
   size_t (*reg_size_fn)(void* ctx, int regno) = nullptr;
@@ -179,6 +194,13 @@ struct shlib_view {
   std::optional<shlib_info> get_shlib_info() const { return get_shlib_info_fn(ctx); }
 };
 
+struct register_info_view {
+  void* ctx = nullptr;
+  std::optional<register_info> (*get_register_info_fn)(void* ctx, int regno) = nullptr;
+
+  std::optional<register_info> get_register_info(int regno) const { return get_register_info_fn(ctx, regno); }
+};
+
 struct target_view {
   regs_view regs;
   mem_view mem;
@@ -189,6 +211,7 @@ struct target_view {
   std::optional<host_info_view> host;
   std::optional<process_info_view> process;
   std::optional<shlib_view> shlib;
+  std::optional<register_info_view> reg_info;
 };
 
 class target {
@@ -237,6 +260,11 @@ concept run_poll_stop = requires(T& t) {
 template <typename T>
 concept run_stop_notifier = requires(T& t, stop_notifier notifier) {
   t.set_stop_notifier(notifier);
+};
+
+template <typename T>
+concept register_info_capability = requires(T& t, int regno) {
+  { t.get_register_info(regno) } -> std::same_as<std::optional<register_info>>;
 };
 
 template <typename T>
@@ -398,12 +426,23 @@ shlib_view make_shlib_view(T& shlib) {
 }
 
 template <typename T>
+register_info_view make_register_info_view(T& reg_info) {
+  register_info_view view;
+  view.ctx = std::addressof(reg_info);
+  view.get_register_info_fn = [](void* ctx, int regno) -> std::optional<register_info> {
+    return static_cast<T*>(ctx)->get_register_info(regno);
+  };
+  return view;
+}
+
+template <typename T>
 void assign_optional(target_view& view, T& obj) {
   static_assert(!regs_capability<T>, "Optional capability object implements register access; pass it as regs.");
   static_assert(!mem_capability<T>, "Optional capability object implements memory access; pass it as mem.");
   static_assert(!run_capability<T>, "Optional capability object implements run control; pass it as run.");
   constexpr int matches = breakpoints_capability<T> + threads_capability<T> + memory_map_capability<T> +
-                          host_info_capability<T> + process_info_capability<T> + shlib_capability<T>;
+                          host_info_capability<T> + process_info_capability<T> + shlib_capability<T> +
+                          register_info_capability<T>;
   static_assert(matches == 1, "Optional capability object must implement exactly one optional capability.");
 
   if constexpr (breakpoints_capability<T>) {
@@ -418,6 +457,8 @@ void assign_optional(target_view& view, T& obj) {
     view.process = make_process_info_view(obj);
   } else if constexpr (shlib_capability<T>) {
     view.shlib = make_shlib_view(obj);
+  } else if constexpr (register_info_capability<T>) {
+    view.reg_info = make_register_info_view(obj);
   } else {
     static_assert(always_false<T>, "Optional capability object must implement exactly one optional capability.");
   }
@@ -443,6 +484,8 @@ target make_target(Regs& regs, Mem& mem, Run& run, Opts&... opts) {
   static_assert(process_count <= 1, "Process info capability provided multiple times.");
   constexpr int shlib_count = (0 + ... + detail::shlib_capability<Opts>);
   static_assert(shlib_count <= 1, "Shlib capability provided multiple times.");
+  constexpr int reg_info_count = (0 + ... + detail::register_info_capability<Opts>);
+  static_assert(reg_info_count <= 1, "Register info capability provided multiple times.");
 
   target_view view;
   view.regs = detail::make_regs_view(regs);

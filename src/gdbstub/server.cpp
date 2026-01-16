@@ -22,6 +22,13 @@ std::span<const std::byte> as_bytes(std::string_view text) {
   return {reinterpret_cast<const std::byte*>(text.data()), text.size()};
 }
 
+std::string hex_encode_string(std::string_view value) {
+  if (value.empty()) {
+    return {};
+  }
+  return rsp::encode_hex(as_bytes(value));
+}
+
 std::string hex_byte(uint8_t value) {
   char buf[3] = {0};
   std::snprintf(buf, sizeof(buf), "%02x", value);
@@ -532,6 +539,11 @@ void server::handle_query(std::string_view args) {
     return;
   }
 
+  if (name.rfind("RegisterInfo", 0) == 0) {
+    handle_register_info(name.substr(std::string_view("RegisterInfo").size()));
+    return;
+  }
+
   if (name.rfind("ThreadStopInfo", 0) == 0) {
     auto tid_str = name.substr(std::string_view("ThreadStopInfo").size());
     uint64_t tid = 0;
@@ -913,6 +925,111 @@ void server::handle_write_register(std::string_view args) {
   }
 
   send_packet("OK");
+}
+
+void server::handle_register_info(std::string_view args) {
+  if (!target_.reg_info) {
+    send_packet("E45");
+    return;
+  }
+
+  uint64_t regno = 0;
+  if (args.empty() || !parse_hex_u64(args, regno)) {
+    send_error(0x16);
+    return;
+  }
+
+  if (arch_.reg_count > 0 && regno >= static_cast<uint64_t>(arch_.reg_count)) {
+    send_packet("E45");
+    return;
+  }
+
+  auto info = target_.reg_info->get_register_info(static_cast<int>(regno));
+  if (!info) {
+    send_packet("E45");
+    return;
+  }
+
+  auto reg_size = target_.regs.reg_size(static_cast<int>(regno));
+  int bitsize = info->bitsize > 0 ? info->bitsize : static_cast<int>(reg_size * 8);
+  if (bitsize <= 0) {
+    send_error(0x16);
+    return;
+  }
+
+  size_t offset = 0;
+  if (info->offset) {
+    offset = *info->offset;
+  } else {
+    for (int idx = 0; idx < static_cast<int>(regno); ++idx) {
+      offset += target_.regs.reg_size(idx);
+    }
+  }
+
+  std::string response;
+  response.reserve(128);
+  response += "name:";
+  response += info->name;
+  response += ";";
+  if (info->alt_name && !info->alt_name->empty()) {
+    response += "alt-name:";
+    response += *info->alt_name;
+    response += ";";
+  }
+  response += "bitsize:";
+  response += std::to_string(bitsize);
+  response += ";";
+  response += "offset:";
+  response += std::to_string(offset);
+  response += ";";
+  response += "encoding:";
+  response += info->encoding.empty() ? "uint" : info->encoding;
+  response += ";";
+  response += "format:";
+  response += info->format.empty() ? "hex" : info->format;
+  response += ";";
+  if (info->set && !info->set->empty()) {
+    response += "set:";
+    response += *info->set;
+    response += ";";
+  }
+  if (info->gcc_regnum) {
+    response += "gcc:";
+    response += std::to_string(*info->gcc_regnum);
+    response += ";";
+  }
+  if (info->dwarf_regnum) {
+    response += "dwarf:";
+    response += std::to_string(*info->dwarf_regnum);
+    response += ";";
+  }
+  if (info->generic && !info->generic->empty()) {
+    response += "generic:";
+    response += *info->generic;
+    response += ";";
+  }
+  if (!info->container_regs.empty()) {
+    response += "container-regs:";
+    for (size_t i = 0; i < info->container_regs.size(); ++i) {
+      if (i > 0) {
+        response.push_back(',');
+      }
+      response += hex_u64(static_cast<uint64_t>(info->container_regs[i]));
+    }
+    response += ";";
+  }
+  if (!info->invalidate_regs.empty()) {
+    response += "invalidate-regs:";
+    for (size_t i = 0; i < info->invalidate_regs.size(); ++i) {
+      if (i > 0) {
+        response.push_back(',');
+      }
+      response += hex_u64(static_cast<uint64_t>(info->invalidate_regs[i]));
+    }
+    response += ";";
+  }
+
+  send_packet(response);
 }
 
 void server::handle_read_memory(std::string_view args) {
@@ -1413,19 +1530,19 @@ void server::handle_host_info() {
 
   std::string response;
   response.reserve(128);
-  response += "triple:" + info->triple + ";";
+  response += "triple:" + hex_encode_string(info->triple) + ";";
   response += "ptrsize:" + std::to_string(info->ptr_size) + ";";
   response += "endian:" + info->endian + ";";
-  response += "hostname:" + info->hostname + ";";
+  response += "hostname:" + hex_encode_string(info->hostname) + ";";
 
   if (info->os_version) {
-    response += "os_version:" + *info->os_version + ";";
+    response += "os_version:" + hex_encode_string(*info->os_version) + ";";
   }
   if (info->os_build) {
-    response += "os_build:" + *info->os_build + ";";
+    response += "os_build:" + hex_encode_string(*info->os_build) + ";";
   }
   if (info->os_kernel) {
-    response += "os_kernel:" + *info->os_kernel + ";";
+    response += "os_kernel:" + hex_encode_string(*info->os_kernel) + ";";
   }
   if (info->addressing_bits) {
     response += "addressing_bits:" + std::to_string(*info->addressing_bits) + ";";
@@ -1449,7 +1566,7 @@ void server::handle_process_info() {
   std::string response;
   response.reserve(128);
   response += "pid:" + hex_u64(static_cast<uint64_t>(info->pid)) + ";";
-  response += "triple:" + info->triple + ";";
+  response += "triple:" + hex_encode_string(info->triple) + ";";
   response += "endian:" + info->endian + ";";
   response += "ptrsize:" + std::to_string(info->ptr_size) + ";";
   response += "ostype:" + info->ostype + ";";

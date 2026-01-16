@@ -23,6 +23,7 @@ public:
         threads_(config_.thread_ids),
         runner_(machine_, threads_, config_.mode, config_.max_steps),
         regs_(layout_, machine_),
+        reg_info_(layout_),
         mem_(machine_),
         run_(runner_),
         breakpoints_(machine_),
@@ -45,7 +46,18 @@ public:
   }
 
   gdbstub::target make_target() {
-    return gdbstub::make_target(regs_, mem_, run_, breakpoints_, thread_api_, memory_map_, host_, process_, shlib_);
+    return gdbstub::make_target(
+        regs_,
+        mem_,
+        run_,
+        breakpoints_,
+        thread_api_,
+        memory_map_,
+        host_,
+        process_,
+        shlib_,
+        reg_info_
+    );
   }
 
   void set_mode(execution_mode mode) {
@@ -82,6 +94,31 @@ private:
 
   private:
     machine& machine_;
+  };
+
+  class register_info_component {
+  public:
+    explicit register_info_component(layout& layout) : layout_(layout) {}
+
+    std::optional<gdbstub::register_info> get_register_info(int regno) {
+      if (regno < 0 || static_cast<size_t>(regno) >= layout_.registers().size()) {
+        return std::nullopt;
+      }
+      const auto& reg = layout_.registers()[static_cast<size_t>(regno)];
+      gdbstub::register_info info;
+      info.name = reg.name;
+      info.bitsize = static_cast<int>(reg.bits);
+      info.encoding = "uint";
+      info.format = "hex";
+      info.set = "general";
+      if (reg.is_pc) {
+        info.generic = "pc";
+      }
+      return info;
+    }
+
+  private:
+    layout& layout_;
   };
 
   class run_component {
@@ -239,6 +276,7 @@ private:
   threads threads_;
   runner runner_;
   regs_component regs_;
+  register_info_component reg_info_;
   mem_component mem_;
   run_component run_;
   breakpoints_component breakpoints_;

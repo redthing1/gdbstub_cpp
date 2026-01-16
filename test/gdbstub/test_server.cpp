@@ -247,6 +247,26 @@ struct mock_shlib {
   std::optional<gdbstub::shlib_info> get_shlib_info() { return state.shlib; }
 };
 
+struct mock_register_info {
+  std::optional<gdbstub::register_info> get_register_info(int regno) {
+    if (regno < 0 || regno >= 3) {
+      return std::nullopt;
+    }
+    gdbstub::register_info info;
+    if (regno == 2) {
+      info.name = "pc";
+      info.generic = "pc";
+    } else {
+      info.name = "r" + std::to_string(regno);
+    }
+    info.bitsize = 32;
+    info.encoding = "uint";
+    info.format = "hex";
+    info.set = "general";
+    return info;
+  }
+};
+
 struct mock_components {
   mock_state& state;
   mock_regs regs{state};
@@ -258,6 +278,7 @@ struct mock_components {
   mock_host host{};
   mock_process process{};
   mock_shlib shlib{state};
+  mock_register_info reg_info{};
 };
 
 struct parsed_output {
@@ -298,7 +319,8 @@ gdbstub::target make_target(mock_components& target) {
       target.memory_map,
       target.host,
       target.process,
-      target.shlib
+      target.shlib,
+      target.reg_info
   );
 }
 
@@ -344,6 +366,42 @@ TEST_CASE("server responds to qSupported") {
   CHECK(payload.find("vContSupported+") != std::string::npos);
   CHECK(payload.find("QStartNoAckMode+") != std::string::npos);
   CHECK(payload.find("qXfer:features:read+") != std::string::npos);
+}
+
+TEST_CASE("server responds to qRegisterInfo") {
+  mock_state state;
+  mock_components target(state);
+  gdbstub::arch_spec arch;
+  arch.reg_count = 3;
+  arch.pc_reg_num = 2;
+
+  auto transport = std::make_unique<loopback_transport>();
+  auto* transport_ptr = transport.get();
+  gdbstub::server server(make_target(target), arch, std::move(transport));
+
+  REQUIRE(server.listen("loop"));
+  REQUIRE(server.wait_for_connection());
+
+  auto output = send_packet(server, *transport_ptr, "qRegisterInfo0");
+  REQUIRE(output.packets.size() == 1);
+  CHECK(output.packets[0].payload.find("name:r0;") != std::string::npos);
+  CHECK(output.packets[0].payload.find("bitsize:32;") != std::string::npos);
+  CHECK(output.packets[0].payload.find("offset:0;") != std::string::npos);
+
+  output = send_packet(server, *transport_ptr, "qRegisterInfo1");
+  REQUIRE(output.packets.size() == 1);
+  CHECK(output.packets[0].payload.find("name:r1;") != std::string::npos);
+  CHECK(output.packets[0].payload.find("offset:4;") != std::string::npos);
+
+  output = send_packet(server, *transport_ptr, "qRegisterInfo2");
+  REQUIRE(output.packets.size() == 1);
+  CHECK(output.packets[0].payload.find("name:pc;") != std::string::npos);
+  CHECK(output.packets[0].payload.find("generic:pc;") != std::string::npos);
+  CHECK(output.packets[0].payload.find("offset:8;") != std::string::npos);
+
+  output = send_packet(server, *transport_ptr, "qRegisterInfo3");
+  REQUIRE(output.packets.size() == 1);
+  CHECK(output.packets[0].payload == "E45");
 }
 
 TEST_CASE("server reports gdbserver version") {
