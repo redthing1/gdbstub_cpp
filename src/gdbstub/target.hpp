@@ -43,6 +43,8 @@ struct memory_region {
   uint64_t start = 0;
   uint64_t size = 0;
   std::string permissions;
+  std::optional<std::string> name;
+  std::vector<std::string> types;
 };
 
 struct host_info {

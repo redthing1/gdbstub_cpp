@@ -203,6 +203,17 @@ std::string build_memory_map_xml(const std::vector<memory_region>& regions) {
   return xml;
 }
 
+std::string join_types(const std::vector<std::string>& types) {
+  std::string out;
+  for (size_t i = 0; i < types.size(); ++i) {
+    if (i > 0) {
+      out += ",";
+    }
+    out += types[i];
+  }
+  return out;
+}
+
 std::string build_thread_list(const std::vector<uint64_t>& threads) {
   std::string out = "m";
   bool first = true;
@@ -1596,6 +1607,12 @@ void server::handle_memory_region_info(std::string_view addr_str) {
   response += "start:" + hex_u64(region->start, sizeof(uint64_t) * 2) + ";";
   response += "size:" + hex_u64(region->size, sizeof(uint64_t) * 2) + ";";
   response += "permissions:" + region->permissions + ";";
+  if (region->name && !region->name->empty()) {
+    response += "name:" + hex_encode_string(*region->name) + ";";
+  }
+  if (!region->types.empty()) {
+    response += "type:" + join_types(region->types) + ";";
+  }
   send_packet(response);
 }
 

@@ -196,12 +196,20 @@ struct mock_breakpoints {
 struct mock_memory_map {
   std::optional<gdbstub::memory_region> region_for(uint64_t addr) {
     if (addr >= 0x1000 && addr < 0x1100) {
-      return gdbstub::memory_region{0x1000, 0x100, "rwx"};
+      gdbstub::memory_region region{0x1000, 0x100, "rwx"};
+      region.name = "test";
+      region.types = {"stack"};
+      return region;
     }
     return std::nullopt;
   }
 
-  std::vector<gdbstub::memory_region> regions() { return {gdbstub::memory_region{0x1000, 0x100, "rwx"}}; }
+  std::vector<gdbstub::memory_region> regions() {
+    gdbstub::memory_region region{0x1000, 0x100, "rwx"};
+    region.name = "test";
+    region.types = {"stack"};
+    return {std::move(region)};
+  }
 };
 
 struct mock_threads {
@@ -930,8 +938,10 @@ TEST_CASE("server responds to memory region info queries") {
 
   auto ok = send_packet(server, *transport_ptr, "qMemoryRegionInfo:1000");
   REQUIRE(ok.packets.size() == 1);
-  CHECK(ok.packets[0].payload ==
-        "start:0000000000001000;size:0000000000000100;permissions:rwx;");
+  CHECK(
+      ok.packets[0].payload ==
+      "start:0000000000001000;size:0000000000000100;permissions:rwx;name:74657374;type:stack;"
+  );
 
   auto miss = send_packet(server, *transport_ptr, "qMemoryRegionInfo:0");
   REQUIRE(miss.packets.size() == 1);
