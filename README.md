@@ -2,6 +2,38 @@
 
 a c++20 gdb rsp server library, focused on lldb
 
+## what
+
+- a gdb remote serial protocol (rsp) server
+- a neat, incremental api for wiring up to any sort of target (registers, memory, run control, breakpoints, threads, etc.)
+
+## integration
+
+1. implement the minimum target interface: `register_access`, `memory_access`, `run_control`.
+2. optionally implement breakpoints, threads, etc.
+3. build an `arch_spec` (target xml + reg count + pc reg number).
+4. create a `server` with your `target_handles`, `arch_spec`, and a `transport`.
+5. `listen()` + `wait_for_connection()`, then either `serve_forever()` or call `poll()` periodically.
+
+here's a minimal sketch:
+
+```cpp
+gdbstub::target_handles handles{regs, mem, run}
+gdbstub::arch_spec arch{
+  .target_xml = target_xml,
+  .xml_arch_name = xml_arch_name,
+  .osabi = osabi,
+  .reg_count = reg_count,
+  .pc_reg_num = pc_reg_num,
+};
+
+auto transport = std::make_unique<gdbstub::transport_tcp>();
+gdbstub::server server(handles, arch, std::move(transport));
+server.listen("127.0.0.1:5555");
+server.wait_for_connection();
+server.serve_forever();
+```
+
 ## build
 
 ```bash
