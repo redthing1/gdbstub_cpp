@@ -10,10 +10,10 @@ a c++20 gdb rsp server library, focused on lldb
 ## integration
 
 1. implement the required capability objects: `regs`, `mem`, `run`.
-2. optionally implement `breakpoints`, `threads`, `memory_map`, `host`, `process`, `shlib`.
+2. optionally implement `breakpoints`, `threads`, `memory_layout`, `host`, `process`, `shlib`, `register_info`.
 3. build an `arch_spec` (target xml + reg count + pc reg number).
 4. create a `server` with `make_target(...)`, `arch_spec`, and a `transport`.
-5. `listen()` + `wait_for_connection()`, then either `serve_forever()` or call `poll()` periodically.
+5. integrate with simple `serve_forever()`, or flexible async `poll()`.
 
 here's a minimal sketch:
 
