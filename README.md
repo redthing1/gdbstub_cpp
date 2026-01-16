@@ -15,29 +15,38 @@ cmake --build build-release --parallel
 ctest --test-dir build-release --output-on-failure
 ```
 
+## toy modules
+
+minimal demo target under `src/gdbstub_tool/toy/`:
+
+- `types.hpp` config and execution mode.
+- `layout.hpp` register layout and target XML.
+- `machine.hpp` core state and stepping logic.
+- `threads.hpp` thread IDs and selection.
+- `runner.hpp` blocking/polling/async execution.
+- `target.hpp` gdbstub adapter that composes the pieces.
+
 ## toy server
 
 ```bash
 ./build-release/bin/gdbstub_tool --listen 127.0.0.1:5555 --arch 32 --mode polling
 ```
 
-Modes: `blocking`, `polling`, `async`.
-
 ## lldb (interactive)
 
-If you are using the toy server, set a default arch and connect:
+if you are using the toy server, set a default arch and connect:
 
 ```bash
 lldb -O "settings set target.default-arch riscv32" -O "gdb-remote 127.0.0.1:5555"
 ```
 
-To enable RSP packet logging:
+to enable RSP packet logging:
 
 ```bash
 lldb -O "log enable gdb-remote packets" -O "gdb-remote 127.0.0.1:5555"
 ```
 
-To log into a file:
+to log into a file:
 
 ```bash
 lldb -O "log enable -f /tmp/lldb-gdb-remote.log gdb-remote packets" -O "gdb-remote 127.0.0.1:5555"

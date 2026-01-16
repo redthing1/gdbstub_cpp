@@ -37,6 +37,7 @@ target_sources(gdbstub_test PRIVATE
     test/gdbstub/test_main.cpp
     test/gdbstub/test_gdbstub.cpp
     test/gdbstub/test_server.cpp
+    test/gdbstub/test_toy_components.cpp
     test/gdbstub/test_toy_emulator.cpp
 )
 set_target_properties(gdbstub_test PROPERTIES

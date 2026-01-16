@@ -1,230 +1,130 @@
 #include "doctest/doctest.hpp"
 
-#include <atomic>
 #include <chrono>
-#include <string>
 #include <string_view>
-#include <thread>
 
-#include "gdbstub/server.hpp"
 #include "gdbstub/tcp_test_client.hpp"
-#include "gdbstub/transport_tcp.hpp"
-#include "gdbstub_tool/toy_emulator.hpp"
+#include "gdbstub/toy_session.hpp"
 
 namespace {
 
-std::string make_target_xml(int reg_bits, int reg_count, int pc_reg) {
-  std::string xml;
-  xml.reserve(256);
-  xml += "<target version=\"1.0\">";
-  xml += "<architecture>toy</architecture>";
-  xml += "<feature name=\"org.gnu.gdb.toy\">";
-  for (int i = 0; i < reg_count; ++i) {
-    xml += "<reg name=\"";
-    if (i == pc_reg) {
-      xml += "pc";
-    } else {
-      xml += "r";
-      xml += std::to_string(i);
-    }
-    xml += "\" bitsize=\"";
-    xml += std::to_string(reg_bits);
-    xml += "\" regnum=\"";
-    xml += std::to_string(i);
-    xml += "\"";
-    if (i == pc_reg) {
-      xml += " type=\"code_ptr\"";
-    }
-    xml += "/>";
-  }
-  xml += "</feature></target>";
-  return xml;
+using namespace std::chrono_literals;
+
+constexpr std::string_view k_host = "127.0.0.1";
+
+constexpr auto k_default_timeout = 200ms;
+constexpr auto k_async_timeout = 400ms;
+
+constexpr uint16_t k_port_base = 44000;
+constexpr uint16_t k_port_sweep = 200;
+
+[[nodiscard]] gdbstub::toy::config make_config(uint32_t reg_bits, gdbstub::toy::execution_mode mode) {
+  gdbstub::toy::config cfg;
+  cfg.reg_bits = reg_bits;
+  cfg.mode = mode;
+  return cfg;
 }
 
-template <typename RegT>
-gdbstub::arch_spec make_arch_spec(const gdbstub::toy::emulator<RegT>& emu) {
-  gdbstub::arch_spec arch;
-  arch.reg_count = static_cast<int>(emu.reg_count());
-  arch.pc_reg_num = emu.pc_reg_num();
-  arch.target_xml = make_target_xml(static_cast<int>(sizeof(RegT) * 8), arch.reg_count, arch.pc_reg_num);
-  arch.xml_arch_name = "org.gnu.gdb.toy";
-  arch.osabi = "none";
-  return arch;
-}
-
-template <typename RegT>
-gdbstub::server make_server(gdbstub::toy::emulator<RegT>& emu) {
-  auto transport = std::make_unique<gdbstub::transport_tcp>();
-  auto arch = make_arch_spec(emu);
-  gdbstub::target_handles handles{emu, emu, emu};
-  handles.breakpoints = &emu;
-  handles.memory = &emu;
-  handles.threads = &emu;
-  handles.host = &emu;
-  handles.process = &emu;
-  handles.shlib = &emu;
-  return gdbstub::server(handles, arch, std::move(transport));
+gdbstub::test::client_reply send_and_wait(
+    gdbstub::test::toy_session& session,
+    std::string_view payload,
+    std::chrono::milliseconds timeout = k_default_timeout
+) {
+  REQUIRE(session.client().send_packet(payload));
+  auto reply = gdbstub::test::wait_for_reply(session.server(), session.client(), timeout);
+  REQUIRE(reply.has_value());
+  return *reply;
 }
 
 } // namespace
 
 TEST_CASE("toy emulator 32-bit blocking stops at breakpoint") {
-  gdbstub::toy::emulator<uint32_t>::options options;
-  options.mode = gdbstub::toy::execution_mode::blocking;
-  options.reg_count = 4;
-  options.pc_reg_num = 0;
-  options.start_pc = 0x1000;
-  options.max_steps = 16;
+  auto cfg = make_config(32, gdbstub::toy::execution_mode::blocking);
+  cfg.reg_count = 4;
+  cfg.pc_reg_num = 0;
+  cfg.start_pc = 0x1000;
+  cfg.max_steps = 16;
 
-  gdbstub::toy::emulator<uint32_t> emu(options);
-  auto server = make_server(emu);
+  gdbstub::test::toy_session session(cfg);
+  REQUIRE(session.listen_and_connect(k_host, k_port_base, k_port_sweep));
 
-  constexpr std::string_view k_host = "127.0.0.1";
-  auto port = gdbstub::test::listen_on_available_port(server, k_host, 44000, 200);
-  REQUIRE(port.has_value());
+  auto bp = send_and_wait(session, "Z0,1008,4");
+  CHECK(bp.payload == "OK");
 
-  std::atomic<bool> accepted{false};
-  std::thread accept_thread([&]() { accepted = server.wait_for_connection(); });
+  auto stop = send_and_wait(session, "c", 300ms);
+  CHECK(stop.payload.rfind("T05", 0) == 0);
 
-  gdbstub::test::tcp_client client;
-  REQUIRE(client.connect(k_host, *port));
-  accept_thread.join();
-  REQUIRE(accepted.load());
-
-  REQUIRE(client.send_packet("Z0,1008,4"));
-  auto bp = gdbstub::test::wait_for_reply(server, client, std::chrono::milliseconds(200));
-  REQUIRE(bp.has_value());
-  CHECK(bp->payload == "OK");
-
-  REQUIRE(client.send_packet("c"));
-  auto stop = gdbstub::test::wait_for_reply(server, client, std::chrono::milliseconds(300));
-  REQUIRE(stop.has_value());
-  CHECK(stop->payload.rfind("T05", 0) == 0);
-
-  REQUIRE(client.send_packet("p0"));
-  auto pc = gdbstub::test::wait_for_reply(server, client, std::chrono::milliseconds(200));
-  REQUIRE(pc.has_value());
-  CHECK(pc->payload == "08100000");
-
-  client.close();
-  server.stop();
+  auto pc = send_and_wait(session, "p0");
+  CHECK(pc.payload == "08100000");
 }
 
 TEST_CASE("toy emulator 32-bit polling stops via poll_stop") {
-  gdbstub::toy::emulator<uint32_t>::options options;
-  options.mode = gdbstub::toy::execution_mode::polling;
-  options.reg_count = 4;
-  options.pc_reg_num = 0;
-  options.start_pc = 0x2000;
-  options.max_steps = 32;
+  auto cfg = make_config(32, gdbstub::toy::execution_mode::polling);
+  cfg.reg_count = 4;
+  cfg.pc_reg_num = 0;
+  cfg.start_pc = 0x2000;
+  cfg.max_steps = 32;
 
-  gdbstub::toy::emulator<uint32_t> emu(options);
-  auto server = make_server(emu);
+  gdbstub::test::toy_session session(cfg);
+  REQUIRE(session.listen_and_connect(k_host, k_port_base + 200, k_port_sweep));
 
-  constexpr std::string_view k_host = "127.0.0.1";
-  auto port = gdbstub::test::listen_on_available_port(server, k_host, 44200, 200);
-  REQUIRE(port.has_value());
+  auto bp = send_and_wait(session, "Z0,200c,4");
+  CHECK(bp.payload == "OK");
 
-  std::atomic<bool> accepted{false};
-  std::thread accept_thread([&]() { accepted = server.wait_for_connection(); });
-
-  gdbstub::test::tcp_client client;
-  REQUIRE(client.connect(k_host, *port));
-  accept_thread.join();
-  REQUIRE(accepted.load());
-
-  REQUIRE(client.send_packet("Z0,200c,4"));
-  auto bp = gdbstub::test::wait_for_reply(server, client, std::chrono::milliseconds(200));
-  REQUIRE(bp.has_value());
-  CHECK(bp->payload == "OK");
-
-  REQUIRE(client.send_packet("c"));
-  auto stop = gdbstub::test::wait_for_reply(server, client, std::chrono::milliseconds(300));
-  REQUIRE(stop.has_value());
-  CHECK(stop->payload.rfind("T05", 0) == 0);
-
-  client.close();
-  server.stop();
+  auto stop = send_and_wait(session, "c", 300ms);
+  CHECK(stop.payload.rfind("T05", 0) == 0);
 }
 
 TEST_CASE("toy emulator 32-bit async notifies stop") {
-  gdbstub::toy::emulator<uint32_t>::options options;
-  options.mode = gdbstub::toy::execution_mode::async;
-  options.reg_count = 4;
-  options.pc_reg_num = 0;
-  options.start_pc = 0x3000;
-  options.max_steps = 32;
+  auto cfg = make_config(32, gdbstub::toy::execution_mode::async);
+  cfg.reg_count = 4;
+  cfg.pc_reg_num = 0;
+  cfg.start_pc = 0x3000;
+  cfg.max_steps = 32;
 
-  gdbstub::toy::emulator<uint32_t> emu(options);
-  auto server = make_server(emu);
+  gdbstub::test::toy_session session(cfg);
+  REQUIRE(session.listen_and_connect(k_host, k_port_base + 400, k_port_sweep));
 
-  emu.set_async_callback([&server](const gdbstub::stop_reason& reason) { server.notify_stop(reason); });
+  auto bp = send_and_wait(session, "Z0,3008,4");
+  CHECK(bp.payload == "OK");
 
-  constexpr std::string_view k_host = "127.0.0.1";
-  auto port = gdbstub::test::listen_on_available_port(server, k_host, 44400, 200);
-  REQUIRE(port.has_value());
-
-  std::atomic<bool> accepted{false};
-  std::thread accept_thread([&]() { accepted = server.wait_for_connection(); });
-
-  gdbstub::test::tcp_client client;
-  REQUIRE(client.connect(k_host, *port));
-  accept_thread.join();
-  REQUIRE(accepted.load());
-
-  REQUIRE(client.send_packet("Z0,3008,4"));
-  auto bp = gdbstub::test::wait_for_reply(server, client, std::chrono::milliseconds(200));
-  REQUIRE(bp.has_value());
-  CHECK(bp->payload == "OK");
-
-  REQUIRE(client.send_packet("c"));
-  auto stop = gdbstub::test::wait_for_reply(server, client, std::chrono::milliseconds(400));
-  REQUIRE(stop.has_value());
-  CHECK(stop->payload.rfind("T05", 0) == 0);
-
-  client.close();
-  server.stop();
+  auto stop = send_and_wait(session, "c", k_async_timeout);
+  CHECK(stop.payload.rfind("T05", 0) == 0);
 }
 
 TEST_CASE("toy emulator 64-bit reads and writes registers") {
-  gdbstub::toy::emulator<uint64_t>::options options;
-  options.mode = gdbstub::toy::execution_mode::blocking;
-  options.reg_count = 2;
-  options.pc_reg_num = 1;
-  options.start_pc = 0x1000;
+  auto cfg = make_config(64, gdbstub::toy::execution_mode::blocking);
+  cfg.reg_count = 2;
+  cfg.pc_reg_num = 1;
+  cfg.start_pc = 0x1000;
 
-  gdbstub::toy::emulator<uint64_t> emu(options);
-  emu.set_reg(0, 0x1122334455667788ULL);
+  gdbstub::test::toy_session session(cfg);
+  session.target().set_reg(0, 0x1122334455667788ULL);
+  REQUIRE(session.listen_and_connect(k_host, k_port_base + 600, k_port_sweep));
 
-  auto server = make_server(emu);
+  auto read = send_and_wait(session, "p0");
+  CHECK(read.payload == "8877665544332211");
 
-  constexpr std::string_view k_host = "127.0.0.1";
-  auto port = gdbstub::test::listen_on_available_port(server, k_host, 44600, 200);
-  REQUIRE(port.has_value());
+  auto write = send_and_wait(session, "P0=0100000000000000");
+  CHECK(write.payload == "OK");
 
-  std::atomic<bool> accepted{false};
-  std::thread accept_thread([&]() { accepted = server.wait_for_connection(); });
+  auto read_back = send_and_wait(session, "p0");
+  CHECK(read_back.payload == "0100000000000000");
+}
 
-  gdbstub::test::tcp_client client;
-  REQUIRE(client.connect(k_host, *port));
-  accept_thread.join();
-  REQUIRE(accepted.load());
+TEST_CASE("toy emulator reports multiple threads and honors selection") {
+  auto cfg = make_config(32, gdbstub::toy::execution_mode::blocking);
+  cfg.thread_ids = {1, 2, 3};
 
-  REQUIRE(client.send_packet("p0"));
-  auto read = gdbstub::test::wait_for_reply(server, client, std::chrono::milliseconds(200));
-  REQUIRE(read.has_value());
-  CHECK(read->payload == "8877665544332211");
+  gdbstub::test::toy_session session(cfg);
+  REQUIRE(session.listen_and_connect(k_host, k_port_base + 800, k_port_sweep));
 
-  REQUIRE(client.send_packet("P0=0100000000000000"));
-  auto write = gdbstub::test::wait_for_reply(server, client, std::chrono::milliseconds(200));
-  REQUIRE(write.has_value());
-  CHECK(write->payload == "OK");
+  auto list = send_and_wait(session, "qfThreadInfo");
+  CHECK(list.payload == "m1,2,3");
 
-  REQUIRE(client.send_packet("p0"));
-  auto read_back = gdbstub::test::wait_for_reply(server, client, std::chrono::milliseconds(200));
-  REQUIRE(read_back.has_value());
-  CHECK(read_back->payload == "0100000000000000");
+  auto set_thread = send_and_wait(session, "Hc2");
+  CHECK(set_thread.payload == "OK");
 
-  client.close();
-  server.stop();
+  auto current = send_and_wait(session, "qC");
+  CHECK(current.payload == "QC2");
 }
