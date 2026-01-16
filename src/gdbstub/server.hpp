@@ -22,6 +22,7 @@ struct arch_spec {
   std::string osabi;
   int reg_count = 0;
   int pc_reg_num = -1;
+  std::optional<int> address_bits;
   bool swap_register_endianness = false;
 };
 

@@ -28,7 +28,7 @@ public:
         run_(runner_),
         breakpoints_(machine_),
         thread_api_(threads_, machine_, runner_),
-        memory_map_(machine_),
+        memory_layout_(machine_),
         host_(config_),
         process_(config_),
         shlib_(config_) {}
@@ -42,6 +42,7 @@ public:
     spec.osabi = config_.osabi;
     spec.reg_count = layout_.reg_count();
     spec.pc_reg_num = layout_.pc_reg_num();
+    spec.address_bits = static_cast<int>(config_.reg_bits);
     return spec;
   }
 
@@ -52,7 +53,7 @@ public:
         run_,
         breakpoints_,
         thread_api_,
-        memory_map_,
+        memory_layout_,
         host_,
         process_,
         shlib_,
@@ -199,19 +200,21 @@ private:
     runner& runner_;
   };
 
-  class memory_map_component {
+  class memory_layout_component {
   public:
-    explicit memory_map_component(machine& machine) : machine_(machine) {}
+    explicit memory_layout_component(machine& machine) : machine_(machine) {}
 
-    std::optional<memory_region> region_for(uint64_t addr) {
-      if (addr >= machine_.memory_size()) {
-        return std::nullopt;
-      }
-      return memory_region{0, static_cast<uint64_t>(machine_.memory_size()), "rwx"};
+    std::optional<memory_region_info> region_info(uint64_t addr) {
+      auto regions = memory_map();
+      return region_info_from_map(regions, addr);
     }
 
-    std::vector<memory_region> regions() {
-      return {memory_region{0, static_cast<uint64_t>(machine_.memory_size()), "rwx"}};
+    std::vector<memory_region> memory_map() {
+      return {memory_region{
+          0,
+          static_cast<uint64_t>(machine_.memory_size()),
+          mem_perm::read | mem_perm::write | mem_perm::exec
+      }};
     }
 
   private:
@@ -281,7 +284,7 @@ private:
   run_component run_;
   breakpoints_component breakpoints_;
   threads_component thread_api_;
-  memory_map_component memory_map_;
+  memory_layout_component memory_layout_;
   host_component host_;
   process_component process_;
   shlib_component shlib_;

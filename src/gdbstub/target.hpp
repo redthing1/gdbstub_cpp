@@ -2,6 +2,8 @@
 
 #include <concepts>
 #include <cstddef>
+#include <cstdint>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <span>
@@ -39,13 +41,88 @@ struct breakpoint_spec {
   uint32_t length = 0;
 };
 
+enum class mem_perm : uint8_t {
+  none = 0,
+  read = 1 << 0,
+  write = 1 << 1,
+  exec = 1 << 2,
+};
+
+constexpr mem_perm operator|(mem_perm lhs, mem_perm rhs) {
+  return static_cast<mem_perm>(static_cast<uint8_t>(lhs) | static_cast<uint8_t>(rhs));
+}
+
+constexpr mem_perm operator&(mem_perm lhs, mem_perm rhs) {
+  return static_cast<mem_perm>(static_cast<uint8_t>(lhs) & static_cast<uint8_t>(rhs));
+}
+
+constexpr mem_perm& operator|=(mem_perm& lhs, mem_perm rhs) {
+  lhs = lhs | rhs;
+  return lhs;
+}
+
+constexpr bool has_perm(mem_perm value, mem_perm flag) {
+  return (value & flag) != mem_perm::none;
+}
+
 struct memory_region {
   uint64_t start = 0;
   uint64_t size = 0;
-  std::string permissions;
+  mem_perm perms = mem_perm::none;
   std::optional<std::string> name;
   std::vector<std::string> types;
 };
+
+struct memory_region_info {
+  uint64_t start = 0;
+  uint64_t size = 0;
+  bool mapped = false;
+  mem_perm perms = mem_perm::none;
+  std::optional<std::string> name;
+  std::vector<std::string> types;
+};
+
+inline uint64_t region_end(const memory_region& region) {
+  if (region.size == 0) {
+    return region.start;
+  }
+  if (region.start > std::numeric_limits<uint64_t>::max() - region.size) {
+    return std::numeric_limits<uint64_t>::max();
+  }
+  return region.start + region.size;
+}
+
+inline memory_region_info mapped_region_info(const memory_region& region) {
+  memory_region_info info;
+  info.start = region.start;
+  info.size = region.size;
+  info.mapped = true;
+  info.perms = region.perms;
+  info.name = region.name;
+  info.types = region.types;
+  return info;
+}
+
+inline memory_region_info unmapped_region_info(uint64_t start, uint64_t size) {
+  memory_region_info info;
+  info.start = start;
+  info.size = size;
+  info.mapped = false;
+  return info;
+}
+
+inline std::optional<memory_region_info> region_info_from_map(
+    std::span<const memory_region> regions,
+    uint64_t addr
+) {
+  for (const auto& region : regions) {
+    auto end = region_end(region);
+    if (addr >= region.start && addr < end) {
+      return mapped_region_info(region);
+    }
+  }
+  return std::nullopt;
+}
 
 struct host_info {
   std::string triple;
@@ -149,13 +226,27 @@ struct breakpoints_view {
   }
 };
 
-struct memory_map_view {
+struct memory_layout_view {
   void* ctx = nullptr;
-  std::optional<memory_region> (*region_for_fn)(void* ctx, uint64_t addr) = nullptr;
-  std::vector<memory_region> (*regions_fn)(void* ctx) = nullptr;
+  std::optional<memory_region_info> (*region_info_fn)(void* ctx, uint64_t addr) = nullptr;
+  std::vector<memory_region> (*memory_map_fn)(void* ctx) = nullptr;
 
-  std::optional<memory_region> region_for(uint64_t addr) const { return region_for_fn(ctx, addr); }
-  std::vector<memory_region> regions() const { return regions_fn(ctx); }
+  bool has_region_info() const { return region_info_fn != nullptr; }
+  bool has_memory_map() const { return memory_map_fn != nullptr; }
+
+  std::optional<memory_region_info> region_info(uint64_t addr) const {
+    if (!region_info_fn) {
+      return std::nullopt;
+    }
+    return region_info_fn(ctx, addr);
+  }
+
+  std::vector<memory_region> memory_map() const {
+    if (!memory_map_fn) {
+      return {};
+    }
+    return memory_map_fn(ctx);
+  }
 };
 
 struct threads_view {
@@ -208,7 +299,7 @@ struct target_view {
   mem_view mem;
   run_view run;
   std::optional<breakpoints_view> breakpoints;
-  std::optional<memory_map_view> memory_map;
+  std::optional<memory_layout_view> memory_layout;
   std::optional<threads_view> threads;
   std::optional<host_info_view> host;
   std::optional<process_info_view> process;
@@ -276,10 +367,17 @@ concept breakpoints_capability = requires(T& t, const breakpoint_spec& request) 
 };
 
 template <typename T>
-concept memory_map_capability = requires(T& t, uint64_t addr) {
-  { t.region_for(addr) } -> std::same_as<std::optional<memory_region>>;
-  { t.regions() } -> std::same_as<std::vector<memory_region>>;
+concept memory_layout_region_capability = requires(T& t, uint64_t addr) {
+  { t.region_info(addr) } -> std::same_as<std::optional<memory_region_info>>;
 };
+
+template <typename T>
+concept memory_layout_map_capability = requires(T& t) {
+  { t.memory_map() } -> std::same_as<std::vector<memory_region>>;
+};
+
+template <typename T>
+concept memory_layout_capability = memory_layout_region_capability<T> || memory_layout_map_capability<T>;
 
 template <typename T>
 concept threads_capability = requires(T& t, uint64_t tid) {
@@ -370,13 +468,19 @@ breakpoints_view make_breakpoints_view(T& breakpoints) {
 }
 
 template <typename T>
-memory_map_view make_memory_map_view(T& memory_map) {
-  memory_map_view view;
-  view.ctx = std::addressof(memory_map);
-  view.region_for_fn = [](void* ctx, uint64_t addr) -> std::optional<memory_region> {
-    return static_cast<T*>(ctx)->region_for(addr);
-  };
-  view.regions_fn = [](void* ctx) -> std::vector<memory_region> { return static_cast<T*>(ctx)->regions(); };
+memory_layout_view make_memory_layout_view(T& layout) {
+  memory_layout_view view;
+  view.ctx = std::addressof(layout);
+  if constexpr (memory_layout_region_capability<T>) {
+    view.region_info_fn = [](void* ctx, uint64_t addr) -> std::optional<memory_region_info> {
+      return static_cast<T*>(ctx)->region_info(addr);
+    };
+  }
+  if constexpr (memory_layout_map_capability<T>) {
+    view.memory_map_fn = [](void* ctx) -> std::vector<memory_region> {
+      return static_cast<T*>(ctx)->memory_map();
+    };
+  }
   return view;
 }
 
@@ -442,27 +546,31 @@ void assign_optional(target_view& view, T& obj) {
   static_assert(!regs_capability<T>, "Optional capability object implements register access; pass it as regs.");
   static_assert(!mem_capability<T>, "Optional capability object implements memory access; pass it as mem.");
   static_assert(!run_capability<T>, "Optional capability object implements run control; pass it as run.");
-  constexpr int matches = breakpoints_capability<T> + threads_capability<T> + memory_map_capability<T> +
+  constexpr int matches = breakpoints_capability<T> + threads_capability<T> + memory_layout_capability<T> +
                           host_info_capability<T> + process_info_capability<T> + shlib_capability<T> +
                           register_info_capability<T>;
-  static_assert(matches == 1, "Optional capability object must implement exactly one optional capability.");
+  static_assert(matches >= 1, "Optional capability object must implement at least one optional capability.");
 
   if constexpr (breakpoints_capability<T>) {
     view.breakpoints = make_breakpoints_view(obj);
-  } else if constexpr (threads_capability<T>) {
+  }
+  if constexpr (threads_capability<T>) {
     view.threads = make_threads_view(obj);
-  } else if constexpr (memory_map_capability<T>) {
-    view.memory_map = make_memory_map_view(obj);
-  } else if constexpr (host_info_capability<T>) {
+  }
+  if constexpr (memory_layout_capability<T>) {
+    view.memory_layout = make_memory_layout_view(obj);
+  }
+  if constexpr (host_info_capability<T>) {
     view.host = make_host_info_view(obj);
-  } else if constexpr (process_info_capability<T>) {
+  }
+  if constexpr (process_info_capability<T>) {
     view.process = make_process_info_view(obj);
-  } else if constexpr (shlib_capability<T>) {
+  }
+  if constexpr (shlib_capability<T>) {
     view.shlib = make_shlib_view(obj);
-  } else if constexpr (register_info_capability<T>) {
+  }
+  if constexpr (register_info_capability<T>) {
     view.reg_info = make_register_info_view(obj);
-  } else {
-    static_assert(always_false<T>, "Optional capability object must implement exactly one optional capability.");
   }
 }
 
@@ -478,8 +586,8 @@ target make_target(Regs& regs, Mem& mem, Run& run, Opts&... opts) {
   static_assert(breakpoints_count <= 1, "Breakpoints capability provided multiple times.");
   constexpr int threads_count = (0 + ... + detail::threads_capability<Opts>);
   static_assert(threads_count <= 1, "Threads capability provided multiple times.");
-  constexpr int memory_map_count = (0 + ... + detail::memory_map_capability<Opts>);
-  static_assert(memory_map_count <= 1, "Memory map capability provided multiple times.");
+  constexpr int memory_layout_count = (0 + ... + detail::memory_layout_capability<Opts>);
+  static_assert(memory_layout_count <= 1, "Memory layout capability provided multiple times.");
   constexpr int host_count = (0 + ... + detail::host_info_capability<Opts>);
   static_assert(host_count <= 1, "Host info capability provided multiple times.");
   constexpr int process_count = (0 + ... + detail::process_info_capability<Opts>);

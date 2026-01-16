@@ -193,19 +193,18 @@ struct mock_breakpoints {
   }
 };
 
-struct mock_memory_map {
-  std::optional<gdbstub::memory_region> region_for(uint64_t addr) {
-    if (addr >= 0x1000 && addr < 0x1100) {
-      gdbstub::memory_region region{0x1000, 0x100, "rwx"};
-      region.name = "test";
-      region.types = {"stack"};
-      return region;
-    }
-    return std::nullopt;
+struct mock_memory_layout {
+  std::optional<gdbstub::memory_region_info> region_info(uint64_t addr) {
+    auto regions = memory_map();
+    return gdbstub::region_info_from_map(regions, addr);
   }
 
-  std::vector<gdbstub::memory_region> regions() {
-    gdbstub::memory_region region{0x1000, 0x100, "rwx"};
+  std::vector<gdbstub::memory_region> memory_map() {
+    gdbstub::memory_region region{
+        0x1000,
+        0x100,
+        gdbstub::mem_perm::read | gdbstub::mem_perm::write | gdbstub::mem_perm::exec
+    };
     region.name = "test";
     region.types = {"stack"};
     return {std::move(region)};
@@ -281,7 +280,7 @@ struct mock_components {
   mock_mem mem{state};
   mock_run run{state};
   mock_breakpoints breakpoints{state};
-  mock_memory_map memory_map{};
+  mock_memory_layout memory_layout{};
   mock_threads threads{state};
   mock_host host{};
   mock_process process{};
@@ -324,7 +323,7 @@ gdbstub::target make_target(mock_components& target) {
       target.run,
       target.breakpoints,
       target.threads,
-      target.memory_map,
+      target.memory_layout,
       target.host,
       target.process,
       target.shlib,
@@ -374,6 +373,8 @@ TEST_CASE("server responds to qSupported") {
   CHECK(payload.find("vContSupported+") != std::string::npos);
   CHECK(payload.find("QStartNoAckMode+") != std::string::npos);
   CHECK(payload.find("qXfer:features:read+") != std::string::npos);
+  CHECK(payload.find("qMemoryRegionInfo+") != std::string::npos);
+  CHECK(payload.find("qXfer:memory-map:read+") != std::string::npos);
 }
 
 TEST_CASE("server responds to qRegisterInfo") {
@@ -945,7 +946,7 @@ TEST_CASE("server responds to memory region info queries") {
 
   auto miss = send_packet(server, *transport_ptr, "qMemoryRegionInfo:0");
   REQUIRE(miss.packets.size() == 1);
-  CHECK(miss.packets[0].payload == "E0e");
+  CHECK(miss.packets[0].payload == "start:0000000000000000;size:0000000000001000;");
 }
 
 TEST_CASE("server checks thread liveness") {

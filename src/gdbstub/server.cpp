@@ -54,6 +54,41 @@ bool parse_hex_u64(std::string_view text, uint64_t& value) {
   return result.ec == std::errc{};
 }
 
+std::string perms_to_string(mem_perm perms) {
+  if (perms == mem_perm::none) {
+    return {};
+  }
+  std::string out;
+  out.push_back(has_perm(perms, mem_perm::read) ? 'r' : '-');
+  out.push_back(has_perm(perms, mem_perm::write) ? 'w' : '-');
+  out.push_back(has_perm(perms, mem_perm::exec) ? 'x' : '-');
+  return out;
+}
+
+uint64_t address_space_end(const target_view& target, const arch_spec& arch) {
+  auto bits = arch.address_bits;
+  if (target.host) {
+    if (auto info = target.host->get_host_info()) {
+      if (info->addressing_bits) {
+        bits = *info->addressing_bits;
+      } else if (info->ptr_size > 0) {
+        bits = info->ptr_size * 8;
+      }
+    }
+  }
+  if (!bits && target.process) {
+    if (auto info = target.process->get_process_info()) {
+      if (info->ptr_size > 0) {
+        bits = info->ptr_size * 8;
+      }
+    }
+  }
+  if (!bits || *bits <= 0 || *bits >= 63) {
+    return std::numeric_limits<uint64_t>::max();
+  }
+  return 1ULL << *bits;
+}
+
 bool parse_dec_int(std::string_view text, int& value) {
   value = 0;
   if (text.empty()) {
@@ -192,9 +227,10 @@ std::string build_memory_map_xml(const std::vector<memory_region>& regions) {
     xml += "\" length=\"0x";
     xml += hex_u64(region.size);
     xml += "\"";
-    if (!region.permissions.empty()) {
+    auto perms = perms_to_string(region.perms);
+    if (!perms.empty()) {
       xml += " permissions=\"";
-      xml += region.permissions;
+      xml += perms;
       xml += "\"";
     }
     xml += "/>";
@@ -530,8 +566,11 @@ void server::handle_query(std::string_view args) {
     if (target_.process) {
       features += ";qProcessInfo+";
     }
-    if (target_.memory_map) {
-      features += ";qMemoryRegionInfo+;qXfer:memory-map:read+";
+    if (target_.memory_layout) {
+      features += ";qMemoryRegionInfo+";
+    }
+    if (target_.memory_layout && target_.memory_layout->has_memory_map()) {
+      features += ";qXfer:memory-map:read+";
     }
     send_packet(features);
     return;
@@ -1489,7 +1528,7 @@ void server::handle_xfer(std::string_view args) {
 
   constexpr std::string_view k_memory_map_prefix = "memory-map:read::";
   if (args.rfind(k_memory_map_prefix, 0) == 0) {
-    if (!target_.memory_map) {
+    if (!target_.memory_layout || !target_.memory_layout->has_memory_map()) {
       send_packet("");
       return;
     }
@@ -1508,7 +1547,7 @@ void server::handle_xfer(std::string_view args) {
       return;
     }
 
-    auto xml = build_memory_map_xml(target_.memory_map->regions());
+    auto xml = build_memory_map_xml(target_.memory_layout->memory_map());
     if (offset >= xml.size()) {
       send_packet("l");
       return;
@@ -1585,7 +1624,7 @@ void server::handle_process_info() {
 }
 
 void server::handle_memory_region_info(std::string_view addr_str) {
-  if (!target_.memory_map) {
+  if (!target_.memory_layout) {
     send_packet("");
     return;
   }
@@ -1596,22 +1635,60 @@ void server::handle_memory_region_info(std::string_view addr_str) {
     return;
   }
 
-  auto region = target_.memory_map->region_for(addr);
-  if (!region) {
+  std::optional<memory_region_info> info;
+  if (target_.memory_layout->has_region_info()) {
+    info = target_.memory_layout->region_info(addr);
+  }
+
+  if (!info && target_.memory_layout->has_memory_map()) {
+    auto regions = target_.memory_layout->memory_map();
+    std::optional<memory_region_info> mapped = region_info_from_map(regions, addr);
+    uint64_t next_start = std::numeric_limits<uint64_t>::max();
+    for (const auto& region : regions) {
+      auto start = region.start;
+      if (start > addr && start < next_start) {
+        next_start = start;
+      }
+    }
+    if (mapped) {
+      info = std::move(mapped);
+    } else {
+      uint64_t end_exclusive = next_start;
+      if (end_exclusive == std::numeric_limits<uint64_t>::max()) {
+        end_exclusive = address_space_end(target_, arch_);
+      }
+      if (end_exclusive <= addr) {
+        end_exclusive = std::numeric_limits<uint64_t>::max();
+      }
+      if (end_exclusive <= addr) {
+        send_error(0x0e);
+        return;
+      }
+      info = unmapped_region_info(addr, end_exclusive - addr);
+    }
+  }
+
+  if (!info) {
     send_error(0x0e);
     return;
   }
 
   std::string response;
   response.reserve(128);
-  response += "start:" + hex_u64(region->start, sizeof(uint64_t) * 2) + ";";
-  response += "size:" + hex_u64(region->size, sizeof(uint64_t) * 2) + ";";
-  response += "permissions:" + region->permissions + ";";
-  if (region->name && !region->name->empty()) {
-    response += "name:" + hex_encode_string(*region->name) + ";";
-  }
-  if (!region->types.empty()) {
-    response += "type:" + join_types(region->types) + ";";
+  response += "start:" + hex_u64(info->start, sizeof(uint64_t) * 2) + ";";
+  response += "size:" + hex_u64(info->size, sizeof(uint64_t) * 2) + ";";
+  if (info->mapped) {
+    auto perms = perms_to_string(info->perms);
+    if (perms.empty()) {
+      perms = "rwx";
+    }
+    response += "permissions:" + perms + ";";
+    if (info->name && !info->name->empty()) {
+      response += "name:" + hex_encode_string(*info->name) + ";";
+    }
+    if (!info->types.empty()) {
+      response += "type:" + join_types(info->types) + ";";
+    }
   }
   send_packet(response);
 }
