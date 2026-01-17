@@ -42,9 +42,20 @@ typedef enum gdbstub_stop_kind {
   GDBSTUB_STOP_EXITED = 6,
 } gdbstub_stop_kind;
 
+typedef enum gdbstub_replay_log_boundary {
+  GDBSTUB_REPLAY_LOG_BEGIN = 0,
+  GDBSTUB_REPLAY_LOG_END = 1,
+} gdbstub_replay_log_boundary;
+
+typedef enum gdbstub_resume_direction {
+  GDBSTUB_RESUME_FORWARD = 0,
+  GDBSTUB_RESUME_REVERSE = 1,
+} gdbstub_resume_direction;
+
 typedef enum gdbstub_resume_action {
   GDBSTUB_RESUME_CONT = 0,
   GDBSTUB_RESUME_STEP = 1,
+  GDBSTUB_RESUME_RANGE_STEP = 2,
 } gdbstub_resume_action;
 
 typedef enum gdbstub_target_status {
@@ -82,20 +93,31 @@ typedef struct gdbstub_stop_reason {
   int exit_code;
   uint8_t has_thread_id;
   uint64_t thread_id;
+  uint8_t has_replay_log;
+  gdbstub_replay_log_boundary replay_log;
 } gdbstub_stop_reason;
+
+typedef struct gdbstub_address_range {
+  uint64_t start;
+  uint64_t end;
+} gdbstub_address_range;
 
 typedef struct gdbstub_resume_request {
   gdbstub_resume_action action;
+  gdbstub_resume_direction direction;
   uint8_t has_addr;
   uint64_t addr;
   uint8_t has_signal;
   int signal;
+  uint8_t has_range;
+  gdbstub_address_range range;
 } gdbstub_resume_request;
 
 typedef struct gdbstub_resume_result {
   gdbstub_resume_state state;
   gdbstub_stop_reason stop;
   int exit_code;
+  gdbstub_target_status status;
 } gdbstub_resume_result;
 
 typedef struct gdbstub_breakpoint_spec {
@@ -214,6 +236,24 @@ typedef void (*gdbstub_set_stop_notifier_fn)(void* ctx, gdbstub_stop_notifier no
 
 typedef gdbstub_target_status (*gdbstub_breakpoint_fn)(void* ctx, const gdbstub_breakpoint_spec* spec);
 
+typedef struct gdbstub_run_capabilities {
+  uint8_t reverse_continue;
+  uint8_t reverse_step;
+  uint8_t range_step;
+  uint8_t non_stop;
+} gdbstub_run_capabilities;
+
+typedef struct gdbstub_breakpoint_capabilities {
+  uint8_t software;
+  uint8_t hardware;
+  uint8_t watch_read;
+  uint8_t watch_write;
+  uint8_t watch_access;
+} gdbstub_breakpoint_capabilities;
+
+typedef uint8_t (*gdbstub_get_run_capabilities_fn)(void* ctx, gdbstub_run_capabilities* out);
+typedef uint8_t (*gdbstub_get_breakpoint_capabilities_fn)(void* ctx, gdbstub_breakpoint_capabilities* out);
+
 typedef uint8_t (*gdbstub_region_info_fn)(
     void* ctx,
     uint64_t addr,
@@ -253,12 +293,14 @@ typedef struct gdbstub_run_iface {
   gdbstub_interrupt_fn interrupt;
   gdbstub_poll_stop_fn poll_stop;
   gdbstub_set_stop_notifier_fn set_stop_notifier;
+  gdbstub_get_run_capabilities_fn get_capabilities;
 } gdbstub_run_iface;
 
 typedef struct gdbstub_breakpoints_iface {
   void* ctx;
   gdbstub_breakpoint_fn set_breakpoint;
   gdbstub_breakpoint_fn remove_breakpoint;
+  gdbstub_get_breakpoint_capabilities_fn get_capabilities;
 } gdbstub_breakpoints_iface;
 
 typedef struct gdbstub_memory_layout_iface {

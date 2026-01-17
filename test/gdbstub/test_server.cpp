@@ -88,12 +88,16 @@ struct mock_state {
   std::vector<uint64_t> threads = {1};
   std::unordered_map<uint64_t, uint64_t> thread_pcs;
   std::optional<gdbstub::stop_reason> stop_for_threads;
+  std::optional<gdbstub::stop_reason> resume_stop;
   std::optional<gdbstub::shlib_info> shlib;
   std::optional<gdbstub::resume_request> last_resume;
   std::optional<uint64_t> last_set_thread;
   std::optional<gdbstub::breakpoint_spec> last_breakpoint;
   std::optional<gdbstub::breakpoint_spec> last_removed_breakpoint;
   gdbstub::target_status breakpoint_status = gdbstub::target_status::ok;
+  gdbstub::target_status resume_status = gdbstub::target_status::ok;
+  gdbstub::run_capabilities run_caps{};
+  gdbstub::breakpoint_capabilities breakpoint_caps{};
   bool interrupt_called = false;
   uint64_t current_tid = 1;
 
@@ -101,7 +105,10 @@ struct mock_state {
 
   resume_behavior resume_behavior = resume_behavior::stop_immediately;
 
-  mock_state() { regs[2] = 0x1000; }
+  mock_state() {
+    regs[2] = 0x1000;
+    breakpoint_caps.software = true;
+  }
 };
 
 struct mock_regs {
@@ -164,19 +171,29 @@ struct mock_run {
     }
 
     gdbstub::resume_result result;
+    result.status = state.resume_status;
+    if (result.status != gdbstub::target_status::ok) {
+      return result;
+    }
     if (state.resume_behavior == mock_state::resume_behavior::run) {
       result.state = gdbstub::resume_result::state::running;
       return result;
     }
 
     result.state = gdbstub::resume_result::state::stopped;
-    result.stop = {gdbstub::stop_kind::signal, 5, 0, 0, 1};
+    if (state.resume_stop) {
+      result.stop = *state.resume_stop;
+    } else {
+      result.stop = {gdbstub::stop_kind::signal, 5, 0, 0, 1};
+    }
     return result;
   }
 
   void interrupt() { state.interrupt_called = true; }
 
   std::optional<gdbstub::stop_reason> poll_stop() { return std::nullopt; }
+
+  gdbstub::run_capabilities capabilities() const { return state.run_caps; }
 };
 
 struct mock_breakpoints {
@@ -191,6 +208,8 @@ struct mock_breakpoints {
     state.last_removed_breakpoint = request;
     return state.breakpoint_status;
   }
+
+  gdbstub::breakpoint_capabilities capabilities() const { return state.breakpoint_caps; }
 };
 
 struct mock_memory_layout {
@@ -290,6 +309,7 @@ struct mock_components {
 
 struct parsed_output {
   std::vector<gdbstub::rsp::input_event> packets;
+  std::vector<gdbstub::rsp::input_event> notifications;
   size_t ack_count = 0;
   size_t nack_count = 0;
 };
@@ -309,6 +329,8 @@ parsed_output parse_output(std::string_view data) {
       ++out.ack_count;
     } else if (event.kind == gdbstub::rsp::event_kind::nack) {
       ++out.nack_count;
+    } else if (event.kind == gdbstub::rsp::event_kind::notification) {
+      out.notifications.push_back(std::move(event));
     } else if (event.kind == gdbstub::rsp::event_kind::packet) {
       out.packets.push_back(std::move(event));
     }
@@ -373,8 +395,39 @@ TEST_CASE("server responds to qSupported") {
   CHECK(payload.find("vContSupported+") != std::string::npos);
   CHECK(payload.find("QStartNoAckMode+") != std::string::npos);
   CHECK(payload.find("qXfer:features:read+") != std::string::npos);
+  CHECK(payload.find("swbreak+") != std::string::npos);
   CHECK(payload.find("qMemoryRegionInfo+") != std::string::npos);
   CHECK(payload.find("qXfer:memory-map:read+") != std::string::npos);
+}
+
+TEST_CASE("server advertises optional capabilities in qSupported") {
+  mock_state state;
+  state.run_caps.reverse_continue = true;
+  state.run_caps.reverse_step = true;
+  state.run_caps.range_step = true;
+  state.run_caps.non_stop = true;
+  state.breakpoint_caps.software = true;
+  state.breakpoint_caps.hardware = true;
+
+  mock_components target(state);
+  gdbstub::arch_spec arch;
+  arch.reg_count = 3;
+  arch.pc_reg_num = 2;
+
+  auto transport = std::make_unique<loopback_transport>();
+  auto* transport_ptr = transport.get();
+  gdbstub::server server(make_target(target), arch, std::move(transport));
+
+  REQUIRE(server.listen("loop"));
+  REQUIRE(server.wait_for_connection());
+
+  auto output = send_packet(server, *transport_ptr, "qSupported");
+  REQUIRE(output.packets.size() == 1);
+  auto payload = output.packets[0].payload;
+  CHECK(payload.find("ReverseContinue+") != std::string::npos);
+  CHECK(payload.find("ReverseStep+") != std::string::npos);
+  CHECK(payload.find("QNonStop+") != std::string::npos);
+  CHECK(payload.find("hwbreak+") != std::string::npos);
 }
 
 TEST_CASE("server responds to qRegisterInfo") {
@@ -698,6 +751,32 @@ TEST_CASE("server sets breakpoints and continues") {
   CHECK(cont.packets[0].payload.rfind("T", 0) == 0);
 }
 
+TEST_CASE("server includes hwbreak stop reason when enabled") {
+  mock_state state;
+  state.breakpoint_caps.hardware = true;
+  state.breakpoint_caps.software = true;
+  state.resume_stop = gdbstub::stop_reason{gdbstub::stop_kind::hw_break, 5, 0x2000, 0, 1};
+  mock_components target(state);
+
+  gdbstub::arch_spec arch;
+  arch.reg_count = 3;
+  arch.pc_reg_num = 2;
+
+  auto transport = std::make_unique<loopback_transport>();
+  auto* transport_ptr = transport.get();
+  gdbstub::server server(make_target(target), arch, std::move(transport));
+
+  REQUIRE(server.listen("loop"));
+  REQUIRE(server.wait_for_connection());
+
+  auto supported = send_packet(server, *transport_ptr, "qSupported");
+  REQUIRE(supported.packets.size() == 1);
+
+  auto cont = send_packet(server, *transport_ptr, "c");
+  REQUIRE(cont.packets.size() == 1);
+  CHECK(cont.packets[0].payload.find("hwbreak:;") != std::string::npos);
+}
+
 TEST_CASE("server parses vCont actions and signals") {
   mock_state state;
   mock_components target(state);
@@ -724,6 +803,65 @@ TEST_CASE("server parses vCont actions and signals") {
   CHECK(state.last_resume->action == gdbstub::resume_action::step);
   REQUIRE(state.last_resume->signal.has_value());
   CHECK(state.last_resume->signal.value() == 0x0a);
+}
+
+TEST_CASE("server parses reverse continue and step") {
+  mock_state state;
+  state.run_caps.reverse_continue = true;
+  state.run_caps.reverse_step = true;
+  mock_components target(state);
+
+  gdbstub::arch_spec arch;
+  arch.reg_count = 3;
+  arch.pc_reg_num = 2;
+
+  auto transport = std::make_unique<loopback_transport>();
+  auto* transport_ptr = transport.get();
+  gdbstub::server server(make_target(target), arch, std::move(transport));
+
+  REQUIRE(server.listen("loop"));
+  REQUIRE(server.wait_for_connection());
+
+  auto out_cont = send_packet(server, *transport_ptr, "bc");
+  REQUIRE(out_cont.packets.size() == 1);
+  REQUIRE(state.last_resume.has_value());
+  CHECK(state.last_resume->action == gdbstub::resume_action::cont);
+  CHECK(state.last_resume->direction == gdbstub::resume_direction::reverse);
+
+  auto out_step = send_packet(server, *transport_ptr, "bs");
+  REQUIRE(out_step.packets.size() == 1);
+  REQUIRE(state.last_resume.has_value());
+  CHECK(state.last_resume->action == gdbstub::resume_action::step);
+  CHECK(state.last_resume->direction == gdbstub::resume_direction::reverse);
+}
+
+TEST_CASE("server parses vCont range stepping") {
+  mock_state state;
+  state.run_caps.range_step = true;
+  mock_components target(state);
+
+  gdbstub::arch_spec arch;
+  arch.reg_count = 3;
+  arch.pc_reg_num = 2;
+
+  auto transport = std::make_unique<loopback_transport>();
+  auto* transport_ptr = transport.get();
+  gdbstub::server server(make_target(target), arch, std::move(transport));
+
+  REQUIRE(server.listen("loop"));
+  REQUIRE(server.wait_for_connection());
+
+  auto probe = send_packet(server, *transport_ptr, "vCont?");
+  REQUIRE(probe.packets.size() == 1);
+  CHECK(probe.packets[0].payload.find(";r") != std::string::npos);
+
+  auto out = send_packet(server, *transport_ptr, "vCont;r1000,1010");
+  REQUIRE(out.packets.size() == 1);
+  REQUIRE(state.last_resume.has_value());
+  CHECK(state.last_resume->action == gdbstub::resume_action::range_step);
+  REQUIRE(state.last_resume->range.has_value());
+  CHECK(state.last_resume->range->start == 0x1000);
+  CHECK(state.last_resume->range->end == 0x1010);
 }
 
 TEST_CASE("server handles continue with signal and address") {
@@ -801,6 +939,81 @@ TEST_CASE("server reports unsupported watchpoints") {
   CHECK(out.packets[0].payload.empty());
   REQUIRE(state.last_breakpoint.has_value());
   CHECK(state.last_breakpoint->type == gdbstub::breakpoint_type::watch_write);
+}
+
+TEST_CASE("server sends non-stop notifications and drains vStopped") {
+  mock_state state;
+  state.run_caps.non_stop = true;
+  state.resume_behavior = mock_state::resume_behavior::run;
+  mock_components target(state);
+
+  gdbstub::arch_spec arch;
+  arch.reg_count = 3;
+  arch.pc_reg_num = 2;
+
+  auto transport = std::make_unique<loopback_transport>();
+  auto* transport_ptr = transport.get();
+  gdbstub::server server(make_target(target), arch, std::move(transport));
+
+  REQUIRE(server.listen("loop"));
+  REQUIRE(server.wait_for_connection());
+
+  auto enable = send_packet(server, *transport_ptr, "QNonStop:1");
+  REQUIRE(enable.packets.size() == 1);
+  CHECK(enable.packets[0].payload == "OK");
+
+  auto resume = send_packet(server, *transport_ptr, "c");
+  REQUIRE(resume.packets.size() == 1);
+  CHECK(resume.packets[0].payload == "OK");
+
+  gdbstub::stop_reason stop1{gdbstub::stop_kind::signal, 5, 0x1111, 0, 1};
+  gdbstub::stop_reason stop2{gdbstub::stop_kind::signal, 5, 0x2222, 0, 1};
+  server.notify_stop(stop1);
+  server.notify_stop(stop2);
+  server.poll(std::chrono::milliseconds(0));
+
+  auto notify = parse_output(transport_ptr->take_outgoing());
+  REQUIRE(notify.notifications.size() == 1);
+  CHECK(notify.notifications[0].payload.rfind("Stop:T", 0) == 0);
+
+  auto first = send_packet(server, *transport_ptr, "vStopped");
+  REQUIRE(first.packets.size() == 1);
+  CHECK(first.packets[0].payload.rfind("T", 0) == 0);
+
+  auto second = send_packet(server, *transport_ptr, "vStopped");
+  REQUIRE(second.packets.size() == 1);
+  CHECK(second.packets[0].payload == "OK");
+
+  gdbstub::stop_reason stop3{gdbstub::stop_kind::signal, 5, 0x3333, 0, 1};
+  server.notify_stop(stop3);
+  server.poll(std::chrono::milliseconds(0));
+
+  auto notify_again = parse_output(transport_ptr->take_outgoing());
+  REQUIRE(notify_again.notifications.size() == 1);
+  CHECK(notify_again.notifications[0].payload.rfind("Stop:T", 0) == 0);
+}
+
+TEST_CASE("server includes replaylog end in stop reply") {
+  mock_state state;
+  mock_components target(state);
+  gdbstub::arch_spec arch;
+  arch.reg_count = 3;
+  arch.pc_reg_num = 2;
+
+  gdbstub::stop_reason reason{gdbstub::stop_kind::signal, 5, 0x0, 0, 1};
+  reason.replay_log = gdbstub::replay_log_boundary::end;
+  state.resume_stop = reason;
+
+  auto transport = std::make_unique<loopback_transport>();
+  auto* transport_ptr = transport.get();
+  gdbstub::server server(make_target(target), arch, std::move(transport));
+
+  REQUIRE(server.listen("loop"));
+  REQUIRE(server.wait_for_connection());
+
+  auto stop = send_packet(server, *transport_ptr, "c");
+  REQUIRE(stop.packets.size() == 1);
+  CHECK(stop.packets[0].payload.find("replaylog:end;") != std::string::npos);
 }
 
 TEST_CASE("tcp polling integration serves packets") {

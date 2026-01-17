@@ -30,9 +30,10 @@ void stream_parser::append(std::span<const std::byte> data) {
   for (std::byte b : data) {
     char c = static_cast<char>(std::to_integer<unsigned char>(b));
 
-    if (c == packet_start) {
+    if (c == packet_start || c == notification_start) {
       payload_.clear();
       state_ = state::payload;
+      current_kind_ = c == notification_start ? event_kind::notification : event_kind::packet;
       continue;
     }
 
@@ -63,7 +64,7 @@ void stream_parser::append(std::span<const std::byte> data) {
       bool hex_ok = parse_hex_byte(checksum_[0], checksum_[1], expected);
       bool checksum_ok = hex_ok && checksum(payload_) == expected;
       input_event event;
-      event.kind = event_kind::packet;
+      event.kind = current_kind_;
       event.payload = payload_;
       event.checksum_ok = checksum_ok;
       push_event(std::move(event));
@@ -92,6 +93,7 @@ void stream_parser::reset() {
   events_.clear();
   checksum_[0] = 0;
   checksum_[1] = 0;
+  current_kind_ = event_kind::packet;
 }
 
 void stream_parser::push_event(input_event event) { events_.push_back(std::move(event)); }
@@ -109,6 +111,18 @@ std::string build_packet(std::string_view payload) {
   std::string packet;
   packet.reserve(payload.size() + 4);
   packet.push_back(packet_start);
+  packet.append(payload.data(), payload.size());
+  packet.push_back(packet_end);
+  packet.push_back(k_hex[(sum >> 4) & 0x0f]);
+  packet.push_back(k_hex[sum & 0x0f]);
+  return packet;
+}
+
+std::string build_notification(std::string_view payload) {
+  uint8_t sum = checksum(payload);
+  std::string packet;
+  packet.reserve(payload.size() + 4);
+  packet.push_back(notification_start);
   packet.append(payload.data(), payload.size());
   packet.push_back(packet_end);
   packet.push_back(k_hex[(sum >> 4) & 0x0f]);

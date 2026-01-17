@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <deque>
 #include <mutex>
 #include <optional>
 #include <thread>
@@ -66,8 +67,12 @@ private:
 
 class runner {
 public:
-  runner(machine& machine, threads& threads, execution_mode mode, size_t max_steps)
-      : machine_(machine), threads_(threads), mode_(mode), max_steps_(max_steps) {}
+  runner(machine& machine, threads& threads, execution_mode mode, size_t max_steps, size_t history_limit)
+      : machine_(machine),
+        threads_(threads),
+        mode_(mode),
+        max_steps_(max_steps),
+        history_limit_(history_limit) {}
 
   ~runner() { stop_async(); }
 
@@ -79,28 +84,42 @@ public:
 
   void set_stop_notifier(stop_notifier notifier) { stops_.set_notifier(notifier); }
 
+  run_capabilities capabilities() const {
+    run_capabilities caps;
+    bool has_history = history_limit_ > 0;
+    caps.reverse_continue = has_history;
+    caps.reverse_step = has_history;
+    caps.range_step = true;
+    caps.non_stop = mode_ != execution_mode::blocking;
+    return caps;
+  }
+
   resume_result resume(const resume_request& request) {
     auto thread_id = threads_.current_thread();
     if (request.addr) {
       machine_.set_pc(*request.addr);
     }
 
-    if (request.action == resume_action::step) {
-      machine_.advance_pc();
-      auto stop = machine_.signal_stop(thread_id);
-      stops_.record_stop(stop);
-      resume_result result;
-      result.state = resume_result::state::stopped;
-      result.stop = stop;
-      return result;
+    if (request.direction == resume_direction::reverse) {
+      if (history_limit_ == 0) {
+        resume_result result;
+        result.status = target_status::unsupported;
+        return result;
+      }
+      return resume_reverse(request, thread_id);
     }
 
-    if (auto stop = machine_.stop_if_breakpoint(thread_id)) {
-      stops_.record_stop(*stop);
-      resume_result result;
-      result.state = resume_result::state::stopped;
-      result.stop = *stop;
-      return result;
+    if (request.action == resume_action::range_step) {
+      if (!request.range) {
+        resume_result result;
+        result.status = target_status::invalid;
+        return result;
+      }
+      return run_range_blocking(thread_id, *request.range);
+    }
+
+    if (request.action == resume_action::step) {
+      return run_step(thread_id);
     }
 
     if (mode_ == execution_mode::blocking) {
@@ -149,7 +168,7 @@ public:
       return std::nullopt;
     }
 
-    if (auto stop = machine_.step_and_check(threads_.current_thread())) {
+    if (auto stop = forward_step(threads_.current_thread())) {
       running_.store(false);
       stops_.record_stop(*stop);
       return stop;
@@ -161,9 +180,164 @@ public:
   std::optional<stop_reason> last_stop() { return stops_.last_stop(); }
 
 private:
+  void record_snapshot() {
+    if (history_limit_ == 0) {
+      return;
+    }
+    auto snap = machine_.capture_snapshot();
+    std::lock_guard<std::mutex> lock(history_mutex_);
+    history_.push_back(std::move(snap));
+    if (history_.size() > history_limit_) {
+      history_.pop_front();
+    }
+  }
+
+  std::optional<machine::snapshot> pop_snapshot() {
+    std::lock_guard<std::mutex> lock(history_mutex_);
+    if (history_.empty()) {
+      return std::nullopt;
+    }
+    auto snap = std::move(history_.back());
+    history_.pop_back();
+    return snap;
+  }
+
+  std::optional<stop_reason> forward_step(uint64_t thread_id) {
+    record_snapshot();
+    machine_.advance_pc();
+    auto pc = machine_.pc();
+    auto mem_size = machine_.memory_size();
+    uint64_t read_addr = mem_size == 0 ? 0 : pc % mem_size;
+    uint64_t write_addr = mem_size == 0 ? 0 : (read_addr + 1) % mem_size;
+    if (auto stop = machine_.stop_if_watchpoint(thread_id, read_addr, write_addr)) {
+      return stop;
+    }
+    return machine_.stop_if_breakpoint(thread_id);
+  }
+
+  resume_result run_step(uint64_t thread_id) {
+    resume_result result;
+    if (auto stop = forward_step(thread_id)) {
+      stops_.record_stop(*stop);
+      result.state = resume_result::state::stopped;
+      result.stop = *stop;
+      return result;
+    }
+    auto stop = machine_.signal_stop(thread_id);
+    stops_.record_stop(stop);
+    result.state = resume_result::state::stopped;
+    result.stop = stop;
+    return result;
+  }
+
+  resume_result run_range_blocking(uint64_t thread_id, const address_range& range) {
+    resume_result result;
+    auto step_stop = forward_step(thread_id);
+    if (step_stop) {
+      stops_.record_stop(*step_stop);
+      result.state = resume_result::state::stopped;
+      result.stop = *step_stop;
+      return result;
+    }
+
+    if (range.start == range.end) {
+      auto stop = machine_.signal_stop(thread_id);
+      stops_.record_stop(stop);
+      result.state = resume_result::state::stopped;
+      result.stop = stop;
+      return result;
+    }
+
+    auto pc = machine_.pc();
+    auto in_range = [&](uint64_t value) { return value >= range.start && value < range.end; };
+    if (!in_range(pc)) {
+      auto stop = machine_.signal_stop(thread_id);
+      stops_.record_stop(stop);
+      result.state = resume_result::state::stopped;
+      result.stop = stop;
+      return result;
+    }
+
+    for (size_t i = 0; i < max_steps_; ++i) {
+      if (!in_range(machine_.pc())) {
+        auto stop = machine_.signal_stop(thread_id);
+        stops_.record_stop(stop);
+        result.state = resume_result::state::stopped;
+        result.stop = stop;
+        return result;
+      }
+      if (auto stop = forward_step(thread_id)) {
+        stops_.record_stop(*stop);
+        result.state = resume_result::state::stopped;
+        result.stop = *stop;
+        return result;
+      }
+    }
+
+    auto stop = machine_.signal_stop(thread_id);
+    stops_.record_stop(stop);
+    result.state = resume_result::state::stopped;
+    result.stop = stop;
+    return result;
+  }
+
+  resume_result resume_reverse(const resume_request& request, uint64_t thread_id) {
+    resume_result result;
+    if (request.action == resume_action::range_step) {
+      result.status = target_status::unsupported;
+      return result;
+    }
+
+    auto pop_and_restore = [&]() -> std::optional<stop_reason> {
+      auto snap = pop_snapshot();
+      if (!snap) {
+        stop_reason stop;
+        stop.kind = stop_kind::signal;
+        stop.signal = 5;
+        stop.thread_id = thread_id;
+        stop.replay_log = replay_log_boundary::begin;
+        return stop;
+      }
+      machine_.restore_snapshot(*snap);
+      if (auto stop = machine_.stop_if_breakpoint(thread_id)) {
+        return stop;
+      }
+      return std::nullopt;
+    };
+
+    if (request.action == resume_action::step) {
+      if (auto stop = pop_and_restore()) {
+        stops_.record_stop(*stop);
+        result.state = resume_result::state::stopped;
+        result.stop = *stop;
+        return result;
+      }
+      auto stop = machine_.signal_stop(thread_id);
+      stops_.record_stop(stop);
+      result.state = resume_result::state::stopped;
+      result.stop = stop;
+      return result;
+    }
+
+    for (size_t i = 0; i < max_steps_; ++i) {
+      if (auto stop = pop_and_restore()) {
+        stops_.record_stop(*stop);
+        result.state = resume_result::state::stopped;
+        result.stop = *stop;
+        return result;
+      }
+    }
+
+    auto stop = machine_.signal_stop(thread_id);
+    stops_.record_stop(stop);
+    result.state = resume_result::state::stopped;
+    result.stop = stop;
+    return result;
+  }
+
   stop_reason run_blocking(uint64_t thread_id) {
     for (size_t i = 0; i < max_steps_; ++i) {
-      if (auto stop = machine_.step_and_check(thread_id)) {
+      if (auto stop = forward_step(thread_id)) {
         return *stop;
       }
     }
@@ -181,7 +355,7 @@ private:
           running_.store(false);
           return;
         }
-        if (auto stop = machine_.step_and_check(thread_id)) {
+        if (auto stop = forward_step(thread_id)) {
           stops_.queue_stop(*stop);
           running_.store(false);
           return;
@@ -205,11 +379,14 @@ private:
   threads& threads_;
   execution_mode mode_ = execution_mode::blocking;
   size_t max_steps_ = 0;
+  size_t history_limit_ = 0;
 
   stop_tracker stops_;
   std::atomic<bool> running_{false};
   std::atomic<bool> stop_requested_{false};
   std::thread worker_;
+  std::deque<machine::snapshot> history_;
+  std::mutex history_mutex_;
 };
 
 } // namespace gdbstub::toy

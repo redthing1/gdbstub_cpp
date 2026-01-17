@@ -39,9 +39,20 @@ enum gdbstub_stop_kind : int {
     GDBSTUB_STOP_EXITED = 6,
 }
 
+enum gdbstub_replay_log_boundary : int {
+    GDBSTUB_REPLAY_LOG_BEGIN = 0,
+    GDBSTUB_REPLAY_LOG_END = 1,
+}
+
+enum gdbstub_resume_direction : int {
+    GDBSTUB_RESUME_FORWARD = 0,
+    GDBSTUB_RESUME_REVERSE = 1,
+}
+
 enum gdbstub_resume_action : int {
     GDBSTUB_RESUME_CONT = 0,
     GDBSTUB_RESUME_STEP = 1,
+    GDBSTUB_RESUME_RANGE_STEP = 2,
 }
 
 enum gdbstub_target_status : int {
@@ -79,20 +90,31 @@ struct gdbstub_stop_reason {
     int exit_code;
     uint8_t has_thread_id;
     uint64_t thread_id;
+    uint8_t has_replay_log;
+    gdbstub_replay_log_boundary replay_log;
+}
+
+struct gdbstub_address_range {
+    uint64_t start;
+    uint64_t end;
 }
 
 struct gdbstub_resume_request {
     gdbstub_resume_action action;
+    gdbstub_resume_direction direction;
     uint8_t has_addr;
     uint64_t addr;
     uint8_t has_signal;
     int signal;
+    uint8_t has_range;
+    gdbstub_address_range range;
 }
 
 struct gdbstub_resume_result {
     gdbstub_resume_state state;
     gdbstub_stop_reason stop;
     int exit_code;
+    gdbstub_target_status status;
 }
 
 struct gdbstub_breakpoint_spec {
@@ -230,6 +252,31 @@ alias gdbstub_breakpoint_fn = extern(C) gdbstub_target_status function(
     const(gdbstub_breakpoint_spec)* spec
 );
 
+struct gdbstub_run_capabilities {
+    uint8_t reverse_continue;
+    uint8_t reverse_step;
+    uint8_t range_step;
+    uint8_t non_stop;
+}
+
+struct gdbstub_breakpoint_capabilities {
+    uint8_t software;
+    uint8_t hardware;
+    uint8_t watch_read;
+    uint8_t watch_write;
+    uint8_t watch_access;
+}
+
+alias gdbstub_get_run_capabilities_fn = extern(C) uint8_t function(
+    void* ctx,
+    gdbstub_run_capabilities* caps_out
+);
+
+alias gdbstub_get_breakpoint_capabilities_fn = extern(C) uint8_t function(
+    void* ctx,
+    gdbstub_breakpoint_capabilities* caps_out
+);
+
 alias gdbstub_region_info_fn = extern(C) uint8_t function(
     void* ctx,
     uint64_t addr,
@@ -281,12 +328,14 @@ struct gdbstub_run_iface {
     gdbstub_interrupt_fn interrupt;
     gdbstub_poll_stop_fn poll_stop;
     gdbstub_set_stop_notifier_fn set_stop_notifier;
+    gdbstub_get_run_capabilities_fn get_capabilities;
 }
 
 struct gdbstub_breakpoints_iface {
     void* ctx;
     gdbstub_breakpoint_fn set_breakpoint;
     gdbstub_breakpoint_fn remove_breakpoint;
+    gdbstub_get_breakpoint_capabilities_fn get_capabilities;
 }
 
 struct gdbstub_memory_layout_iface {

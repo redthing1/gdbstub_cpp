@@ -42,6 +42,14 @@ public:
 private:
   enum class exec_state { halted, running };
 
+  struct non_stop_state {
+    bool enabled = false;
+    bool notification_in_flight = false;
+    bool stop_signal_zero_pending = false;
+    std::mutex mutex;
+    std::queue<stop_reason> pending_stops;
+  };
+
   target_view target_;
   arch_spec arch_;
   std::unique_ptr<transport> transport_;
@@ -52,10 +60,8 @@ private:
   bool list_threads_in_stop_reply_ = false;
   bool thread_suffix_enabled_ = false;
   bool error_strings_enabled_ = false;
+  non_stop_state non_stop_;
   std::optional<stop_reason> last_stop_;
-
-  std::mutex stop_mutex_;
-  std::queue<stop_reason> pending_stops_;
 
   bool read_and_process(std::chrono::milliseconds timeout);
   bool process_event(const rsp::input_event& event);
@@ -67,6 +73,8 @@ private:
   void handle_set_query(std::string_view args);
   void handle_v_packet(std::string_view args);
   void handle_continue(std::string_view args, resume_action action, bool has_signal);
+  void handle_reverse(bool step);
+  void finish_resume(const resume_result& result, bool optional_feature);
   void handle_read_all_registers();
   void handle_write_all_registers(std::string_view args);
   void handle_read_register(std::string_view args);
@@ -95,13 +103,22 @@ private:
   void send_ack();
   void send_nack();
   void send_packet(std::string_view payload);
+  void send_notification(std::string_view payload);
   void send_error(uint8_t code);
   void send_status_error(target_status status, bool optional_feature);
   void send_stop_reply(const stop_reason& reason);
   void send_exit_reply(const stop_reason& reason);
+  std::string build_stop_reply_payload(const stop_reason& reason) const;
+  void maybe_send_stop_notification();
+  void enqueue_stop(stop_reason reason);
+  void reset_non_stop_state();
+  bool supports_sw_break() const;
+  bool supports_hw_break() const;
 
   std::optional<uint64_t> current_thread_id() const;
   std::vector<uint64_t> thread_ids() const;
+  run_capabilities run_caps() const;
+  breakpoint_capabilities breakpoint_caps() const;
 };
 
 } // namespace gdbstub

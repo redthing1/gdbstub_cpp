@@ -21,6 +21,7 @@ struct config {
   uint64_t start_pc = 0x1000;
   uint64_t instruction_size = 4;
   size_t max_steps = 256;
+  size_t history_limit = 1024;
   execution_mode mode = execution_mode::blocking;
   size_t memory_size = 0x4000;
   std::string triple = "toy-unknown-elf";

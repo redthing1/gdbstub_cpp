@@ -51,17 +51,27 @@ gdbstub::stop_reason to_stop_reason(const gdbstub_stop_reason& in) {
   if (in.has_thread_id) {
     out.thread_id = in.thread_id;
   }
+  if (in.has_replay_log) {
+    out.replay_log = static_cast<gdbstub::replay_log_boundary>(in.replay_log);
+  }
   return out;
 }
 
 gdbstub::resume_request to_resume_request(const gdbstub_resume_request& in) {
   gdbstub::resume_request out;
   out.action = static_cast<gdbstub::resume_action>(in.action);
+  out.direction = static_cast<gdbstub::resume_direction>(in.direction);
   if (in.has_addr) {
     out.addr = in.addr;
   }
   if (in.has_signal) {
     out.signal = in.signal;
+  }
+  if (in.has_range) {
+    gdbstub::address_range range;
+    range.start = in.range.start;
+    range.end = in.range.end;
+    out.range = range;
   }
   return out;
 }
@@ -71,6 +81,26 @@ gdbstub::resume_result to_resume_result(const gdbstub_resume_result& in) {
   out.state = static_cast<decltype(out.state)>(in.state);
   out.stop = to_stop_reason(in.stop);
   out.exit_code = in.exit_code;
+  out.status = static_cast<gdbstub::target_status>(in.status);
+  return out;
+}
+
+gdbstub::run_capabilities to_run_capabilities(const gdbstub_run_capabilities& caps) {
+  gdbstub::run_capabilities out;
+  out.reverse_continue = caps.reverse_continue != 0;
+  out.reverse_step = caps.reverse_step != 0;
+  out.range_step = caps.range_step != 0;
+  out.non_stop = caps.non_stop != 0;
+  return out;
+}
+
+gdbstub::breakpoint_capabilities to_breakpoint_capabilities(const gdbstub_breakpoint_capabilities& caps) {
+  gdbstub::breakpoint_capabilities out;
+  out.software = caps.software != 0;
+  out.hardware = caps.hardware != 0;
+  out.watch_read = caps.watch_read != 0;
+  out.watch_write = caps.watch_write != 0;
+  out.watch_access = caps.watch_access != 0;
   return out;
 }
 
@@ -82,6 +112,9 @@ gdbstub_stop_reason to_c_stop_reason(const gdbstub::stop_reason& in) {
   out.exit_code = in.exit_code;
   out.has_thread_id = in.thread_id.has_value() ? 1 : 0;
   out.thread_id = in.thread_id.value_or(0);
+  out.has_replay_log = in.replay_log.has_value() ? 1 : 0;
+  out.replay_log = in.replay_log ? static_cast<gdbstub_replay_log_boundary>(*in.replay_log)
+                                 : GDBSTUB_REPLAY_LOG_BEGIN;
   return out;
 }
 
@@ -90,6 +123,7 @@ gdbstub_resume_result to_c_resume_result(const gdbstub::resume_result& in) {
   out.state = static_cast<gdbstub_resume_state>(in.state);
   out.stop = to_c_stop_reason(in.stop);
   out.exit_code = in.exit_code;
+  out.status = static_cast<gdbstub_target_status>(in.status);
   return out;
 }
 
@@ -295,12 +329,20 @@ struct c_target {
 
   static gdbstub::resume_result resume_tramp(void* ctx, const gdbstub::resume_request& request) {
     auto* self = static_cast<c_target*>(ctx);
+    gdbstub_address_range range{};
+    if (request.range) {
+      range.start = request.range->start;
+      range.end = request.range->end;
+    }
     const auto c_request = gdbstub_resume_request{
         static_cast<gdbstub_resume_action>(request.action),
+        static_cast<gdbstub_resume_direction>(request.direction),
         static_cast<uint8_t>(request.addr.has_value() ? 1 : 0),
         request.addr.value_or(0),
         static_cast<uint8_t>(request.signal.has_value() ? 1 : 0),
         request.signal.value_or(0),
+        static_cast<uint8_t>(request.range.has_value() ? 1 : 0),
+        range,
     };
     const auto result = self->run.resume(self->run.ctx, &c_request);
     return to_resume_result(result);
@@ -337,6 +379,18 @@ struct c_target {
     self->run.set_stop_notifier(self->run.ctx, c_notifier);
   }
 
+  static std::optional<gdbstub::run_capabilities> run_capabilities_tramp(void* ctx) {
+    auto* self = static_cast<c_target*>(ctx);
+    if (!self->run.get_capabilities) {
+      return std::nullopt;
+    }
+    gdbstub_run_capabilities caps{};
+    if (!self->run.get_capabilities(self->run.ctx, &caps)) {
+      return std::nullopt;
+    }
+    return to_run_capabilities(caps);
+  }
+
   static gdbstub::target_status set_breakpoint_tramp(void* ctx, const gdbstub::breakpoint_spec& spec) {
     auto* self = static_cast<c_target*>(ctx);
     const auto c_spec = gdbstub_breakpoint_spec{
@@ -359,6 +413,18 @@ struct c_target {
     return static_cast<gdbstub::target_status>(
         self->breakpoints->remove_breakpoint(self->breakpoints->ctx, &c_spec)
     );
+  }
+
+  static std::optional<gdbstub::breakpoint_capabilities> breakpoint_capabilities_tramp(void* ctx) {
+    auto* self = static_cast<c_target*>(ctx);
+    if (!self->breakpoints || !self->breakpoints->get_capabilities) {
+      return std::nullopt;
+    }
+    gdbstub_breakpoint_capabilities caps{};
+    if (!self->breakpoints->get_capabilities(self->breakpoints->ctx, &caps)) {
+      return std::nullopt;
+    }
+    return to_breakpoint_capabilities(caps);
   }
 
   static std::optional<gdbstub::memory_region_info> region_info_tramp(void* ctx, uint64_t addr) {
@@ -490,12 +556,14 @@ struct c_target {
     view.run.interrupt_fn = run.interrupt ? &interrupt_tramp : nullptr;
     view.run.poll_stop_fn = run.poll_stop ? &poll_stop_tramp : nullptr;
     view.run.set_stop_notifier_fn = run.set_stop_notifier ? &set_stop_notifier_tramp : nullptr;
+    view.run.get_run_capabilities_fn = run.get_capabilities ? &run_capabilities_tramp : nullptr;
 
     if (breakpoints) {
       gdbstub::breakpoints_view bp;
       bp.ctx = this;
       bp.set_breakpoint_fn = &set_breakpoint_tramp;
       bp.remove_breakpoint_fn = &remove_breakpoint_tramp;
+      bp.get_breakpoint_capabilities_fn = breakpoints->get_capabilities ? &breakpoint_capabilities_tramp : nullptr;
       view.breakpoints = bp;
     }
 

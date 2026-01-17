@@ -32,6 +32,8 @@ struct capi_state {
 
   size_t breakpoints_set = 0;
   size_t breakpoints_removed = 0;
+  gdbstub_run_capabilities run_caps{};
+  gdbstub_breakpoint_capabilities breakpoint_caps{};
 
   gdbstub_memory_region region{};
   gdbstub_string_view region_types[1]{};
@@ -152,6 +154,17 @@ static void init_state(capi_state& state) {
 
   state.thread_names[0] = make_view("thread-1");
   state.thread_names[1] = make_view("thread-2");
+
+  state.run_caps.reverse_continue = 0;
+  state.run_caps.reverse_step = 0;
+  state.run_caps.range_step = 0;
+  state.run_caps.non_stop = 0;
+
+  state.breakpoint_caps.software = 1;
+  state.breakpoint_caps.hardware = 0;
+  state.breakpoint_caps.watch_read = 0;
+  state.breakpoint_caps.watch_write = 0;
+  state.breakpoint_caps.watch_access = 0;
 }
 
 static gdbstub_stop_reason make_stop_reason(uint64_t tid) {
@@ -162,6 +175,8 @@ static gdbstub_stop_reason make_stop_reason(uint64_t tid) {
   reason.exit_code = 0;
   reason.has_thread_id = 1;
   reason.thread_id = tid;
+  reason.has_replay_log = 0;
+  reason.replay_log = GDBSTUB_REPLAY_LOG_BEGIN;
   return reason;
 }
 
@@ -224,6 +239,7 @@ static gdbstub_resume_result resume(void* ctx, const gdbstub_resume_request* req
   (void) request;
   auto* state = static_cast<capi_state*>(ctx);
   gdbstub_resume_result result{};
+  result.status = GDBSTUB_TARGET_OK;
   if (state->resume_running) {
     state->running = true;
     result.state = GDBSTUB_RESUME_RUNNING;
@@ -257,6 +273,15 @@ static void set_stop_notifier(void* ctx, gdbstub_stop_notifier notifier) {
   state->has_notifier = true;
 }
 
+static uint8_t get_run_capabilities(void* ctx, gdbstub_run_capabilities* out) {
+  auto* state = static_cast<capi_state*>(ctx);
+  if (!out) {
+    return 0;
+  }
+  *out = state->run_caps;
+  return 1;
+}
+
 static gdbstub_target_status set_breakpoint(void* ctx, const gdbstub_breakpoint_spec* spec) {
   (void) spec;
   auto* state = static_cast<capi_state*>(ctx);
@@ -269,6 +294,15 @@ static gdbstub_target_status remove_breakpoint(void* ctx, const gdbstub_breakpoi
   auto* state = static_cast<capi_state*>(ctx);
   state->breakpoints_removed++;
   return GDBSTUB_TARGET_OK;
+}
+
+static uint8_t get_breakpoint_capabilities(void* ctx, gdbstub_breakpoint_capabilities* out) {
+  auto* state = static_cast<capi_state*>(ctx);
+  if (!out) {
+    return 0;
+  }
+  *out = state->breakpoint_caps;
+  return 1;
 }
 
 static uint8_t region_info(void* ctx, uint64_t addr, gdbstub_memory_region_info* out) {
@@ -386,10 +420,12 @@ static void setup_config(capi_state& state) {
   state.run_iface.interrupt = &interrupt;
   state.run_iface.poll_stop = state.enable_poll_stop ? &poll_stop : nullptr;
   state.run_iface.set_stop_notifier = state.enable_stop_notifier ? &set_stop_notifier : nullptr;
+  state.run_iface.get_capabilities = &get_run_capabilities;
 
   state.bp_iface.ctx = &state;
   state.bp_iface.set_breakpoint = &set_breakpoint;
   state.bp_iface.remove_breakpoint = &remove_breakpoint;
+  state.bp_iface.get_capabilities = &get_breakpoint_capabilities;
 
   state.layout_iface.ctx = &state;
   state.layout_iface.region_info = &region_info;
@@ -599,6 +635,39 @@ TEST_CASE("capi tcp integration handles core packets") {
   auto detach = wait_for_reply(server_handle.server, client, std::chrono::milliseconds(200));
   REQUIRE(detach.has_value());
   CHECK(detach->payload == "OK");
+
+  client.close();
+}
+
+TEST_CASE("capi advertises run and breakpoint capabilities") {
+  capi_state state;
+  init_state(state);
+  state.run_caps.reverse_continue = 1;
+  state.run_caps.reverse_step = 1;
+  state.run_caps.non_stop = 1;
+  state.breakpoint_caps.hardware = 1;
+
+  auto server_handle = make_server(state);
+
+  constexpr std::string_view k_host = "127.0.0.1";
+  auto port = listen_on_available_port(server_handle.server, k_host, 45100, 200);
+  REQUIRE(port.has_value());
+
+  std::atomic<bool> accepted{false};
+  std::thread accept_thread([&]() { accepted = gdbstub_server_wait_for_connection(server_handle.server) != 0; });
+
+  gdbstub::test::tcp_client client;
+  REQUIRE(client.connect(k_host, *port));
+  accept_thread.join();
+  REQUIRE(accepted.load());
+
+  REQUIRE(client.send_packet("qSupported"));
+  auto supported = wait_for_reply(server_handle.server, client, std::chrono::milliseconds(200));
+  REQUIRE(supported.has_value());
+  CHECK(supported->payload.find("ReverseContinue+") != std::string::npos);
+  CHECK(supported->payload.find("ReverseStep+") != std::string::npos);
+  CHECK(supported->payload.find("QNonStop+") != std::string::npos);
+  CHECK(supported->payload.find("hwbreak+") != std::string::npos);
 
   client.close();
 }

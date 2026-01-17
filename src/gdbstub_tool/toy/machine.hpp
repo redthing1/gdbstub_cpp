@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -10,12 +11,18 @@
 #include <vector>
 
 #include "gdbstub/rsp_types.hpp"
+#include "gdbstub/target.hpp"
 #include "gdbstub_tool/toy/types.hpp"
 
 namespace gdbstub::toy {
 
 class machine {
 public:
+  struct snapshot {
+    std::vector<uint64_t> regs;
+    std::vector<std::byte> memory;
+  };
+
   explicit machine(const config& cfg)
       : reg_bits_(cfg.reg_bits),
         reg_count_(cfg.reg_count),
@@ -92,14 +99,51 @@ public:
     return target_status::ok;
   }
 
-  void add_breakpoint(uint64_t addr) {
+  void add_breakpoint(const gdbstub::breakpoint_spec& spec) {
     std::lock_guard<std::mutex> lock(mutex_);
-    breakpoints_.insert(addr);
+    if (spec.type == gdbstub::breakpoint_type::software) {
+      sw_breakpoints_.insert(spec.addr);
+      return;
+    }
+    if (spec.type == gdbstub::breakpoint_type::hardware) {
+      hw_breakpoints_.insert(spec.addr);
+      return;
+    }
+    watchpoints_.push_back({spec.type, spec.addr, spec.length});
   }
 
-  void remove_breakpoint(uint64_t addr) {
+  void remove_breakpoint(const gdbstub::breakpoint_spec& spec) {
     std::lock_guard<std::mutex> lock(mutex_);
-    breakpoints_.erase(addr);
+    if (spec.type == gdbstub::breakpoint_type::software) {
+      sw_breakpoints_.erase(spec.addr);
+      return;
+    }
+    if (spec.type == gdbstub::breakpoint_type::hardware) {
+      hw_breakpoints_.erase(spec.addr);
+      return;
+    }
+    auto it = std::remove_if(watchpoints_.begin(), watchpoints_.end(), [&](const watchpoint& wp) {
+      return wp.type == spec.type && wp.addr == spec.addr && wp.length == spec.length;
+    });
+    watchpoints_.erase(it, watchpoints_.end());
+  }
+
+  snapshot capture_snapshot() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    snapshot shot;
+    shot.regs = regs_;
+    shot.memory = memory_;
+    return shot;
+  }
+
+  void restore_snapshot(const snapshot& shot) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (shot.regs.size() == regs_.size()) {
+      regs_ = shot.regs;
+    }
+    if (shot.memory.size() == memory_.size()) {
+      memory_ = shot.memory;
+    }
   }
 
   uint64_t pc() const {
@@ -132,14 +176,27 @@ public:
     return stop_if_breakpoint_locked(thread_id);
   }
 
+  std::optional<stop_reason> stop_if_watchpoint(uint64_t thread_id, uint64_t read_addr, uint64_t write_addr) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return stop_if_watchpoint_locked(thread_id, read_addr, write_addr);
+  }
+
   std::optional<stop_reason> step_and_check(uint64_t thread_id) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (auto stop = stop_if_breakpoint_locked(thread_id)) {
       return stop;
     }
+    uint64_t access_addr = 0;
     if (valid_reg(pc_reg_num_)) {
       auto index = static_cast<size_t>(pc_reg_num_);
       regs_[index] = mask_value(regs_[index] + instruction_size_);
+      if (!memory_.empty()) {
+        access_addr = regs_[index] % memory_.size();
+      }
+    }
+    uint64_t write_addr = memory_.empty() ? 0 : (access_addr + 1) % std::max<size_t>(1, memory_.size());
+    if (auto stop = stop_if_watchpoint_locked(thread_id, access_addr, write_addr)) {
+      return stop;
     }
     return stop_if_breakpoint_locked(thread_id);
   }
@@ -153,6 +210,12 @@ public:
   }
 
 private:
+  struct watchpoint {
+    gdbstub::breakpoint_type type = gdbstub::breakpoint_type::watch_access;
+    uint64_t addr = 0;
+    uint32_t length = 0;
+  };
+
   bool valid_reg(int regno) const {
     return regno >= 0 && static_cast<size_t>(regno) < reg_count_;
   }
@@ -194,15 +257,68 @@ private:
       return std::nullopt;
     }
     auto pc_value = regs_[static_cast<size_t>(pc_reg_num_)];
-    if (breakpoints_.find(pc_value) == breakpoints_.end()) {
-      return std::nullopt;
+    if (hw_breakpoints_.find(pc_value) != hw_breakpoints_.end()) {
+      stop_reason reason;
+      reason.kind = stop_kind::hw_break;
+      reason.signal = 5;
+      reason.addr = pc_value;
+      reason.thread_id = thread_id;
+      return reason;
     }
-    stop_reason reason;
-    reason.kind = stop_kind::sw_break;
-    reason.signal = 5;
-    reason.addr = pc_value;
-    reason.thread_id = thread_id;
-    return reason;
+    if (sw_breakpoints_.find(pc_value) != sw_breakpoints_.end()) {
+      stop_reason reason;
+      reason.kind = stop_kind::sw_break;
+      reason.signal = 5;
+      reason.addr = pc_value;
+      reason.thread_id = thread_id;
+      return reason;
+    }
+    return std::nullopt;
+  }
+
+  std::optional<stop_reason> stop_if_watchpoint_locked(
+      uint64_t thread_id,
+      uint64_t read_addr,
+      uint64_t write_addr
+  ) const {
+    auto matches = [](uint64_t access, uint64_t addr, uint32_t length) {
+      uint64_t size = length > 0 ? static_cast<uint64_t>(length) : 1;
+      return access >= addr && access < addr + size;
+    };
+
+    for (const auto& wp : watchpoints_) {
+      if (wp.type == gdbstub::breakpoint_type::watch_access) {
+        if (matches(read_addr, wp.addr, wp.length) || matches(write_addr, wp.addr, wp.length)) {
+          stop_reason reason;
+          reason.kind = stop_kind::watch_access;
+          reason.signal = 5;
+          reason.addr = matches(read_addr, wp.addr, wp.length) ? read_addr : write_addr;
+          reason.thread_id = thread_id;
+          return reason;
+        }
+      }
+    }
+    for (const auto& wp : watchpoints_) {
+      if (wp.type == gdbstub::breakpoint_type::watch_write && matches(write_addr, wp.addr, wp.length)) {
+        stop_reason reason;
+        reason.kind = stop_kind::watch_write;
+        reason.signal = 5;
+        reason.addr = write_addr;
+        reason.thread_id = thread_id;
+        return reason;
+      }
+    }
+    for (const auto& wp : watchpoints_) {
+      if (wp.type == gdbstub::breakpoint_type::watch_read && matches(read_addr, wp.addr, wp.length)) {
+        stop_reason reason;
+        reason.kind = stop_kind::watch_read;
+        reason.signal = 5;
+        reason.addr = read_addr;
+        reason.thread_id = thread_id;
+        return reason;
+      }
+    }
+    return std::nullopt;
   }
 
   uint32_t reg_bits_ = 0;
@@ -214,7 +330,9 @@ private:
   mutable std::mutex mutex_;
   std::vector<uint64_t> regs_;
   std::vector<std::byte> memory_;
-  std::unordered_set<uint64_t> breakpoints_;
+  std::unordered_set<uint64_t> sw_breakpoints_;
+  std::unordered_set<uint64_t> hw_breakpoints_;
+  std::vector<watchpoint> watchpoints_;
 };
 
 } // namespace gdbstub::toy

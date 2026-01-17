@@ -15,9 +15,20 @@ public enum StopKind : int {
     exited = gdbstub_stop_kind.GDBSTUB_STOP_EXITED,
 }
 
+public enum ReplayLogBoundary : int {
+    begin = gdbstub_replay_log_boundary.GDBSTUB_REPLAY_LOG_BEGIN,
+    end = gdbstub_replay_log_boundary.GDBSTUB_REPLAY_LOG_END,
+}
+
+public enum ResumeDirection : int {
+    forward = gdbstub_resume_direction.GDBSTUB_RESUME_FORWARD,
+    reverse = gdbstub_resume_direction.GDBSTUB_RESUME_REVERSE,
+}
+
 public enum ResumeAction : int {
     cont = gdbstub_resume_action.GDBSTUB_RESUME_CONT,
     step = gdbstub_resume_action.GDBSTUB_RESUME_STEP,
+    rangeStep = gdbstub_resume_action.GDBSTUB_RESUME_RANGE_STEP,
 }
 
 public enum ResumeState : int {
@@ -57,18 +68,42 @@ public struct StopReason {
     ulong addr = 0;
     int exitCode = 0;
     Nullable!ulong threadId;
+    Nullable!ReplayLogBoundary replayLog;
+}
+
+public struct AddressRange {
+    ulong start = 0;
+    ulong end = 0;
 }
 
 public struct ResumeRequest {
     ResumeAction action = ResumeAction.cont;
+    ResumeDirection direction = ResumeDirection.forward;
     Nullable!ulong addr;
     Nullable!int signal;
+    Nullable!AddressRange range;
 }
 
 public struct ResumeResult {
     ResumeState state = ResumeState.stopped;
     StopReason stop;
     int exitCode = 0;
+    TargetStatus status = TargetStatus.ok;
+}
+
+public struct RunCapabilities {
+    bool reverseContinue = false;
+    bool reverseStep = false;
+    bool rangeStep = false;
+    bool nonStop = false;
+}
+
+public struct BreakpointCapabilities {
+    bool software = false;
+    bool hardware = false;
+    bool watchRead = false;
+    bool watchWrite = false;
+    bool watchAccess = false;
 }
 
 public struct BreakpointSpec {
@@ -174,11 +209,13 @@ public struct RunCallbacks {
     void delegate() interrupt;
     Nullable!StopReason delegate() pollStop;
     void delegate(StopNotifier notifier) setStopNotifier;
+    Nullable!RunCapabilities delegate() getCapabilities;
 }
 
 public struct BreakpointsCallbacks {
     TargetStatus delegate(BreakpointSpec spec) setBreakpoint;
     TargetStatus delegate(BreakpointSpec spec) removeBreakpoint;
+    Nullable!BreakpointCapabilities delegate() getCapabilities;
 }
 
 public struct MemoryLayoutCallbacks {
@@ -270,13 +307,15 @@ public struct TargetBuilder {
         ResumeResult delegate(ResumeRequest request) resume,
         void delegate() interrupt = null,
         Nullable!StopReason delegate() pollStop = null,
-        void delegate(StopNotifier notifier) setStopNotifier = null
+        void delegate(StopNotifier notifier) setStopNotifier = null,
+        Nullable!RunCapabilities delegate() getCapabilities = null
     ) {
         RunCallbacks run;
         run.resume = resume;
         run.interrupt = interrupt;
         run.pollStop = pollStop;
         run.setStopNotifier = setStopNotifier;
+        run.getCapabilities = getCapabilities;
         callbacks.run = run;
         return this;
     }
@@ -288,11 +327,13 @@ public struct TargetBuilder {
 
     ref TargetBuilder withBreakpoints(
         TargetStatus delegate(BreakpointSpec spec) setBreakpoint,
-        TargetStatus delegate(BreakpointSpec spec) removeBreakpoint
+        TargetStatus delegate(BreakpointSpec spec) removeBreakpoint,
+        Nullable!BreakpointCapabilities delegate() getCapabilities = null
     ) {
         BreakpointsCallbacks breakpoints;
         breakpoints.setBreakpoint = setBreakpoint;
         breakpoints.removeBreakpoint = removeBreakpoint;
+        breakpoints.getCapabilities = getCapabilities;
         callbacks.breakpoints = breakpoints;
         return this;
     }
@@ -456,6 +497,7 @@ public final class Target {
         runIface.interrupt = callbacks.run.interrupt is null ? null : &interruptTramp;
         runIface.poll_stop = callbacks.run.pollStop is null ? null : &pollStopTramp;
         runIface.set_stop_notifier = callbacks.run.setStopNotifier is null ? null : &setStopNotifierTramp;
+        runIface.get_capabilities = callbacks.run.getCapabilities is null ? null : &getRunCapabilitiesTramp;
 
         gdbstub_target_config config;
         config.regs = regsIface;
@@ -474,6 +516,8 @@ public final class Target {
             breakpointsIface.ctx = cast(void*)ctx;
             breakpointsIface.set_breakpoint = &setBreakpointTramp;
             breakpointsIface.remove_breakpoint = &removeBreakpointTramp;
+            breakpointsIface.get_capabilities =
+                callbacks.breakpoints.getCapabilities is null ? null : &getBreakpointCapabilitiesTramp;
             config.breakpoints = &breakpointsIface;
         }
 
@@ -640,6 +684,10 @@ private gdbstub_stop_reason toCStopReason(StopReason reason) {
     result.exit_code = reason.exitCode;
     result.has_thread_id = reason.threadId.isNull ? 0 : 1;
     result.thread_id = reason.threadId.isNull ? 0 : reason.threadId.get;
+    result.has_replay_log = reason.replayLog.isNull ? 0 : 1;
+    result.replay_log = reason.replayLog.isNull
+        ? gdbstub_replay_log_boundary.GDBSTUB_REPLAY_LOG_BEGIN
+        : cast(gdbstub_replay_log_boundary)reason.replayLog.get;
     return result;
 }
 
@@ -655,6 +703,9 @@ private StopReason toDStopReason(const gdbstub_stop_reason* reason) {
     if (reason.has_thread_id != 0) {
         result.threadId = nullable(cast(ulong)reason.thread_id);
     }
+    if (reason.has_replay_log != 0) {
+        result.replayLog = nullable(cast(ReplayLogBoundary)reason.replay_log);
+    }
     return result;
 }
 
@@ -664,11 +715,18 @@ private ResumeRequest toDResumeRequest(const gdbstub_resume_request* request) {
         return result;
     }
     result.action = cast(ResumeAction)request.action;
+    result.direction = cast(ResumeDirection)request.direction;
     if (request.has_addr != 0) {
         result.addr = nullable(cast(ulong)request.addr);
     }
     if (request.has_signal != 0) {
         result.signal = nullable(cast(int)request.signal);
+    }
+    if (request.has_range != 0) {
+        AddressRange range;
+        range.start = request.range.start;
+        range.end = request.range.end;
+        result.range = nullable(range);
     }
     return result;
 }
@@ -678,7 +736,27 @@ private gdbstub_resume_result toCResumeResult(ResumeResult result) {
     value.state = cast(gdbstub_resume_state)result.state;
     value.stop = toCStopReason(result.stop);
     value.exit_code = result.exitCode;
+    value.status = cast(gdbstub_target_status)result.status;
     return value;
+}
+
+private gdbstub_run_capabilities toCRunCapabilities(RunCapabilities caps) {
+    gdbstub_run_capabilities result;
+    result.reverse_continue = caps.reverseContinue ? 1 : 0;
+    result.reverse_step = caps.reverseStep ? 1 : 0;
+    result.range_step = caps.rangeStep ? 1 : 0;
+    result.non_stop = caps.nonStop ? 1 : 0;
+    return result;
+}
+
+private gdbstub_breakpoint_capabilities toCBreakpointCapabilities(BreakpointCapabilities caps) {
+    gdbstub_breakpoint_capabilities result;
+    result.software = caps.software ? 1 : 0;
+    result.hardware = caps.hardware ? 1 : 0;
+    result.watch_read = caps.watchRead ? 1 : 0;
+    result.watch_write = caps.watchWrite ? 1 : 0;
+    result.watch_access = caps.watchAccess ? 1 : 0;
+    return result;
 }
 
 private gdbstub_memory_region_info toCMemoryRegionInfo(MemoryRegionInfo info, TargetContext ctx) {
@@ -861,6 +939,21 @@ private extern(C) void setStopNotifierTramp(void* ctx, gdbstub_stop_notifier not
     c.callbacks.run.setStopNotifier(wrap);
 }
 
+private extern(C) uint8_t getRunCapabilitiesTramp(void* ctx, gdbstub_run_capabilities* capsOut) {
+    auto c = cast(TargetContext)ctx;
+    if (c.callbacks.run.getCapabilities is null) {
+        return 0;
+    }
+    auto caps = c.callbacks.run.getCapabilities();
+    if (caps.isNull) {
+        return 0;
+    }
+    if (capsOut !is null) {
+        *capsOut = toCRunCapabilities(caps.get);
+    }
+    return 1;
+}
+
 private extern(C) gdbstub_target_status setBreakpointTramp(void* ctx, const(gdbstub_breakpoint_spec)* spec) {
     auto c = cast(TargetContext)ctx;
     if (spec is null) {
@@ -885,6 +978,21 @@ private extern(C) gdbstub_target_status removeBreakpointTramp(void* ctx, const(g
     dSpec.length = spec.length;
     auto status = c.callbacks.breakpoints.removeBreakpoint(dSpec);
     return cast(gdbstub_target_status)status;
+}
+
+private extern(C) uint8_t getBreakpointCapabilitiesTramp(void* ctx, gdbstub_breakpoint_capabilities* capsOut) {
+    auto c = cast(TargetContext)ctx;
+    if (c.callbacks.breakpoints.getCapabilities is null) {
+        return 0;
+    }
+    auto caps = c.callbacks.breakpoints.getCapabilities();
+    if (caps.isNull) {
+        return 0;
+    }
+    if (capsOut !is null) {
+        *capsOut = toCBreakpointCapabilities(caps.get);
+    }
+    return 1;
 }
 
 private extern(C) uint8_t regionInfoTramp(void* ctx, uint64_t addr, gdbstub_memory_region_info* infoOut) {

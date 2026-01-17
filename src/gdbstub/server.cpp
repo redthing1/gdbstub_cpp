@@ -111,6 +111,71 @@ bool parse_thread_token(std::string_view text, std::optional<uint64_t>& tid) {
   return true;
 }
 
+enum class vcont_parse_result { none, ok, invalid };
+
+struct vcont_selection {
+  char action = 0;
+  std::optional<int> signal;
+  std::optional<address_range> range;
+};
+
+vcont_parse_result parse_vcont_actions(std::string_view actions,
+                                       uint64_t current_tid,
+                                       vcont_selection& out) {
+  out = {};
+  size_t start = 0;
+  while (start < actions.size()) {
+    auto next = actions.find(';', start);
+    auto part = actions.substr(start, next == std::string_view::npos ? actions.size() - start : next - start);
+    if (!part.empty()) {
+      char action = part[0];
+      auto colon = part.find(':');
+      std::string_view signal_str = colon == std::string_view::npos ? part.substr(1) : part.substr(1, colon - 1);
+      std::string_view thread_str = colon == std::string_view::npos ? std::string_view{} : part.substr(colon + 1);
+
+      bool applies = true;
+      if (!thread_str.empty()) {
+        std::optional<uint64_t> tid;
+        if (!parse_thread_token(thread_str, tid)) {
+          applies = false;
+        } else if (tid && *tid != current_tid) {
+          applies = false;
+        }
+      }
+
+      if (applies) {
+        out.action = action;
+        if (action == 'r') {
+          auto comma = signal_str.find(',');
+          if (comma == std::string_view::npos) {
+            return vcont_parse_result::invalid;
+          }
+          uint64_t range_start = 0;
+          uint64_t range_end = 0;
+          if (!parse_hex_u64(signal_str.substr(0, comma), range_start) ||
+              !parse_hex_u64(signal_str.substr(comma + 1), range_end)) {
+            return vcont_parse_result::invalid;
+          }
+          out.range = address_range{range_start, range_end};
+        } else if (action != 't' && !signal_str.empty()) {
+          uint64_t parsed = 0;
+          if (parse_hex_u64(signal_str, parsed) && parsed > 0) {
+            out.signal = static_cast<int>(parsed);
+          }
+        }
+        return vcont_parse_result::ok;
+      }
+    }
+
+    if (next == std::string_view::npos) {
+      break;
+    }
+    start = next + 1;
+  }
+
+  return vcont_parse_result::none;
+}
+
 bool split_thread_suffix(std::string_view payload, std::string_view& base, std::optional<uint64_t>& tid) {
   auto pos = payload.rfind(";thread:");
   if (pos == std::string_view::npos) {
@@ -334,23 +399,27 @@ bool server::poll(std::chrono::milliseconds timeout) {
     return false;
   }
 
-  bool processed = flush_pending_stop();
-  processed = read_and_process(timeout) || processed;
+  bool processed = read_and_process(timeout);
+  processed = flush_pending_stop() || processed;
 
   if (exec_state_ == exec_state::running) {
     if (auto stop = target_.run.poll_stop()) {
-      send_stop_reply(*stop);
-      exec_state_ = exec_state::halted;
+      if (non_stop_.enabled) {
+        enqueue_stop(std::move(*stop));
+      } else {
+        send_stop_reply(*stop);
+        exec_state_ = exec_state::halted;
+      }
       processed = true;
     }
   }
 
+  maybe_send_stop_notification();
   return processed;
 }
 
 void server::notify_stop(stop_reason reason) {
-  std::lock_guard<std::mutex> lock(stop_mutex_);
-  pending_stops_.push(std::move(reason));
+  enqueue_stop(std::move(reason));
 }
 
 void server::stop() {
@@ -388,6 +457,8 @@ bool server::process_event(const rsp::input_event& event) {
   case rsp::event_kind::interrupt:
     handle_interrupt();
     return true;
+  case rsp::event_kind::notification:
+    return false;
   case rsp::event_kind::packet:
     if (!event.checksum_ok) {
       if (!no_ack_mode_) {
@@ -411,12 +482,16 @@ bool server::flush_pending_stop() {
     return false;
   }
 
+  if (non_stop_.enabled) {
+    return false;
+  }
+
   std::optional<stop_reason> reason;
   {
-    std::lock_guard<std::mutex> lock(stop_mutex_);
-    if (!pending_stops_.empty()) {
-      reason = std::move(pending_stops_.front());
-      pending_stops_.pop();
+    std::lock_guard<std::mutex> lock(non_stop_.mutex);
+    if (!non_stop_.pending_stops.empty()) {
+      reason = std::move(non_stop_.pending_stops.front());
+      non_stop_.pending_stops.pop();
     }
   }
 
@@ -495,6 +570,15 @@ void server::handle_packet(std::string_view payload) {
   case 'S':
     handle_continue(args, resume_action::step, true);
     break;
+  case 'b':
+    if (args == "c") {
+      handle_reverse(false);
+    } else if (args == "s") {
+      handle_reverse(true);
+    } else {
+      send_packet("");
+    }
+    break;
   case 'z':
     handle_remove_breakpoint(args);
     break;
@@ -548,6 +632,9 @@ void server::handle_query(std::string_view args) {
   auto params = colon_pos == std::string_view::npos ? std::string_view{} : args.substr(colon_pos + 1);
 
   if (name == "Supported") {
+    auto caps = run_caps();
+    auto bp_caps = breakpoint_caps();
+
     std::string features;
     features += "PacketSize=";
     features += hex_u64(k_max_packet_size);
@@ -557,8 +644,20 @@ void server::handle_query(std::string_view args) {
       features += ";qXfer:features:read+;xmlRegisters=";
       features += arch_.xml_arch_name;
     }
-    if (target_.breakpoints) {
+    if (bp_caps.software) {
       features += ";swbreak+";
+    }
+    if (bp_caps.hardware) {
+      features += ";hwbreak+";
+    }
+    if (caps.reverse_continue) {
+      features += ";ReverseContinue+";
+    }
+    if (caps.reverse_step) {
+      features += ";ReverseStep+";
+    }
+    if (caps.non_stop) {
+      features += ";QNonStop+";
     }
     if (target_.host) {
       features += ";qHostInfo+";
@@ -679,6 +778,21 @@ void server::handle_set_query(std::string_view args) {
     return;
   }
 
+  if (args.rfind("NonStop:", 0) == 0) {
+    if (!run_caps().non_stop) {
+      send_packet("");
+      return;
+    }
+    if (args.size() != 9 || (args[8] != '0' && args[8] != '1')) {
+      send_error(0x16);
+      return;
+    }
+    non_stop_.enabled = args[8] == '1';
+    reset_non_stop_state();
+    send_packet("OK");
+    return;
+  }
+
   if (args.rfind("EnableErrorStrings", 0) == 0) {
     error_strings_enabled_ = true;
     send_packet("OK");
@@ -690,7 +804,43 @@ void server::handle_set_query(std::string_view args) {
 
 void server::handle_v_packet(std::string_view args) {
   if (args == "Cont?") {
-    send_packet("vCont;c;C;s;S");
+    auto caps = run_caps();
+    std::string response = "vCont;c;C;s;S";
+    if (caps.range_step) {
+      response += ";r";
+    }
+    if (caps.non_stop) {
+      response += ";t";
+    }
+    send_packet(response);
+    return;
+  }
+
+  if (args == "Stopped") {
+    if (!non_stop_.enabled) {
+      send_packet("");
+      return;
+    }
+    std::optional<stop_reason> reason;
+    {
+      std::lock_guard<std::mutex> lock(non_stop_.mutex);
+      if (!non_stop_.pending_stops.empty()) {
+        reason = std::move(non_stop_.pending_stops.front());
+        non_stop_.pending_stops.pop();
+      }
+    }
+    if (!reason) {
+      non_stop_.notification_in_flight = false;
+      send_packet("OK");
+      return;
+    }
+    send_packet(build_stop_reply_payload(*reason));
+    return;
+  }
+
+  if (args == "CtrlC") {
+    handle_interrupt();
+    send_packet("OK");
     return;
   }
 
@@ -701,84 +851,53 @@ void server::handle_v_packet(std::string_view args) {
 
   auto actions = args.substr(5);
   uint64_t current_tid = current_thread_id().value_or(1);
-  char selected = 0;
-  std::optional<int> selected_signal;
-
-  size_t start = 0;
-  while (start < actions.size()) {
-    auto next = actions.find(';', start);
-    auto part = actions.substr(start, next == std::string_view::npos ? actions.size() - start : next - start);
-    if (!part.empty()) {
-      char action = part[0];
-      auto colon = part.find(':');
-      std::string_view signal_str = colon == std::string_view::npos ? part.substr(1) : part.substr(1, colon - 1);
-      std::string_view thread_str = colon == std::string_view::npos ? std::string_view{} : part.substr(colon + 1);
-
-      bool applies = true;
-      if (!thread_str.empty()) {
-        std::optional<uint64_t> tid;
-        if (!parse_thread_token(thread_str, tid)) {
-          applies = false;
-        } else if (tid && *tid != current_tid) {
-          applies = false;
-        }
-      }
-
-      if (applies) {
-        selected = action;
-        if (!signal_str.empty()) {
-          int sig = 0;
-          uint64_t parsed = 0;
-          if (parse_hex_u64(signal_str, parsed)) {
-            sig = static_cast<int>(parsed);
-          }
-          selected_signal = sig > 0 ? std::optional<int>(sig) : std::nullopt;
-        }
-        break;
-      }
-    }
-
-    if (next == std::string_view::npos) {
-      break;
-    }
-    start = next + 1;
+  vcont_selection selection;
+  auto parse_result = parse_vcont_actions(actions, current_tid, selection);
+  if (parse_result == vcont_parse_result::invalid) {
+    send_error(0x16);
+    return;
   }
-
-  if (selected == 's' || selected == 'S') {
-    resume_request req;
-    req.action = resume_action::step;
-    req.signal = selected_signal;
-    auto result = target_.run.resume(req);
-    if (result.state == resume_result::state::running) {
-      exec_state_ = exec_state::running;
-      return;
-    }
-    if (result.state == resume_result::state::exited) {
-      send_exit_reply(result.stop);
-      exec_state_ = exec_state::halted;
-      return;
-    }
-    send_stop_reply(result.stop);
-    exec_state_ = exec_state::halted;
+  if (parse_result == vcont_parse_result::none) {
+    send_stop_reply(last_stop_.value_or(stop_reason{stop_kind::signal, 5}));
     return;
   }
 
-  if (selected == 'c' || selected == 'C') {
-    resume_request req;
-    req.action = resume_action::cont;
-    req.signal = selected_signal;
-    auto result = target_.run.resume(req);
-    if (result.state == resume_result::state::running) {
-      exec_state_ = exec_state::running;
+  auto caps = run_caps();
+
+  if (selection.action == 't') {
+    if (!non_stop_.enabled) {
+      send_packet("");
       return;
     }
-    if (result.state == resume_result::state::exited) {
-      send_exit_reply(result.stop);
-      exec_state_ = exec_state::halted;
+    non_stop_.stop_signal_zero_pending = true;
+    target_.run.interrupt();
+    send_packet("OK");
+    return;
+  }
+
+  if (selection.action == 's' || selection.action == 'S') {
+    auto result = target_.run.resume(resume_request::step(selection.signal));
+    finish_resume(result, false);
+    return;
+  }
+
+  if (selection.action == 'c' || selection.action == 'C') {
+    auto result = target_.run.resume(resume_request::cont(selection.signal));
+    finish_resume(result, false);
+    return;
+  }
+
+  if (selection.action == 'r') {
+    if (!caps.range_step) {
+      send_packet("");
       return;
     }
-    send_stop_reply(result.stop);
-    exec_state_ = exec_state::halted;
+    if (!selection.range) {
+      send_error(0x16);
+      return;
+    }
+    auto result = target_.run.resume(resume_request::range_step(*selection.range));
+    finish_resume(result, true);
     return;
   }
 
@@ -823,6 +942,38 @@ void server::handle_continue(std::string_view args, resume_action action, bool h
   }
 
   auto result = target_.run.resume(req);
+  finish_resume(result, false);
+}
+
+void server::handle_reverse(bool step) {
+  auto caps = run_caps();
+  if ((step && !caps.reverse_step) || (!step && !caps.reverse_continue)) {
+    send_packet("");
+    return;
+  }
+  auto result = target_.run.resume(step ? resume_request::reverse_step() : resume_request::reverse_cont());
+  finish_resume(result, true);
+}
+
+void server::finish_resume(const resume_result& result, bool optional_feature) {
+  if (result.status != target_status::ok) {
+    send_status_error(result.status, optional_feature);
+    return;
+  }
+
+  if (non_stop_.enabled) {
+    if (result.state == resume_result::state::running) {
+      exec_state_ = exec_state::running;
+      send_packet("OK");
+      return;
+    }
+    exec_state_ = exec_state::halted;
+    enqueue_stop(result.stop);
+    send_packet("OK");
+    maybe_send_stop_notification();
+    return;
+  }
+
   if (result.state == resume_result::state::running) {
     exec_state_ = exec_state::running;
     return;
@@ -1712,6 +1863,21 @@ void server::send_packet(std::string_view payload) {
   }
 }
 
+void server::send_notification(std::string_view payload) {
+  auto packet = rsp::build_notification(payload);
+  auto bytes = as_bytes(packet);
+
+  size_t offset = 0;
+  while (offset < bytes.size()) {
+    auto written = transport_->write(bytes.subspan(offset));
+    if (written <= 0) {
+      transport_->disconnect();
+      return;
+    }
+    offset += static_cast<size_t>(written);
+  }
+}
+
 void server::send_error(uint8_t code) { send_packet("E" + hex_byte(code)); }
 
 void server::send_status_error(target_status status, bool optional_feature) {
@@ -1729,17 +1895,32 @@ void server::send_status_error(target_status status, bool optional_feature) {
 }
 
 void server::send_stop_reply(const stop_reason& reason) {
+  auto response = build_stop_reply_payload(reason);
+  last_stop_ = reason;
+  send_packet(response);
+}
+
+void server::send_exit_reply(const stop_reason& reason) {
+  auto response = build_stop_reply_payload(reason);
+  last_stop_ = reason;
+  send_packet(response);
+}
+
+std::string server::build_stop_reply_payload(const stop_reason& reason) const {
   if (reason.kind == stop_kind::exited) {
-    send_exit_reply(reason);
-    return;
+    int code = reason.exit_code;
+    if (code < 0) {
+      code = 0;
+    }
+    return "W" + hex_byte(static_cast<uint8_t>(code & 0xff));
   }
 
   int signal = reason.signal;
-  if (reason.kind != stop_kind::signal || signal <= 0) {
+  if (signal <= 0 && reason.kind != stop_kind::signal) {
     signal = 5;
   }
 
-  std::string response = "T" + hex_byte(static_cast<uint8_t>(signal));
+  std::string response = "T" + hex_byte(static_cast<uint8_t>(signal & 0xff));
 
   switch (reason.kind) {
   case stop_kind::watch_write:
@@ -1751,8 +1932,24 @@ void server::send_stop_reply(const stop_reason& reason) {
   case stop_kind::watch_access:
     response += "awatch:" + hex_u64(reason.addr, sizeof(uint64_t) * 2) + ";";
     break;
+  case stop_kind::sw_break:
+    if (supports_sw_break()) {
+      response += "swbreak:;";
+    }
+    break;
+  case stop_kind::hw_break:
+    if (supports_hw_break()) {
+      response += "hwbreak:;";
+    }
+    break;
   default:
     break;
+  }
+
+  if (reason.replay_log) {
+    response += "replaylog:";
+    response += *reason.replay_log == replay_log_boundary::begin ? "begin" : "end";
+    response += ";";
   }
 
   uint64_t tid = reason.thread_id.value_or(current_thread_id().value_or(1));
@@ -1798,17 +1995,41 @@ void server::send_stop_reply(const stop_reason& reason) {
     }
   }
 
-  last_stop_ = reason;
-  send_packet(response);
+  return response;
 }
 
-void server::send_exit_reply(const stop_reason& reason) {
-  int code = reason.exit_code;
-  if (code < 0) {
-    code = 0;
+void server::enqueue_stop(stop_reason reason) {
+  if (non_stop_.stop_signal_zero_pending) {
+    reason.kind = stop_kind::signal;
+    reason.signal = 0;
+    non_stop_.stop_signal_zero_pending = false;
   }
-  send_packet("W" + hex_byte(static_cast<uint8_t>(code & 0xff)));
   last_stop_ = reason;
+  std::lock_guard<std::mutex> lock(non_stop_.mutex);
+  non_stop_.pending_stops.push(std::move(reason));
+}
+
+void server::maybe_send_stop_notification() {
+  if (!non_stop_.enabled || non_stop_.notification_in_flight) {
+    return;
+  }
+
+  std::optional<stop_reason> reason;
+  {
+    std::lock_guard<std::mutex> lock(non_stop_.mutex);
+    if (!non_stop_.pending_stops.empty()) {
+      reason = std::move(non_stop_.pending_stops.front());
+      non_stop_.pending_stops.pop();
+    }
+  }
+
+  if (!reason) {
+    return;
+  }
+
+  auto payload = "Stop:" + build_stop_reply_payload(*reason);
+  send_notification(payload);
+  non_stop_.notification_in_flight = true;
 }
 
 std::optional<uint64_t> server::current_thread_id() const {
@@ -1827,5 +2048,37 @@ std::vector<uint64_t> server::thread_ids() const {
   }
   return {current_thread_id().value_or(1)};
 }
+
+run_capabilities server::run_caps() const {
+  if (auto caps = target_.run.capabilities()) {
+    return *caps;
+  }
+  return {};
+}
+
+breakpoint_capabilities server::breakpoint_caps() const {
+  if (!target_.breakpoints) {
+    return {};
+  }
+  if (auto caps = target_.breakpoints->capabilities()) {
+    return *caps;
+  }
+  breakpoint_capabilities defaults;
+  defaults.software = true;
+  return defaults;
+}
+
+void server::reset_non_stop_state() {
+  non_stop_.notification_in_flight = false;
+  non_stop_.stop_signal_zero_pending = false;
+  std::lock_guard<std::mutex> lock(non_stop_.mutex);
+  while (!non_stop_.pending_stops.empty()) {
+    non_stop_.pending_stops.pop();
+  }
+}
+
+bool server::supports_sw_break() const { return breakpoint_caps().software; }
+
+bool server::supports_hw_break() const { return breakpoint_caps().hardware; }
 
 } // namespace gdbstub

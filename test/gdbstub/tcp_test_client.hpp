@@ -167,6 +167,7 @@ struct client_reply {
   bool checksum_ok = true;
   size_t ack_count = 0;
   size_t nack_count = 0;
+  bool is_notification = false;
 };
 
 class tcp_client {
@@ -240,6 +241,52 @@ public:
           ++reply.nack_count;
           continue;
         }
+        if (event.kind == rsp::event_kind::notification) {
+          continue;
+        }
+        if (event.kind == rsp::event_kind::packet) {
+          reply.payload = std::move(event.payload);
+          reply.checksum_ok = event.checksum_ok;
+          send_ack();
+          return reply;
+        }
+      }
+    }
+    return std::nullopt;
+  }
+
+  std::optional<client_reply> read_event(std::chrono::milliseconds timeout) {
+    client_reply reply;
+    auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+      auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now());
+      if (!detail::socket_readable(sock_.get(), remaining)) {
+        continue;
+      }
+
+      std::array<std::byte, 4096> buffer{};
+      auto bytes = detail::socket_read(sock_.get(), buffer);
+      if (bytes <= 0) {
+        return std::nullopt;
+      }
+
+      parser_.append(std::span<const std::byte>(buffer.data(), static_cast<size_t>(bytes)));
+      while (parser_.has_event()) {
+        auto event = parser_.pop_event();
+        if (event.kind == rsp::event_kind::ack) {
+          ++reply.ack_count;
+          continue;
+        }
+        if (event.kind == rsp::event_kind::nack) {
+          ++reply.nack_count;
+          continue;
+        }
+        if (event.kind == rsp::event_kind::notification) {
+          reply.payload = std::move(event.payload);
+          reply.checksum_ok = event.checksum_ok;
+          reply.is_notification = true;
+          return reply;
+        }
         if (event.kind == rsp::event_kind::packet) {
           reply.payload = std::move(event.payload);
           reply.checksum_ok = event.checksum_ok;
@@ -300,6 +347,21 @@ inline std::optional<client_reply> wait_for_reply(
   while (std::chrono::steady_clock::now() < deadline) {
     server.poll(std::chrono::milliseconds(10));
     if (auto reply = client.read_packet(std::chrono::milliseconds(10))) {
+      return reply;
+    }
+  }
+  return std::nullopt;
+}
+
+inline std::optional<client_reply> wait_for_event(
+    server& server,
+    tcp_client& client,
+    std::chrono::milliseconds timeout
+) {
+  auto deadline = std::chrono::steady_clock::now() + timeout;
+  while (std::chrono::steady_clock::now() < deadline) {
+    server.poll(std::chrono::milliseconds(10));
+    if (auto reply = client.read_event(std::chrono::milliseconds(10))) {
       return reply;
     }
   }

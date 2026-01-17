@@ -21,7 +21,7 @@ public:
         layout_(config_),
         machine_(config_),
         threads_(config_.thread_ids),
-        runner_(machine_, threads_, config_.mode, config_.max_steps),
+        runner_(machine_, threads_, config_.mode, config_.max_steps, config_.history_limit),
         regs_(layout_, machine_),
         reg_info_(layout_),
         mem_(machine_),
@@ -134,6 +134,8 @@ private:
 
     void set_stop_notifier(stop_notifier notifier) { runner_.set_stop_notifier(notifier); }
 
+    run_capabilities capabilities() const { return runner_.capabilities(); }
+
   private:
     runner& runner_;
   };
@@ -144,18 +146,34 @@ private:
 
     target_status set_breakpoint(const breakpoint_spec& request) {
       if (request.type != breakpoint_type::software && request.type != breakpoint_type::hardware) {
-        return target_status::unsupported;
+        if (request.type != breakpoint_type::watch_read && request.type != breakpoint_type::watch_write &&
+            request.type != breakpoint_type::watch_access) {
+          return target_status::unsupported;
+        }
       }
-      machine_.add_breakpoint(request.addr);
+      machine_.add_breakpoint(request);
       return target_status::ok;
     }
 
     target_status remove_breakpoint(const breakpoint_spec& request) {
       if (request.type != breakpoint_type::software && request.type != breakpoint_type::hardware) {
-        return target_status::unsupported;
+        if (request.type != breakpoint_type::watch_read && request.type != breakpoint_type::watch_write &&
+            request.type != breakpoint_type::watch_access) {
+          return target_status::unsupported;
+        }
       }
-      machine_.remove_breakpoint(request.addr);
+      machine_.remove_breakpoint(request);
       return target_status::ok;
+    }
+
+    breakpoint_capabilities capabilities() const {
+      breakpoint_capabilities caps;
+      caps.software = true;
+      caps.hardware = true;
+      caps.watch_read = true;
+      caps.watch_write = true;
+      caps.watch_access = true;
+      return caps;
     }
 
   private:

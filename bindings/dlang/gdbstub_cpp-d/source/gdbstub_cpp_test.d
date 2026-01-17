@@ -30,16 +30,31 @@ private class TestTarget {
     private BreakpointSpec lastBreakpoint;
     private size_t breakpointsSet;
     private size_t breakpointsRemoved;
+    private Nullable!RunCapabilities runCaps;
+    private Nullable!BreakpointCapabilities breakpointCaps;
+    private Nullable!ReplayLogBoundary replayLogOverride;
+    private Nullable!ResumeRequest lastResumeRequest;
+    private TargetStatus resumeStatus = TargetStatus.ok;
 
     ubyte[regSizeBytes * regCount] regs;
     ubyte[memSize] mem;
     ulong[] threads = [1, 2];
 
-    this(IntegrationMode mode) {
+    this(
+        IntegrationMode mode,
+        Nullable!RunCapabilities runCaps = Nullable!RunCapabilities.init,
+        Nullable!BreakpointCapabilities breakpointCaps = Nullable!BreakpointCapabilities.init,
+        Nullable!ReplayLogBoundary replayLogOverride = Nullable!ReplayLogBoundary.init
+    ) {
         this.mode = mode;
+        this.runCaps = runCaps;
+        this.breakpointCaps = breakpointCaps;
+        this.replayLogOverride = replayLogOverride;
     }
 
     Target buildTarget() {
+        auto runCapsFn = runCaps.isNull ? null : &getRunCapabilities;
+        auto breakCapsFn = breakpointCaps.isNull ? null : &getBreakpointCapabilities;
         auto builder = TargetBuilder()
             .withRegs(&regSize, &readReg, &writeReg)
             .withMem(&readMem, &writeMem)
@@ -47,13 +62,14 @@ private class TestTarget {
                 &resume,
                 &interrupt,
                 mode == IntegrationMode.polling ? &pollStop : null,
-                mode == IntegrationMode.async ? &setStopNotifier : null
+                mode == IntegrationMode.async ? &setStopNotifier : null,
+                runCapsFn
             )
             .withMemoryLayout(&regionInfo, &memoryMap)
             .withHostInfo(&hostInfo)
             .withProcessInfo(&processInfo)
             .withShlibInfo(&shlibInfo)
-            .withBreakpoints(&setBreakpoint, &removeBreakpoint)
+            .withBreakpoints(&setBreakpoint, &removeBreakpoint, breakCapsFn)
             .withRegisterInfo(&registerInfo)
             .withThreads(
                 &threadIds,
@@ -109,10 +125,13 @@ private class TestTarget {
     }
 
     ResumeResult resume(ResumeRequest request) {
+        lastResumeRequest = nullable(request);
         running = true;
         pollTicks = 0;
         if (mode == IntegrationMode.blocking) {
-            return stoppedResult();
+            auto result = stoppedResult();
+            result.status = resumeStatus;
+            return result;
         }
         if (mode == IntegrationMode.async && notifier.isValid()) {
             auto notifyCopy = notifier;
@@ -125,6 +144,7 @@ private class TestTarget {
         }
         ResumeResult result;
         result.state = ResumeState.running;
+        result.status = resumeStatus;
         return result;
     }
 
@@ -234,12 +254,28 @@ private class TestTarget {
         return TargetStatus.ok;
     }
 
+    Nullable!RunCapabilities getRunCapabilities() {
+        return runCaps;
+    }
+
+    Nullable!BreakpointCapabilities getBreakpointCapabilities() {
+        return breakpointCaps;
+    }
+
     size_t breakpointsSetCount() {
         return breakpointsSet;
     }
 
     size_t breakpointsRemovedCount() {
         return breakpointsRemoved;
+    }
+
+    Nullable!ResumeRequest lastResumeRequestValue() {
+        return lastResumeRequest;
+    }
+
+    void setResumeStatus(TargetStatus status) {
+        resumeStatus = status;
     }
 
     ulong currentThreadValue() {
@@ -277,6 +313,9 @@ private class TestTarget {
         StopReason reason;
         reason.kind = StopKind.signal;
         reason.signal = 5; // SIGTRAP
+        if (!replayLogOverride.isNull) {
+            reason.replayLog = replayLogOverride;
+        }
         return reason;
     }
 
@@ -296,8 +335,13 @@ private class ServerHarness {
     string targetXml;
     string xmlArchName;
 
-    this(IntegrationMode mode) {
-        target = new TestTarget(mode);
+    this(
+        IntegrationMode mode,
+        Nullable!RunCapabilities runCaps = Nullable!RunCapabilities.init,
+        Nullable!BreakpointCapabilities breakCaps = Nullable!BreakpointCapabilities.init,
+        Nullable!ReplayLogBoundary replayLog = Nullable!ReplayLogBoundary.init
+    ) {
+        target = new TestTarget(mode, runCaps, breakCaps, replayLog);
         auto targetHandle = target.buildTarget();
 
         ArchSpec arch;
@@ -695,6 +739,81 @@ private void runBasicProtocolChecks(IntegrationMode mode) {
     assert(stop.canFind("thread-pcs:"));
 }
 
+private void runCapabilitiesProtocolChecks() {
+    RunCapabilities runCaps;
+    runCaps.reverseContinue = true;
+    runCaps.reverseStep = true;
+    runCaps.rangeStep = true;
+    runCaps.nonStop = true;
+
+    BreakpointCapabilities breakCaps;
+    breakCaps.software = true;
+    breakCaps.hardware = true;
+    breakCaps.watchRead = true;
+    breakCaps.watchWrite = true;
+    breakCaps.watchAccess = true;
+
+    auto harness = new ServerHarness(
+        IntegrationMode.blocking,
+        nullable(runCaps),
+        nullable(breakCaps),
+        nullable(ReplayLogBoundary.begin)
+    );
+    scope(exit) harness.stop();
+
+    auto client = new RspClient(harness.address);
+    scope(exit) client.close();
+
+    client.sendPacket("qSupported");
+    auto supported = client.readPacket();
+    assert(supported.canFind("ReverseContinue+"));
+    assert(supported.canFind("ReverseStep+"));
+    assert(supported.canFind("QNonStop+"));
+    assert(supported.canFind("hwbreak+"));
+
+    client.sendPacket("vCont?");
+    auto vCont = client.readPacket();
+    assert(vCont.canFind(";r"));
+    assert(vCont.canFind(";t"));
+
+    client.sendPacket("bc");
+    auto reverseContStop = client.readPacket();
+    auto lastRequest = harness.target.lastResumeRequestValue();
+    assert(!lastRequest.isNull);
+    assert(lastRequest.get.action == ResumeAction.cont);
+    assert(lastRequest.get.direction == ResumeDirection.reverse);
+    assert(reverseContStop.canFind("replaylog:begin"));
+
+    client.sendPacket("bs");
+    auto reverseStepStop = client.readPacket();
+    lastRequest = harness.target.lastResumeRequestValue();
+    assert(!lastRequest.isNull);
+    assert(lastRequest.get.action == ResumeAction.step);
+    assert(lastRequest.get.direction == ResumeDirection.reverse);
+
+    client.sendPacket("vCont;r10,20");
+    auto rangeStop = client.readPacket();
+    lastRequest = harness.target.lastResumeRequestValue();
+    assert(!lastRequest.isNull);
+    assert(lastRequest.get.action == ResumeAction.rangeStep);
+    assert(!lastRequest.get.range.isNull);
+    assert(lastRequest.get.range.get.start == 0x10);
+    assert(lastRequest.get.range.get.end == 0x20);
+    assert(rangeStop.startsWith("T05") || rangeStop.startsWith("S05"));
+}
+
+private void runResumeStatusChecks() {
+    auto harness = new ServerHarness(IntegrationMode.blocking);
+    scope(exit) harness.stop();
+    harness.target.setResumeStatus(TargetStatus.invalid);
+
+    auto client = new RspClient(harness.address);
+    scope(exit) client.close();
+
+    client.sendPacket("c");
+    assert(client.readPacket() == "E16");
+}
+
 unittest {
     runBasicProtocolChecks(IntegrationMode.blocking);
 }
@@ -705,4 +824,12 @@ unittest {
 
 unittest {
     runBasicProtocolChecks(IntegrationMode.async);
+}
+
+unittest {
+    runCapabilitiesProtocolChecks();
+}
+
+unittest {
+    runResumeStatusChecks();
 }

@@ -38,6 +38,15 @@ gdbstub::test::client_reply send_and_wait(
   return *reply;
 }
 
+gdbstub::test::client_reply wait_for_event(
+    gdbstub::test::toy_session& session,
+    std::chrono::milliseconds timeout = k_default_timeout
+) {
+  auto reply = gdbstub::test::wait_for_event(session.server(), session.client(), timeout);
+  REQUIRE(reply.has_value());
+  return *reply;
+}
+
 std::span<const std::byte> as_bytes(std::string_view text) {
   return {reinterpret_cast<const std::byte*>(text.data()), text.size()};
 }
@@ -96,6 +105,106 @@ TEST_CASE("toy emulator 32-bit async notifies stop") {
 
   auto stop = send_and_wait(session, "c", k_async_timeout);
   CHECK(stop.payload.rfind("T05", 0) == 0);
+}
+
+TEST_CASE("toy emulator reverse step and reverse continue") {
+  auto cfg = make_config(32, gdbstub::toy::execution_mode::blocking);
+  cfg.reg_count = 2;
+  cfg.pc_reg_num = 0;
+  cfg.start_pc = 0x1000;
+  cfg.max_steps = 8;
+  cfg.history_limit = 8;
+
+  gdbstub::test::toy_session session(cfg);
+  REQUIRE(session.listen_and_connect(k_host, k_port_base + 500, k_port_sweep));
+
+  auto step1 = send_and_wait(session, "s");
+  CHECK(step1.payload.rfind("T05", 0) == 0);
+  auto step2 = send_and_wait(session, "s");
+  CHECK(step2.payload.rfind("T05", 0) == 0);
+
+  auto back = send_and_wait(session, "bs");
+  CHECK(back.payload.rfind("T05", 0) == 0);
+  auto pc = send_and_wait(session, "p0");
+  CHECK(pc.payload == "04100000");
+
+  auto reverse = send_and_wait(session, "bc");
+  CHECK(reverse.payload.find("replaylog:begin;") != std::string::npos);
+  auto pc_back = send_and_wait(session, "p0");
+  CHECK(pc_back.payload == "00100000");
+}
+
+TEST_CASE("toy emulator range stepping stops at range end") {
+  auto cfg = make_config(32, gdbstub::toy::execution_mode::blocking);
+  cfg.reg_count = 2;
+  cfg.pc_reg_num = 0;
+  cfg.start_pc = 0x2000;
+  cfg.max_steps = 16;
+
+  gdbstub::test::toy_session session(cfg);
+  REQUIRE(session.listen_and_connect(k_host, k_port_base + 550, k_port_sweep));
+
+  auto vcont = send_and_wait(session, "vCont;r2000,200c");
+  CHECK(vcont.payload.rfind("T05", 0) == 0);
+
+  auto pc = send_and_wait(session, "p0");
+  CHECK(pc.payload == "0c200000");
+}
+
+TEST_CASE("toy emulator hardware breakpoint and watchpoint") {
+  auto cfg = make_config(32, gdbstub::toy::execution_mode::blocking);
+  cfg.reg_count = 2;
+  cfg.pc_reg_num = 0;
+  cfg.start_pc = 0x3000;
+  cfg.max_steps = 16;
+
+  gdbstub::test::toy_session session(cfg);
+  REQUIRE(session.listen_and_connect(k_host, k_port_base + 900, k_port_sweep));
+
+  auto supported = send_and_wait(session, "qSupported");
+  CHECK(supported.payload.find("hwbreak+") != std::string::npos);
+
+  auto hw_bp = send_and_wait(session, "Z1,3008,4");
+  CHECK(hw_bp.payload == "OK");
+
+  auto hw_stop = send_and_wait(session, "c");
+  CHECK(hw_stop.payload.find("hwbreak:;") != std::string::npos);
+
+  auto watch = send_and_wait(session, "Z2,300d,1");
+  CHECK(watch.payload == "OK");
+
+  auto watch_stop = send_and_wait(session, "c");
+  CHECK(watch_stop.payload.find("watch:") != std::string::npos);
+}
+
+TEST_CASE("toy emulator non-stop async notifications") {
+  auto cfg = make_config(32, gdbstub::toy::execution_mode::async);
+  cfg.reg_count = 2;
+  cfg.pc_reg_num = 0;
+  cfg.start_pc = 0x4000;
+  cfg.max_steps = 32;
+
+  gdbstub::test::toy_session session(cfg);
+  REQUIRE(session.listen_and_connect(k_host, k_port_base + 950, k_port_sweep));
+
+  auto enable = send_and_wait(session, "QNonStop:1");
+  CHECK(enable.payload == "OK");
+
+  auto bp = send_and_wait(session, "Z0,4008,4");
+  CHECK(bp.payload == "OK");
+
+  auto resume = send_and_wait(session, "c");
+  CHECK(resume.payload == "OK");
+
+  auto notify = wait_for_event(session, k_async_timeout);
+  CHECK(notify.is_notification);
+  CHECK(notify.payload.rfind("Stop:T", 0) == 0);
+
+  auto first = send_and_wait(session, "vStopped");
+  CHECK(first.payload.rfind("T", 0) == 0);
+
+  auto second = send_and_wait(session, "vStopped");
+  CHECK(second.payload == "OK");
 }
 
 TEST_CASE("toy emulator 64-bit reads and writes registers") {

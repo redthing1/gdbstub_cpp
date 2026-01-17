@@ -39,6 +39,41 @@ struct breakpoint_spec {
   breakpoint_type type = breakpoint_type::software;
   uint64_t addr = 0;
   uint32_t length = 0;
+
+  static breakpoint_spec software(uint64_t addr_value, uint32_t length_value = 0) {
+    return {breakpoint_type::software, addr_value, length_value};
+  }
+
+  static breakpoint_spec hardware(uint64_t addr_value, uint32_t length_value = 0) {
+    return {breakpoint_type::hardware, addr_value, length_value};
+  }
+
+  static breakpoint_spec watch_write(uint64_t addr_value, uint32_t length_value) {
+    return {breakpoint_type::watch_write, addr_value, length_value};
+  }
+
+  static breakpoint_spec watch_read(uint64_t addr_value, uint32_t length_value) {
+    return {breakpoint_type::watch_read, addr_value, length_value};
+  }
+
+  static breakpoint_spec watch_access(uint64_t addr_value, uint32_t length_value) {
+    return {breakpoint_type::watch_access, addr_value, length_value};
+  }
+};
+
+struct run_capabilities {
+  bool reverse_continue = false;
+  bool reverse_step = false;
+  bool range_step = false;
+  bool non_stop = false;
+};
+
+struct breakpoint_capabilities {
+  bool software = false;
+  bool hardware = false;
+  bool watch_read = false;
+  bool watch_write = false;
+  bool watch_access = false;
 };
 
 enum class mem_perm : uint8_t {
@@ -192,6 +227,7 @@ struct run_view {
   void (*interrupt_fn)(void* ctx) = nullptr;
   std::optional<stop_reason> (*poll_stop_fn)(void* ctx) = nullptr;
   void (*set_stop_notifier_fn)(void* ctx, stop_notifier notifier) = nullptr;
+  std::optional<run_capabilities> (*get_run_capabilities_fn)(void* ctx) = nullptr;
 
   resume_result resume(const resume_request& request) const { return resume_fn(ctx, request); }
 
@@ -213,16 +249,31 @@ struct run_view {
       set_stop_notifier_fn(ctx, notifier);
     }
   }
+
+  std::optional<run_capabilities> capabilities() const {
+    if (get_run_capabilities_fn) {
+      return get_run_capabilities_fn(ctx);
+    }
+    return std::nullopt;
+  }
 };
 
 struct breakpoints_view {
   void* ctx = nullptr;
   target_status (*set_breakpoint_fn)(void* ctx, const breakpoint_spec& request) = nullptr;
   target_status (*remove_breakpoint_fn)(void* ctx, const breakpoint_spec& request) = nullptr;
+  std::optional<breakpoint_capabilities> (*get_breakpoint_capabilities_fn)(void* ctx) = nullptr;
 
   target_status set_breakpoint(const breakpoint_spec& request) const { return set_breakpoint_fn(ctx, request); }
   target_status remove_breakpoint(const breakpoint_spec& request) const {
     return remove_breakpoint_fn(ctx, request);
+  }
+
+  std::optional<breakpoint_capabilities> capabilities() const {
+    if (get_breakpoint_capabilities_fn) {
+      return get_breakpoint_capabilities_fn(ctx);
+    }
+    return std::nullopt;
   }
 };
 
@@ -341,6 +392,11 @@ concept run_capability = requires(T& t, const resume_request& request) {
 };
 
 template <typename T>
+concept run_capabilities_capability = requires(T& t) {
+  { t.capabilities() } -> std::same_as<run_capabilities>;
+};
+
+template <typename T>
 concept run_interrupt = requires(T& t) {
   t.interrupt();
 };
@@ -364,6 +420,11 @@ template <typename T>
 concept breakpoints_capability = requires(T& t, const breakpoint_spec& request) {
   { t.set_breakpoint(request) } -> std::same_as<target_status>;
   { t.remove_breakpoint(request) } -> std::same_as<target_status>;
+};
+
+template <typename T>
+concept breakpoint_capabilities_capability = requires(T& t) {
+  { t.capabilities() } -> std::same_as<breakpoint_capabilities>;
 };
 
 template <typename T>
@@ -451,6 +512,11 @@ run_view make_run_view(T& run) {
       static_cast<T*>(ctx)->set_stop_notifier(notifier);
     };
   }
+  if constexpr (run_capabilities_capability<T>) {
+    view.get_run_capabilities_fn = [](void* ctx) -> std::optional<run_capabilities> {
+      return static_cast<T*>(ctx)->capabilities();
+    };
+  }
   return view;
 }
 
@@ -464,6 +530,11 @@ breakpoints_view make_breakpoints_view(T& breakpoints) {
   view.remove_breakpoint_fn = [](void* ctx, const breakpoint_spec& request) -> target_status {
     return static_cast<T*>(ctx)->remove_breakpoint(request);
   };
+  if constexpr (breakpoint_capabilities_capability<T>) {
+    view.get_breakpoint_capabilities_fn = [](void* ctx) -> std::optional<breakpoint_capabilities> {
+      return static_cast<T*>(ctx)->capabilities();
+    };
+  }
   return view;
 }
 

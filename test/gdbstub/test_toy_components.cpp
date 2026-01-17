@@ -60,7 +60,11 @@ TEST_CASE("toy machine reports breakpoints") {
   cfg.start_pc = 0x2000;
   gdbstub::toy::machine machine(cfg);
 
-  machine.add_breakpoint(0x2000);
+  gdbstub::breakpoint_spec spec;
+  spec.type = gdbstub::breakpoint_type::software;
+  spec.addr = 0x2000;
+  spec.length = 1;
+  machine.add_breakpoint(spec);
   auto stop = machine.stop_if_breakpoint(1);
   REQUIRE(stop.has_value());
   CHECK(stop->kind == gdbstub::stop_kind::sw_break);
