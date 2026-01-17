@@ -8,6 +8,7 @@
 #include <optional>
 #include <span>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include "gdbstub/rsp_types.hpp"
@@ -16,6 +17,7 @@
 
 namespace gdbstub::toy {
 
+// Toy machine: register file, memory, and breakpoint/watchpoint bookkeeping.
 class machine {
 public:
   struct snapshot {
@@ -46,6 +48,16 @@ public:
     return reg_bytes();
   }
   size_t memory_size() const { return memory_size_; }
+
+  std::pair<uint64_t, uint64_t> access_addrs_for_pc(uint64_t pc) const {
+    // Deterministic synthetic access pattern for watchpoint testing.
+    if (memory_size_ == 0) {
+      return {0, 0};
+    }
+    uint64_t read_addr = pc % memory_size_;
+    uint64_t write_addr = (read_addr + 1) % memory_size_;
+    return {read_addr, write_addr};
+  }
 
   target_status read_reg(int regno, std::span<std::byte> out) const {
     if (!valid_reg(regno) || out.size() != reg_bytes()) {
@@ -186,16 +198,16 @@ public:
     if (auto stop = stop_if_breakpoint_locked(thread_id)) {
       return stop;
     }
-    uint64_t access_addr = 0;
+    uint64_t read_addr = 0;
+    uint64_t write_addr = 0;
     if (valid_reg(pc_reg_num_)) {
       auto index = static_cast<size_t>(pc_reg_num_);
       regs_[index] = mask_value(regs_[index] + instruction_size_);
-      if (!memory_.empty()) {
-        access_addr = regs_[index] % memory_.size();
-      }
+      auto addrs = access_addrs_for_pc(regs_[index]);
+      read_addr = addrs.first;
+      write_addr = addrs.second;
     }
-    uint64_t write_addr = memory_.empty() ? 0 : (access_addr + 1) % std::max<size_t>(1, memory_.size());
-    if (auto stop = stop_if_watchpoint_locked(thread_id, access_addr, write_addr)) {
+    if (auto stop = stop_if_watchpoint_locked(thread_id, read_addr, write_addr)) {
       return stop;
     }
     return stop_if_breakpoint_locked(thread_id);
@@ -258,20 +270,10 @@ private:
     }
     auto pc_value = regs_[static_cast<size_t>(pc_reg_num_)];
     if (hw_breakpoints_.find(pc_value) != hw_breakpoints_.end()) {
-      stop_reason reason;
-      reason.kind = stop_kind::hw_break;
-      reason.signal = 5;
-      reason.addr = pc_value;
-      reason.thread_id = thread_id;
-      return reason;
+      return make_stop(stop_kind::hw_break, pc_value, thread_id);
     }
     if (sw_breakpoints_.find(pc_value) != sw_breakpoints_.end()) {
-      stop_reason reason;
-      reason.kind = stop_kind::sw_break;
-      reason.signal = 5;
-      reason.addr = pc_value;
-      reason.thread_id = thread_id;
-      return reason;
+      return make_stop(stop_kind::sw_break, pc_value, thread_id);
     }
     return std::nullopt;
   }
@@ -289,36 +291,31 @@ private:
     for (const auto& wp : watchpoints_) {
       if (wp.type == gdbstub::breakpoint_type::watch_access) {
         if (matches(read_addr, wp.addr, wp.length) || matches(write_addr, wp.addr, wp.length)) {
-          stop_reason reason;
-          reason.kind = stop_kind::watch_access;
-          reason.signal = 5;
-          reason.addr = matches(read_addr, wp.addr, wp.length) ? read_addr : write_addr;
-          reason.thread_id = thread_id;
-          return reason;
+          auto addr = matches(read_addr, wp.addr, wp.length) ? read_addr : write_addr;
+          return make_stop(stop_kind::watch_access, addr, thread_id);
         }
       }
     }
     for (const auto& wp : watchpoints_) {
       if (wp.type == gdbstub::breakpoint_type::watch_write && matches(write_addr, wp.addr, wp.length)) {
-        stop_reason reason;
-        reason.kind = stop_kind::watch_write;
-        reason.signal = 5;
-        reason.addr = write_addr;
-        reason.thread_id = thread_id;
-        return reason;
+        return make_stop(stop_kind::watch_write, write_addr, thread_id);
       }
     }
     for (const auto& wp : watchpoints_) {
       if (wp.type == gdbstub::breakpoint_type::watch_read && matches(read_addr, wp.addr, wp.length)) {
-        stop_reason reason;
-        reason.kind = stop_kind::watch_read;
-        reason.signal = 5;
-        reason.addr = read_addr;
-        reason.thread_id = thread_id;
-        return reason;
+        return make_stop(stop_kind::watch_read, read_addr, thread_id);
       }
     }
     return std::nullopt;
+  }
+
+  static stop_reason make_stop(stop_kind kind, uint64_t addr, uint64_t thread_id) {
+    stop_reason reason;
+    reason.kind = kind;
+    reason.signal = 5;
+    reason.addr = addr;
+    reason.thread_id = thread_id;
+    return reason;
   }
 
   uint32_t reg_bits_ = 0;
