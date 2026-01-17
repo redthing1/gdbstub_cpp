@@ -49,14 +49,7 @@ ctest --test-dir build-release --output-on-failure
 
 ## a sample target
 
-minimal demo target under `src/gdbstub_tool/toy/`:
-
-- `types.hpp` config and execution mode.
-- `layout.hpp` register layout and target XML.
-- `machine.hpp` core state and stepping logic.
-- `threads.hpp` thread IDs and selection.
-- `runner.hpp` blocking/polling/async execution.
-- `target.hpp` gdbstub adapter that composes the pieces.
+see the full-featured demo target under `src/gdbstub_tool/toy/`.
 
 run debug server:
 ```bash
