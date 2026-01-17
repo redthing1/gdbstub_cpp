@@ -1,0 +1,23 @@
+name "gdbstub_cpp"
+description "D bindings for gdbstub_cpp"
+authors "gdbstub_cpp"
+license "proprietary"
+targetType "staticLibrary"
+sourcePaths "source"
+importPaths "source"
+
+cImportPaths "../../capi/include" "../../../src" "../../../lib/third_party"
+
+preBuildCommands "cmake -S ../../.. -B .dub/build-gdbstub -DCMAKE_BUILD_TYPE=Release"
+preBuildCommands "cmake --build .dub/build-gdbstub --config Release --target gdbstub_c"
+
+libs "gdbstub_c"
+lflags "-L$PACKAGE_DIR/.dub/build-gdbstub/lib"
+
+libs "stdc++" platform="linux"
+lflags "-pthread" platform="linux"
+
+libs "c++" platform="osx"
+
+lflags "/LIBPATH:$PACKAGE_DIR/.dub/build-gdbstub/lib" platform="windows"
+libs "ws2_32" platform="windows"

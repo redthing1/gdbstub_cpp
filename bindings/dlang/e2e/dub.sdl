@@ -1,0 +1,8 @@
+name "gdbstub_cpp_e2e"
+description "End-to-end LLDB test target for gdbstub_cpp D bindings"
+authors "gdbstub_cpp"
+license "proprietary"
+targetType "executable"
+sourcePaths "source"
+
+dependency "gdbstub_cpp" path="../gdbstub_cpp-d"

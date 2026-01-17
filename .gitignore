@@ -24,9 +24,9 @@ build-*/
 
 .vscode
 
-### C ###
-# Prerequisites
-*.d
+# ### C ###
+# # Prerequisites
+# *.d
 
 # Object files
 *.o

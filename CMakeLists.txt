@@ -10,6 +10,24 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 
+option(GDBSTUB_SANITIZE "Enable address/undefined sanitizers in Debug builds" OFF)
+
+function(gdbstub_apply_sanitizers target)
+    if (NOT GDBSTUB_SANITIZE)
+        return()
+    endif()
+    if (MSVC)
+        return()
+    endif()
+    target_compile_options(${target} PRIVATE
+        $<$<CONFIG:Debug>:-fsanitize=address,undefined>
+        $<$<CONFIG:Debug>:-fno-omit-frame-pointer>
+    )
+    target_link_options(${target} PRIVATE
+        $<$<CONFIG:Debug>:-fsanitize=address,undefined>
+    )
+endfunction()
+
 add_library(gdbstub)
 target_sources(gdbstub PRIVATE
     src/gdbstub/gdbstub.cpp
@@ -26,12 +44,33 @@ target_include_directories(gdbstub
 )
 target_compile_features(gdbstub PUBLIC cxx_std_20)
 add_library(gdbstub::gdbstub ALIAS gdbstub)
+gdbstub_apply_sanitizers(gdbstub)
+
+add_library(gdbstub_c)
+target_sources(gdbstub_c PRIVATE
+    bindings/capi/src/gdbstub_cpp_c.cpp
+    src/gdbstub/gdbstub.cpp
+    src/gdbstub/rsp_core.cpp
+    src/gdbstub/server.cpp
+    src/gdbstub/transport_tcp.cpp
+)
+set_target_properties(gdbstub_c PROPERTIES OUTPUT_NAME gdbstub_c)
+target_include_directories(gdbstub_c
+    PUBLIC
+        $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/bindings/capi/include>
+        $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/src>
+        $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/lib/third_party>
+        $<INSTALL_INTERFACE:include>
+)
+target_compile_features(gdbstub_c PUBLIC cxx_std_20)
+gdbstub_apply_sanitizers(gdbstub_c)
 
 add_executable(gdbstub_tool)
 target_sources(gdbstub_tool PRIVATE
     src/gdbstub_tool/main.cpp
 )
 target_link_libraries(gdbstub_tool PRIVATE gdbstub)
+gdbstub_apply_sanitizers(gdbstub_tool)
 
 add_executable(gdbstub_test)
 target_sources(gdbstub_test PRIVATE
@@ -46,20 +85,41 @@ set_target_properties(gdbstub_test PROPERTIES
     OUTPUT_NAME gdbstub_test
 )
 target_link_libraries(gdbstub_test PRIVATE gdbstub)
+gdbstub_apply_sanitizers(gdbstub_test)
 target_include_directories(gdbstub_test PRIVATE ${PROJECT_SOURCE_DIR}/test)
+
+add_executable(gdbstub_capi_test)
+target_sources(gdbstub_capi_test PRIVATE
+    test/gdbstub/test_main.cpp
+    test/gdbstub/test_capi.cpp
+)
+set_target_properties(gdbstub_capi_test PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/test
+    OUTPUT_NAME gdbstub_capi_test
+)
+target_link_libraries(gdbstub_capi_test PRIVATE gdbstub_c)
+gdbstub_apply_sanitizers(gdbstub_capi_test)
+target_include_directories(gdbstub_capi_test PRIVATE
+    ${PROJECT_SOURCE_DIR}/test
+    ${PROJECT_SOURCE_DIR}/bindings/capi/include
+)
 
 find_package(Threads REQUIRED)
 target_link_libraries(gdbstub_tool PRIVATE Threads::Threads)
 target_link_libraries(gdbstub_test PRIVATE Threads::Threads)
+target_link_libraries(gdbstub_capi_test PRIVATE Threads::Threads)
 
 if (WIN32)
     target_link_libraries(gdbstub PRIVATE ws2_32)
+    target_link_libraries(gdbstub_c PRIVATE ws2_32)
     target_link_libraries(gdbstub_tool PRIVATE ws2_32)
     target_link_libraries(gdbstub_test PRIVATE ws2_32)
+    target_link_libraries(gdbstub_capi_test PRIVATE ws2_32)
 endif()
 
 enable_testing()
 add_test(NAME gdbstub_test COMMAND gdbstub_test)
+add_test(NAME gdbstub_capi_test COMMAND gdbstub_capi_test)
 
 find_program(LLDB_EXECUTABLE lldb)
 find_package(Python3 COMPONENTS Interpreter)

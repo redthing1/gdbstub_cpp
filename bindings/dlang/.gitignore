@@ -1,0 +1,11 @@
+.dub/
+*.a
+*.o
+*.obj
+*.lib
+*.exe
+*.dll
+*test-library
+gdbstub_cpp_demo*
+gdbstub_cpp_e2e*
+libgdbstub*
