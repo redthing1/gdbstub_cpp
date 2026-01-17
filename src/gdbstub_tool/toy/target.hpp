@@ -91,22 +91,16 @@ public:
   explicit breakpoints_component(machine& machine) : machine_(machine) {}
 
   target_status set_breakpoint(const breakpoint_spec& request) {
-    if (request.type != breakpoint_type::software && request.type != breakpoint_type::hardware) {
-      if (request.type != breakpoint_type::watch_read && request.type != breakpoint_type::watch_write &&
-          request.type != breakpoint_type::watch_access) {
-        return target_status::unsupported;
-      }
+    if (!supports(request.type)) {
+      return target_status::unsupported;
     }
     machine_.add_breakpoint(request);
     return target_status::ok;
   }
 
   target_status remove_breakpoint(const breakpoint_spec& request) {
-    if (request.type != breakpoint_type::software && request.type != breakpoint_type::hardware) {
-      if (request.type != breakpoint_type::watch_read && request.type != breakpoint_type::watch_write &&
-          request.type != breakpoint_type::watch_access) {
-        return target_status::unsupported;
-      }
+    if (!supports(request.type)) {
+      return target_status::unsupported;
     }
     machine_.remove_breakpoint(request);
     return target_status::ok;
@@ -123,6 +117,18 @@ public:
   }
 
 private:
+  static bool supports(breakpoint_type type) {
+    switch (type) {
+      case breakpoint_type::software:
+      case breakpoint_type::hardware:
+      case breakpoint_type::watch_read:
+      case breakpoint_type::watch_write:
+      case breakpoint_type::watch_access:
+        return true;
+    }
+    return false;
+  }
+
   machine& machine_;
 };
 

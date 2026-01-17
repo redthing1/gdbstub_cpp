@@ -113,31 +113,40 @@ public:
 
   void add_breakpoint(const gdbstub::breakpoint_spec& spec) {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (spec.type == gdbstub::breakpoint_type::software) {
-      sw_breakpoints_.insert(spec.addr);
-      return;
+    switch (spec.type) {
+      case gdbstub::breakpoint_type::software:
+        sw_breakpoints_.insert(spec.addr);
+        return;
+      case gdbstub::breakpoint_type::hardware:
+        hw_breakpoints_.insert(spec.addr);
+        return;
+      case gdbstub::breakpoint_type::watch_read:
+      case gdbstub::breakpoint_type::watch_write:
+      case gdbstub::breakpoint_type::watch_access:
+        watchpoints_.push_back({spec.type, spec.addr, spec.length});
+        return;
     }
-    if (spec.type == gdbstub::breakpoint_type::hardware) {
-      hw_breakpoints_.insert(spec.addr);
-      return;
-    }
-    watchpoints_.push_back({spec.type, spec.addr, spec.length});
   }
 
   void remove_breakpoint(const gdbstub::breakpoint_spec& spec) {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (spec.type == gdbstub::breakpoint_type::software) {
-      sw_breakpoints_.erase(spec.addr);
-      return;
+    switch (spec.type) {
+      case gdbstub::breakpoint_type::software:
+        sw_breakpoints_.erase(spec.addr);
+        return;
+      case gdbstub::breakpoint_type::hardware:
+        hw_breakpoints_.erase(spec.addr);
+        return;
+      case gdbstub::breakpoint_type::watch_read:
+      case gdbstub::breakpoint_type::watch_write:
+      case gdbstub::breakpoint_type::watch_access: {
+        auto it = std::remove_if(watchpoints_.begin(), watchpoints_.end(), [&](const watchpoint& wp) {
+          return wp.type == spec.type && wp.addr == spec.addr && wp.length == spec.length;
+        });
+        watchpoints_.erase(it, watchpoints_.end());
+        return;
+      }
     }
-    if (spec.type == gdbstub::breakpoint_type::hardware) {
-      hw_breakpoints_.erase(spec.addr);
-      return;
-    }
-    auto it = std::remove_if(watchpoints_.begin(), watchpoints_.end(), [&](const watchpoint& wp) {
-      return wp.type == spec.type && wp.addr == spec.addr && wp.length == spec.length;
-    });
-    watchpoints_.erase(it, watchpoints_.end());
   }
 
   snapshot capture_snapshot() const {
@@ -264,6 +273,40 @@ private:
     return value;
   }
 
+  static bool watchpoint_matches(uint64_t access, uint64_t addr, uint32_t length) {
+    uint64_t size = length > 0 ? static_cast<uint64_t>(length) : 1;
+    return access >= addr && access < addr + size;
+  }
+
+  std::optional<stop_reason> watchpoint_hit(
+      uint64_t thread_id,
+      breakpoint_type type,
+      stop_kind kind,
+      uint64_t access
+  ) const {
+    for (const auto& wp : watchpoints_) {
+      if (wp.type == type && watchpoint_matches(access, wp.addr, wp.length)) {
+        return make_stop(kind, access, thread_id);
+      }
+    }
+    return std::nullopt;
+  }
+
+  std::optional<stop_reason> watch_access_hit(uint64_t thread_id, uint64_t read_addr, uint64_t write_addr) const {
+    for (const auto& wp : watchpoints_) {
+      if (wp.type != breakpoint_type::watch_access) {
+        continue;
+      }
+      bool read_hit = watchpoint_matches(read_addr, wp.addr, wp.length);
+      bool write_hit = watchpoint_matches(write_addr, wp.addr, wp.length);
+      if (read_hit || write_hit) {
+        auto addr = read_hit ? read_addr : write_addr;
+        return make_stop(stop_kind::watch_access, addr, thread_id);
+      }
+    }
+    return std::nullopt;
+  }
+
   std::optional<stop_reason> stop_if_breakpoint_locked(uint64_t thread_id) const {
     if (!valid_reg(pc_reg_num_)) {
       return std::nullopt;
@@ -283,30 +326,13 @@ private:
       uint64_t read_addr,
       uint64_t write_addr
   ) const {
-    auto matches = [](uint64_t access, uint64_t addr, uint32_t length) {
-      uint64_t size = length > 0 ? static_cast<uint64_t>(length) : 1;
-      return access >= addr && access < addr + size;
-    };
-
-    for (const auto& wp : watchpoints_) {
-      if (wp.type == gdbstub::breakpoint_type::watch_access) {
-        if (matches(read_addr, wp.addr, wp.length) || matches(write_addr, wp.addr, wp.length)) {
-          auto addr = matches(read_addr, wp.addr, wp.length) ? read_addr : write_addr;
-          return make_stop(stop_kind::watch_access, addr, thread_id);
-        }
-      }
+    if (auto stop = watch_access_hit(thread_id, read_addr, write_addr)) {
+      return stop;
     }
-    for (const auto& wp : watchpoints_) {
-      if (wp.type == gdbstub::breakpoint_type::watch_write && matches(write_addr, wp.addr, wp.length)) {
-        return make_stop(stop_kind::watch_write, write_addr, thread_id);
-      }
+    if (auto stop = watchpoint_hit(thread_id, breakpoint_type::watch_write, stop_kind::watch_write, write_addr)) {
+      return stop;
     }
-    for (const auto& wp : watchpoints_) {
-      if (wp.type == gdbstub::breakpoint_type::watch_read && matches(read_addr, wp.addr, wp.length)) {
-        return make_stop(stop_kind::watch_read, read_addr, thread_id);
-      }
-    }
-    return std::nullopt;
+    return watchpoint_hit(thread_id, breakpoint_type::watch_read, stop_kind::watch_read, read_addr);
   }
 
   static stop_reason make_stop(stop_kind kind, uint64_t addr, uint64_t thread_id) {

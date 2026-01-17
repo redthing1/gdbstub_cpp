@@ -96,33 +96,19 @@ public:
   }
 
   resume_result resume(const resume_request& request) {
-    auto thread_id = threads_.current_thread();
-    if (request.addr) {
-      machine_.set_pc(*request.addr);
-    }
+    const auto thread_id = threads_.current_thread();
+    apply_resume_address(request);
 
     if (request.direction == resume_direction::reverse) {
       return resume_reverse(request, thread_id);
     }
-
-    if (request.action == resume_action::range_step) {
-      if (!request.range) {
-        return make_error(target_status::invalid);
-      }
-      return run_range_blocking(thread_id, *request.range);
-    }
-
-    if (request.action == resume_action::step) {
-      return run_step(thread_id);
-    }
-
-    return resume_forward(thread_id);
+    return resume_forward(request, thread_id);
   }
 
   void interrupt() {
     stop_requested_.store(true);
     running_.store(false);
-    stops_.queue_stop(machine_.signal_stop(threads_.current_thread()));
+    stops_.queue_stop(signal_stop(threads_.current_thread()));
   }
 
   std::optional<stop_reason> poll_stop() {
@@ -146,6 +132,12 @@ public:
   std::optional<stop_reason> last_stop() { return stops_.last_stop(); }
 
 private:
+  void apply_resume_address(const resume_request& request) {
+    if (request.addr) {
+      machine_.set_pc(*request.addr);
+    }
+  }
+
   resume_result make_error(target_status status) {
     resume_result result;
     result.status = status;
@@ -166,22 +158,33 @@ private:
     return result;
   }
 
-  resume_result resume_forward(uint64_t thread_id) {
-    if (mode_ == execution_mode::blocking) {
-      return make_stopped(run_blocking(thread_id));
+  resume_result resume_forward(const resume_request& request, uint64_t thread_id) {
+    switch (request.action) {
+      case resume_action::range_step:
+        if (!request.range) {
+          return make_error(target_status::invalid);
+        }
+        return run_range_blocking(thread_id, *request.range);
+      case resume_action::step:
+        return run_step(thread_id);
+      case resume_action::cont:
+      default:
+        return resume_continue(thread_id);
     }
+  }
 
-    if (mode_ == execution_mode::polling) {
-      running_.store(true);
-      return make_running();
+  resume_result resume_continue(uint64_t thread_id) {
+    switch (mode_) {
+      case execution_mode::blocking:
+        return make_stopped(run_blocking(thread_id));
+      case execution_mode::polling:
+        running_.store(true);
+        return make_running();
+      case execution_mode::async:
+        start_async(thread_id);
+        return make_running();
     }
-
-    if (mode_ == execution_mode::async) {
-      start_async(thread_id);
-      return make_running();
-    }
-
-    return make_stopped(machine_.signal_stop(thread_id));
+    return make_stopped(signal_stop(thread_id));
   }
 
   void record_snapshot() {
@@ -221,7 +224,7 @@ private:
     if (auto stop = forward_step(thread_id)) {
       return make_stopped(*stop);
     }
-    return make_stopped(machine_.signal_stop(thread_id));
+    return make_stopped(signal_stop(thread_id));
   }
 
   resume_result run_range_blocking(uint64_t thread_id, const address_range& range) {
@@ -233,23 +236,23 @@ private:
     }
 
     if (range.start == range.end) {
-      return make_stopped(machine_.signal_stop(thread_id));
+      return make_stopped(signal_stop(thread_id));
     }
 
     if (!in_range(machine_.pc())) {
-      return make_stopped(machine_.signal_stop(thread_id));
+      return make_stopped(signal_stop(thread_id));
     }
 
     for (size_t i = 0; i < max_steps_; ++i) {
       if (!in_range(machine_.pc())) {
-        return make_stopped(machine_.signal_stop(thread_id));
+        return make_stopped(signal_stop(thread_id));
       }
       if (auto stop = forward_step(thread_id)) {
         return make_stopped(*stop);
       }
     }
 
-    return make_stopped(machine_.signal_stop(thread_id));
+    return make_stopped(signal_stop(thread_id));
   }
 
   resume_result resume_reverse(const resume_request& request, uint64_t thread_id) {
@@ -257,14 +260,15 @@ private:
       return make_error(target_status::unsupported);
     }
 
-    if (request.action == resume_action::range_step) {
-      return make_error(target_status::unsupported);
+    switch (request.action) {
+      case resume_action::range_step:
+        return make_error(target_status::unsupported);
+      case resume_action::step:
+        return reverse_step(thread_id);
+      case resume_action::cont:
+      default:
+        return reverse_continue(thread_id);
     }
-
-    if (request.action == resume_action::step) {
-      return reverse_step(thread_id);
-    }
-    return reverse_continue(thread_id);
   }
 
   stop_reason replay_log_begin_stop(uint64_t thread_id) const {
@@ -289,7 +293,7 @@ private:
     if (auto stop = restore_previous(thread_id)) {
       return make_stopped(*stop);
     }
-    return make_stopped(machine_.signal_stop(thread_id));
+    return make_stopped(signal_stop(thread_id));
   }
 
   resume_result reverse_continue(uint64_t thread_id) {
@@ -298,7 +302,7 @@ private:
         return make_stopped(*stop);
       }
     }
-    return make_stopped(machine_.signal_stop(thread_id));
+    return make_stopped(signal_stop(thread_id));
   }
 
   stop_reason run_blocking(uint64_t thread_id) {
@@ -307,7 +311,7 @@ private:
         return *stop;
       }
     }
-    return machine_.signal_stop(thread_id);
+    return signal_stop(thread_id);
   }
 
   void start_async(uint64_t thread_id) {
@@ -317,7 +321,7 @@ private:
     worker_ = std::thread([this, thread_id]() {
       for (size_t i = 0; i < max_steps_; ++i) {
         if (stop_requested_.load()) {
-          stops_.queue_stop(machine_.signal_stop(thread_id));
+          stops_.queue_stop(signal_stop(thread_id));
           running_.store(false);
           return;
         }
@@ -328,7 +332,7 @@ private:
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
       }
-      stops_.queue_stop(machine_.signal_stop(thread_id));
+      stops_.queue_stop(signal_stop(thread_id));
       running_.store(false);
     });
   }
@@ -340,6 +344,8 @@ private:
     }
     running_.store(false);
   }
+
+  stop_reason signal_stop(uint64_t thread_id) const { return machine_.signal_stop(thread_id); }
 
   machine& machine_;
   threads& threads_;
