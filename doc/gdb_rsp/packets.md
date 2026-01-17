@@ -59,7 +59,7 @@ Here are the packet descriptions.
     Packets](about:blank/Stop-Reply-Packets.html#Stop-Reply-Packets), for the reply
     specifications.
 
-‘`A arglen,argnum,arg,…`’
+‘`A arglen,argnum,arg,...`’
 :   Initialized `argv[]` array passed into program. arglen specifies the number of
     bytes in the hex encoded byte stream arg. See `gdbserver` for more details.
 
@@ -161,7 +161,7 @@ Here are the packet descriptions.
 
     Reply:
 
-    ‘`XX…`’
+    ‘`XX...`’
     :   Each byte of register data is described by two hex digits. The bytes with the
         register are transmitted in target byte order. The size of each register and
         their position within the ‘`g`’ packet are determined by the target description
@@ -189,12 +189,11 @@ Here are the packet descriptions.
         ```
         -> g
         <- xxxxxxxx00000000xxxxxxxx00000000
-
         ```
 
-‘`G XX…`’
+‘`G XX...`’
 :   Write general registers. See [read registers packet](#read-registers-packet),
-    for a description of the XX… data.
+    for a description of the XX... data.
 
     Reply:
 
@@ -256,7 +255,7 @@ Here are the packet descriptions.
 
     Reply:
 
-    ‘`XX…`’
+    ‘`XX...`’
     :   Memory contents; each byte is transmitted as a two-digit hexadecimal number. The
         reply may contain fewer addressable memory units than requested if the server
         was reading from a trace frame memory and was able to read only part of the
@@ -269,10 +268,10 @@ Here are the packet descriptions.
     the `error-message` feature (see
     [error-message](about:blank/General-Query-Packets.html#error_002dmessage)).
 
-‘`M addr,length:XX…`’
+‘`M addr,length:XX...`’
 :   Write length addressable memory units starting at address addr (see [addressable
     memory unit](about:blank/Memory.html#addressable-memory-unit)). The data is
-    given by XX…; each byte is transmitted as a two-digit hexadecimal number.
+    given by XX...; each byte is transmitted as a two-digit hexadecimal number.
 
     Reply:
 
@@ -287,11 +286,11 @@ Here are the packet descriptions.
 
     Reply:
 
-    ‘`XX…`’
+    ‘`XX...`’
     :   the register’s value
 
-‘`P n…=r…`’
-:   Write register n… with value r…. The register number n is in hexadecimal, and r…
+‘`P n...=r...`’
+:   Write register n... with value r.... The register number n is in hexadecimal, and r...
     contains two hex digits for each byte in the register (target byte order).
 
     Reply:
@@ -299,9 +298,9 @@ Here are the packet descriptions.
     ‘`OK`’
     :   for success
 
-‘`q name params…`’
+‘`q name params...`’
 
-‘`Q name params…`’
+‘`Q name params...`’
 :   General query (‘`q`’) and set (‘`Q`’). These packets are described fully in
     [General Query
     Packets](about:blank/General-Query-Packets.html#General-Query-Packets).
@@ -374,7 +373,7 @@ Here are the packet descriptions.
     :   for success in non-stop mode (see [Remote
         Non-Stop](about:blank/Remote-Non_002dStop.html#Remote-Non_002dStop))
 
-‘`vCont[;action[:thread-id]]…`’
+‘`vCont[;action[:thread-id]]...`’
 :   Resume the inferior, specifying different actions for each thread.
 
     For each inferior thread, the leftmost action with a matching thread-id is
@@ -450,7 +449,7 @@ Here are the packet descriptions.
 
     Reply:
 
-    ‘`vCont[;action…]`’
+    ‘`vCont[;action...]`’
     :   The ‘`vCont`’ packet is supported. Each action is a supported command in the
         ‘`vCont`’ packet.
 
@@ -467,7 +466,7 @@ Here are the packet descriptions.
     ‘`OK`’
     :   for success
 
-‘`vFile:operation:parameter…`’
+‘`vFile:operation:parameter...`’
 :   Perform a file operation on the target system. For details, see [Host I/O
     Packets](about:blank/Host-I_002fO-Packets.html#Host-I_002fO-Packets).
 
@@ -485,7 +484,7 @@ Here are the packet descriptions.
     ‘`OK`’
     :   for success
 
-‘`vFlashWrite:addr:XX…`’
+‘`vFlashWrite:addr:XX...`’
 :   Direct the stub to write data to flash address addr. The data is passed in
     binary form using the same encoding as for the ‘`X`’ packet (see [Binary
     Data](about:blank/Overview.html#Binary-Data)). The memory ranges specified by
@@ -533,11 +532,17 @@ Here are the packet descriptions.
     other unknown ‘`v`’ packets then it is possible that GDB may run into problems
     in other areas, specifically around use of ‘`vFile:setfs:`’.
 
-‘`vRun;filename[;argument]…`’
+‘`vRun;filename[;argument]...`’
 :   Run the program filename, passing it each argument on its command line. The file
     and arguments are hex-encoded strings. If filename is an empty string, the stub
     may use a default program (e.g. the last program run). The program is created in
     the stopped state.
+
+    If GDB sent the ‘`single-inf-arg`’ feature in the ‘`qSupported`’ packet (see
+    [single-inf-arg](about:blank/General-Query-Packets.html#single_002dinf_002darg)),
+    and the stub replied with ‘`single-inf-arg+`’, then there will only be a single
+    argument string, which includes all inferior arguments, separated with
+    whitespace.
 
     This packet is only available in extended mode (see [extended
     mode](#extended-mode)).
@@ -568,7 +573,7 @@ Here are the packet descriptions.
 
     Reply:
 
-    ‘`b XX…`’
+    ‘`b XX...`’
     :   Memory contents as binary data (see [Binary
         Data](about:blank/Overview.html#Binary-Data)). The reply may contain fewer
         addressable memory units than requested if the server was reading from a trace
@@ -577,11 +582,11 @@ Here are the packet descriptions.
     ‘`E NN`’
     :   for an error
 
-‘`X addr,length:XX…`’
+‘`X addr,length:XX...`’
 :   Write data to memory, where the data is transmitted in binary. Memory is
     specified by its address addr and number of addressable memory units length (see
     [addressable memory unit](about:blank/Memory.html#addressable-memory-unit));
-    ‘`XX…`’ is binary data (see [Binary
+    ‘`XX...`’ is binary data (see [Binary
     Data](about:blank/Overview.html#Binary-Data)).
 
     Reply:
@@ -599,13 +604,13 @@ Here are the packet descriptions.
 
     *Implementation notes: A remote target shall return an empty string for an
     unrecognized breakpoint or watchpoint packet type. A remote target shall support
-    either both or neither of a given ‘`Ztype…`’ and ‘`ztype…`’ packet pair. To
+    either both or neither of a given ‘`Ztype...`’ and ‘`ztype...`’ packet pair. To
     avoid potential problems with duplicate packets, the operations should be
     implemented in an idempotent way.*
 
 ‘`z0,addr,kind`’
 
-‘`Z0,addr,kind[;cond_list…][;cmds:persist,cmd_list…]`’
+‘`Z0,addr,kind[;cond_list...][;cmds:persist,cmd_list...]`’
 :   Insert (‘`Z0`’) or remove (‘`z0`’) a software breakpoint at address addr of type
     kind.
 
@@ -655,7 +660,7 @@ Here are the packet descriptions.
 
 ‘`z1,addr,kind`’
 
-‘`Z1,addr,kind[;cond_list…][;cmds:persist,cmd_list…]`’
+‘`Z1,addr,kind[;cond_list...][;cmds:persist,cmd_list...]`’
 :   Insert (‘`Z1`’) or remove (‘`z1`’) a hardware breakpoint at address addr.
 
     A hardware breakpoint is implemented using a mechanism that is not dependent on
