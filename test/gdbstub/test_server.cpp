@@ -722,6 +722,11 @@ TEST_CASE("server serves target xml via qXfer") {
   auto out = send_packet(server, *transport_ptr, "qXfer:features:read:target.xml:0,10");
   REQUIRE(out.packets.size() == 1);
   CHECK(out.packets[0].payload[0] == 'm');
+
+  // compatibility for a weird packet i see sometimes
+  auto out_empty = send_packet(server, *transport_ptr, "qXfer:features:read::0,10");
+  REQUIRE(out_empty.packets.size() == 1);
+  CHECK(out_empty.packets[0].payload[0] == 'm');
 }
 
 TEST_CASE("server sets breakpoints and continues") {

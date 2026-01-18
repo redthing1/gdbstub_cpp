@@ -1641,13 +1641,26 @@ void server::handle_shlib_info_addr() {
 }
 
 void server::handle_xfer(std::string_view args) {
-  if (args.rfind("features:read:target.xml:", 0) == 0) {
+  constexpr std::string_view k_features_prefix = "features:read:";
+  if (args.rfind(k_features_prefix, 0) == 0) {
+    auto rest = args.substr(k_features_prefix.size());
+    auto annex_end = rest.find(':');
+    if (annex_end == std::string_view::npos) {
+      send_error(0x01);
+      return;
+    }
+    auto annex = rest.substr(0, annex_end);
+    auto range = rest.substr(annex_end + 1);
+    auto resolved_annex = annex.empty() ? std::string_view("target.xml") : annex;
+    if (resolved_annex != "target.xml") {
+      send_packet("");
+      return;
+    }
     if (arch_.target_xml.empty()) {
       send_error(0x01);
       return;
     }
 
-    auto range = args.substr(25);
     auto comma = range.find(',');
     if (comma == std::string_view::npos) {
       send_error(0x01);
