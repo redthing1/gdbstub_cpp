@@ -173,6 +173,20 @@ typedef struct gdbstub_shlib_info {
   uint64_t info_addr;
 } gdbstub_shlib_info;
 
+typedef enum gdbstub_offsets_kind {
+  GDBSTUB_OFFSETS_SECTION = 0,
+  GDBSTUB_OFFSETS_SEGMENT = 1,
+} gdbstub_offsets_kind;
+
+typedef struct gdbstub_offsets_info {
+  gdbstub_offsets_kind kind;
+  uint64_t text;
+  uint8_t has_data;
+  uint64_t data;
+  uint8_t has_bss;
+  uint64_t bss;
+} gdbstub_offsets_info;
+
 typedef struct gdbstub_register_info {
   gdbstub_string_view name;
   uint8_t has_alt_name;
@@ -272,6 +286,7 @@ typedef uint8_t (*gdbstub_thread_stop_reason_fn)(void* ctx, uint64_t tid, gdbstu
 typedef uint8_t (*gdbstub_get_host_info_fn)(void* ctx, gdbstub_host_info* out);
 typedef uint8_t (*gdbstub_get_process_info_fn)(void* ctx, gdbstub_process_info* out);
 typedef uint8_t (*gdbstub_get_shlib_info_fn)(void* ctx, gdbstub_shlib_info* out);
+typedef uint8_t (*gdbstub_get_offsets_info_fn)(void* ctx, gdbstub_offsets_info* out);
 typedef uint8_t (*gdbstub_get_register_info_fn)(void* ctx, int regno, gdbstub_register_info* out);
 
 typedef struct gdbstub_regs_iface {
@@ -334,6 +349,11 @@ typedef struct gdbstub_shlib_info_iface {
   gdbstub_get_shlib_info_fn get_shlib_info;
 } gdbstub_shlib_info_iface;
 
+typedef struct gdbstub_offsets_info_iface {
+  void* ctx;
+  gdbstub_get_offsets_info_fn get_offsets_info;
+} gdbstub_offsets_info_iface;
+
 typedef struct gdbstub_register_info_iface {
   void* ctx;
   gdbstub_get_register_info_fn get_register_info;
@@ -349,6 +369,7 @@ typedef struct gdbstub_target_config {
   const gdbstub_host_info_iface* host;
   const gdbstub_process_info_iface* process;
   const gdbstub_shlib_info_iface* shlib;
+  const gdbstub_offsets_info_iface* offsets;
   const gdbstub_register_info_iface* reg_info;
 } gdbstub_target_config;
 

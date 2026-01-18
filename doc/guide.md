@@ -461,6 +461,7 @@ These are purely informational and are only used if you provide them:
 std::optional<gdbstub::host_info> get_host_info();
 std::optional<gdbstub::process_info> get_process_info();
 std::optional<gdbstub::shlib_info> get_shlib_info();
+std::optional<gdbstub::offsets_info> get_offsets_info();
 ```
 
 You can omit them entirely if you do not have meaningful data. The server will

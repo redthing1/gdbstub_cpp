@@ -715,6 +715,11 @@ void server::handle_query(std::string_view args) {
     return;
   }
 
+  if (name == "Offsets") {
+    handle_offsets();
+    return;
+  }
+
   if (name == "Attached") {
     send_packet("1");
     return;
@@ -1638,6 +1643,48 @@ void server::handle_shlib_info_addr() {
   }
 
   send_packet(rsp::encode_hex(buffer));
+}
+
+void server::handle_offsets() {
+  if (!target_.offsets) {
+    send_packet("");
+    return;
+  }
+
+  auto info = target_.offsets->get_offsets_info();
+  if (!info) {
+    send_packet("");
+    return;
+  }
+
+  std::string response;
+  switch (info->kind) {
+  case offsets_kind::section:
+    if (!info->data) {
+      send_packet("");
+      return;
+    }
+    response = "Text=" + hex_u64(info->text) + ";Data=" + hex_u64(*info->data);
+    if (info->bss) {
+      response += ";Bss=" + hex_u64(*info->bss);
+    }
+    break;
+  case offsets_kind::segment:
+    if (info->bss) {
+      send_packet("");
+      return;
+    }
+    response = "TextSeg=" + hex_u64(info->text);
+    if (info->data) {
+      response += ";DataSeg=" + hex_u64(*info->data);
+    }
+    break;
+  default:
+    send_packet("");
+    return;
+  }
+
+  send_packet(response);
 }
 
 void server::handle_xfer(std::string_view args) {

@@ -97,6 +97,7 @@ private:
   void handle_process_info();
   void handle_memory_region_info(std::string_view addr_str);
   void handle_shlib_info_addr();
+  void handle_offsets();
   void handle_threads_info();
   void handle_thread_extended_info(std::string_view args);
 

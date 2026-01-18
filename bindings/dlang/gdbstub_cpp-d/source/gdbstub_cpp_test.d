@@ -69,6 +69,7 @@ private class TestTarget {
             .withHostInfo(&hostInfo)
             .withProcessInfo(&processInfo)
             .withShlibInfo(&shlibInfo)
+            .withOffsetsInfo(&offsetsInfo)
             .withBreakpoints(&setBreakpoint, &removeBreakpoint, breakCapsFn)
             .withRegisterInfo(&registerInfo)
             .withThreads(
@@ -214,6 +215,15 @@ private class TestTarget {
     Nullable!ShlibInfo shlibInfo() {
         ShlibInfo info;
         info.infoAddr = nullable(0x11223344UL);
+        return nullable(info);
+    }
+
+    Nullable!OffsetsInfo offsetsInfo() {
+        OffsetsInfo info;
+        info.kind = OffsetsKind.section;
+        info.text = 0x1000;
+        info.data = nullable(0x2000UL);
+        info.bss = nullable(0x3000UL);
         return nullable(info);
     }
 
@@ -673,6 +683,9 @@ private void runBasicProtocolChecks(IntegrationMode mode) {
 
     client.sendPacket("qShlibInfoAddr");
     assert(client.readPacket() == hexEncodeU64Sized(0x11223344UL, 4));
+
+    client.sendPacket("qOffsets");
+    assert(client.readPacket() == "Text=1000;Data=2000;Bss=3000");
 
     client.sendPacket("qfThreadInfo");
     auto threadList = client.readPacket();

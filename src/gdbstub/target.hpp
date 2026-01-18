@@ -182,6 +182,43 @@ struct shlib_info {
   std::optional<uint64_t> info_addr;
 };
 
+enum class offsets_kind {
+  section,
+  segment,
+};
+
+struct offsets_info {
+  offsets_kind kind = offsets_kind::section;
+  uint64_t text = 0;
+  std::optional<uint64_t> data;
+  std::optional<uint64_t> bss;
+
+  static offsets_info section(
+      uint64_t text_value,
+      uint64_t data_value,
+      std::optional<uint64_t> bss_value = std::nullopt
+  ) {
+    offsets_info info;
+    info.kind = offsets_kind::section;
+    info.text = text_value;
+    info.data = data_value;
+    info.bss = bss_value;
+    return info;
+  }
+
+  static offsets_info segment(
+      uint64_t text_value,
+      std::optional<uint64_t> data_value = std::nullopt
+  ) {
+    offsets_info info;
+    info.kind = offsets_kind::segment;
+    info.text = text_value;
+    info.data = data_value;
+    info.bss.reset();
+    return info;
+  }
+};
+
 struct register_info {
   std::string name;
   std::optional<std::string> alt_name;
@@ -338,6 +375,13 @@ struct shlib_view {
   std::optional<shlib_info> get_shlib_info() const { return get_shlib_info_fn(ctx); }
 };
 
+struct offsets_view {
+  void* ctx = nullptr;
+  std::optional<offsets_info> (*get_offsets_info_fn)(void* ctx) = nullptr;
+
+  std::optional<offsets_info> get_offsets_info() const { return get_offsets_info_fn(ctx); }
+};
+
 struct register_info_view {
   void* ctx = nullptr;
   std::optional<register_info> (*get_register_info_fn)(void* ctx, int regno) = nullptr;
@@ -355,6 +399,7 @@ struct target_view {
   std::optional<host_info_view> host;
   std::optional<process_info_view> process;
   std::optional<shlib_view> shlib;
+  std::optional<offsets_view> offsets;
   std::optional<register_info_view> reg_info;
 };
 
@@ -463,6 +508,11 @@ concept process_info_capability = requires(T& t) {
 template <typename T>
 concept shlib_capability = requires(T& t) {
   { t.get_shlib_info() } -> std::same_as<std::optional<shlib_info>>;
+};
+
+template <typename T>
+concept offsets_capability = requires(T& t) {
+  { t.get_offsets_info() } -> std::same_as<std::optional<offsets_info>>;
 };
 
 template <typename T>
@@ -603,6 +653,16 @@ shlib_view make_shlib_view(T& shlib) {
 }
 
 template <typename T>
+offsets_view make_offsets_view(T& offsets) {
+  offsets_view view;
+  view.ctx = std::addressof(offsets);
+  view.get_offsets_info_fn = [](void* ctx) -> std::optional<offsets_info> {
+    return static_cast<T*>(ctx)->get_offsets_info();
+  };
+  return view;
+}
+
+template <typename T>
 register_info_view make_register_info_view(T& reg_info) {
   register_info_view view;
   view.ctx = std::addressof(reg_info);
@@ -619,7 +679,7 @@ void assign_optional(target_view& view, T& obj) {
   static_assert(!run_capability<T>, "Optional capability object implements run control; pass it as run.");
   constexpr int matches = breakpoints_capability<T> + threads_capability<T> + memory_layout_capability<T> +
                           host_info_capability<T> + process_info_capability<T> + shlib_capability<T> +
-                          register_info_capability<T>;
+                          offsets_capability<T> + register_info_capability<T>;
   static_assert(matches >= 1, "Optional capability object must implement at least one optional capability.");
 
   if constexpr (breakpoints_capability<T>) {
@@ -639,6 +699,9 @@ void assign_optional(target_view& view, T& obj) {
   }
   if constexpr (shlib_capability<T>) {
     view.shlib = make_shlib_view(obj);
+  }
+  if constexpr (offsets_capability<T>) {
+    view.offsets = make_offsets_view(obj);
   }
   if constexpr (register_info_capability<T>) {
     view.reg_info = make_register_info_view(obj);
@@ -665,6 +728,8 @@ target make_target(Regs& regs, Mem& mem, Run& run, Opts&... opts) {
   static_assert(process_count <= 1, "Process info capability provided multiple times.");
   constexpr int shlib_count = (0 + ... + detail::shlib_capability<Opts>);
   static_assert(shlib_count <= 1, "Shlib capability provided multiple times.");
+  constexpr int offsets_count = (0 + ... + detail::offsets_capability<Opts>);
+  static_assert(offsets_count <= 1, "Offsets capability provided multiple times.");
   constexpr int reg_info_count = (0 + ... + detail::register_info_capability<Opts>);
   static_assert(reg_info_count <= 1, "Register info capability provided multiple times.");
 

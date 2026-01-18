@@ -44,6 +44,7 @@ struct capi_state {
   gdbstub_host_info host{};
   gdbstub_process_info process{};
   gdbstub_shlib_info shlib{};
+  gdbstub_offsets_info offsets{};
 
   gdbstub_register_info reg_info{};
   gdbstub_slice_int reg_info_container_slice{};
@@ -62,6 +63,7 @@ struct capi_state {
   gdbstub_host_info_iface host_iface{};
   gdbstub_process_info_iface process_iface{};
   gdbstub_shlib_info_iface shlib_iface{};
+  gdbstub_offsets_info_iface offsets_iface{};
   gdbstub_register_info_iface reg_info_iface{};
   gdbstub_target_config config{};
 };
@@ -125,6 +127,13 @@ static void init_state(capi_state& state) {
 
   state.shlib.has_info_addr = 1;
   state.shlib.info_addr = 0x11223344;
+
+  state.offsets.kind = GDBSTUB_OFFSETS_SECTION;
+  state.offsets.text = 0x1000;
+  state.offsets.has_data = 1;
+  state.offsets.data = 0x2000;
+  state.offsets.has_bss = 1;
+  state.offsets.bss = 0x3000;
 
   state.reg_info.name = make_view("r0");
   state.reg_info.has_alt_name = 1;
@@ -396,6 +405,15 @@ static uint8_t get_shlib_info(void* ctx, gdbstub_shlib_info* out) {
   return 1;
 }
 
+static uint8_t get_offsets_info(void* ctx, gdbstub_offsets_info* out) {
+  auto* state = static_cast<capi_state*>(ctx);
+  if (!out) {
+    return 0;
+  }
+  *out = state->offsets;
+  return 1;
+}
+
 static uint8_t get_register_info(void* ctx, int regno, gdbstub_register_info* out) {
   auto* state = static_cast<capi_state*>(ctx);
   if (!out || regno != 0) {
@@ -448,6 +466,9 @@ static void setup_config(capi_state& state) {
   state.shlib_iface.ctx = &state;
   state.shlib_iface.get_shlib_info = &get_shlib_info;
 
+  state.offsets_iface.ctx = &state;
+  state.offsets_iface.get_offsets_info = &get_offsets_info;
+
   state.reg_info_iface.ctx = &state;
   state.reg_info_iface.get_register_info = &get_register_info;
 
@@ -460,6 +481,7 @@ static void setup_config(capi_state& state) {
   state.config.host = &state.host_iface;
   state.config.process = &state.process_iface;
   state.config.shlib = &state.shlib_iface;
+  state.config.offsets = &state.offsets_iface;
   state.config.reg_info = &state.reg_info_iface;
 }
 
@@ -613,6 +635,11 @@ TEST_CASE("capi tcp integration handles core packets") {
   auto shlib = wait_for_reply(server_handle.server, client, std::chrono::milliseconds(200));
   REQUIRE(shlib.has_value());
   CHECK(shlib->payload == "11223344");
+
+  REQUIRE(client.send_packet("qOffsets"));
+  auto offsets = wait_for_reply(server_handle.server, client, std::chrono::milliseconds(200));
+  REQUIRE(offsets.has_value());
+  CHECK(offsets->payload == "Text=1000;Data=2000;Bss=3000");
 
   REQUIRE(client.send_packet("Z0,1008,4"));
   auto bp = wait_for_reply(server_handle.server, client, std::chrono::milliseconds(200));

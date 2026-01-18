@@ -199,6 +199,16 @@ gdbstub::shlib_info to_shlib_info(const gdbstub_shlib_info& info) {
   return out;
 }
 
+gdbstub::offsets_info to_offsets_info(const gdbstub_offsets_info& info) {
+  gdbstub::offsets_info out;
+  out.kind = info.kind == GDBSTUB_OFFSETS_SEGMENT ? gdbstub::offsets_kind::segment
+                                                  : gdbstub::offsets_kind::section;
+  out.text = info.text;
+  out.data = opt_value(info.has_data != 0, info.data);
+  out.bss = opt_value(info.has_bss != 0, info.bss);
+  return out;
+}
+
 gdbstub::register_info to_register_info(const gdbstub_register_info& info) {
   gdbstub::register_info out;
   out.name = to_string(info.name);
@@ -242,6 +252,7 @@ struct c_target {
   std::optional<gdbstub_host_info_iface> host;
   std::optional<gdbstub_process_info_iface> process;
   std::optional<gdbstub_shlib_info_iface> shlib;
+  std::optional<gdbstub_offsets_info_iface> offsets;
   std::optional<gdbstub_register_info_iface> reg_info;
   std::optional<gdbstub::stop_notifier> stop_notifier;
 
@@ -264,6 +275,9 @@ struct c_target {
     }
     if (config.shlib) {
       shlib = *config.shlib;
+    }
+    if (config.offsets) {
+      offsets = *config.offsets;
     }
     if (config.reg_info) {
       reg_info = *config.reg_info;
@@ -529,6 +543,15 @@ struct c_target {
     return to_shlib_info(info);
   }
 
+  static std::optional<gdbstub::offsets_info> offsets_info_tramp(void* ctx) {
+    auto* self = static_cast<c_target*>(ctx);
+    gdbstub_offsets_info info{};
+    if (!self->offsets->get_offsets_info(self->offsets->ctx, &info)) {
+      return std::nullopt;
+    }
+    return to_offsets_info(info);
+  }
+
   static std::optional<gdbstub::register_info> register_info_tramp(void* ctx, int regno) {
     auto* self = static_cast<c_target*>(ctx);
     gdbstub_register_info info{};
@@ -606,6 +629,13 @@ struct c_target {
       sv.ctx = this;
       sv.get_shlib_info_fn = &shlib_info_tramp;
       view.shlib = sv;
+    }
+
+    if (offsets) {
+      gdbstub::offsets_view ov;
+      ov.ctx = this;
+      ov.get_offsets_info_fn = &offsets_info_tramp;
+      view.offsets = ov;
     }
 
     if (reg_info) {

@@ -90,6 +90,7 @@ struct mock_state {
   std::optional<gdbstub::stop_reason> stop_for_threads;
   std::optional<gdbstub::stop_reason> resume_stop;
   std::optional<gdbstub::shlib_info> shlib;
+  std::optional<gdbstub::offsets_info> offsets;
   std::optional<gdbstub::resume_request> last_resume;
   std::optional<uint64_t> last_set_thread;
   std::optional<gdbstub::breakpoint_spec> last_breakpoint;
@@ -273,6 +274,12 @@ struct mock_shlib {
   std::optional<gdbstub::shlib_info> get_shlib_info() { return state.shlib; }
 };
 
+struct mock_offsets {
+  mock_state& state;
+
+  std::optional<gdbstub::offsets_info> get_offsets_info() { return state.offsets; }
+};
+
 struct mock_register_info {
   std::optional<gdbstub::register_info> get_register_info(int regno) {
     if (regno < 0 || regno >= 3) {
@@ -304,6 +311,7 @@ struct mock_components {
   mock_host host{};
   mock_process process{};
   mock_shlib shlib{state};
+  mock_offsets offsets{state};
   mock_register_info reg_info{};
 };
 
@@ -349,6 +357,7 @@ gdbstub::target make_target(mock_components& target) {
       target.host,
       target.process,
       target.shlib,
+      target.offsets,
       target.reg_info
   );
 }
@@ -1269,6 +1278,135 @@ TEST_CASE("server responds to qShlibInfoAddr when available") {
   REQUIRE(out.ack_count == 1);
   REQUIRE(out.packets.size() == 1);
   CHECK(out.packets[0].payload == "11223344");
+}
+
+TEST_CASE("server responds to qOffsets with section offsets") {
+  mock_state state;
+  mock_components target(state);
+  state.offsets = gdbstub::offsets_info::section(0x1000, 0x2000, 0x3000);
+
+  gdbstub::arch_spec arch;
+  arch.reg_count = 3;
+
+  auto transport = std::make_unique<loopback_transport>();
+  auto* transport_ptr = transport.get();
+  gdbstub::server server(make_target(target), arch, std::move(transport));
+
+  REQUIRE(server.listen("loop"));
+  REQUIRE(server.wait_for_connection());
+
+  auto out = send_packet(server, *transport_ptr, "qOffsets");
+  REQUIRE(out.ack_count == 1);
+  REQUIRE(out.packets.size() == 1);
+  CHECK(out.packets[0].payload == "Text=1000;Data=2000;Bss=3000");
+}
+
+TEST_CASE("server responds to qOffsets without bss") {
+  mock_state state;
+  mock_components target(state);
+  state.offsets = gdbstub::offsets_info::section(0x1000, 0x2000);
+
+  gdbstub::arch_spec arch;
+  arch.reg_count = 3;
+
+  auto transport = std::make_unique<loopback_transport>();
+  auto* transport_ptr = transport.get();
+  gdbstub::server server(make_target(target), arch, std::move(transport));
+
+  REQUIRE(server.listen("loop"));
+  REQUIRE(server.wait_for_connection());
+
+  auto out = send_packet(server, *transport_ptr, "qOffsets");
+  REQUIRE(out.ack_count == 1);
+  REQUIRE(out.packets.size() == 1);
+  CHECK(out.packets[0].payload == "Text=1000;Data=2000");
+}
+
+TEST_CASE("server responds to qOffsets with segment offsets") {
+  mock_state state;
+  mock_components target(state);
+  state.offsets = gdbstub::offsets_info::segment(0x4000, 0x5000);
+
+  gdbstub::arch_spec arch;
+  arch.reg_count = 3;
+
+  auto transport = std::make_unique<loopback_transport>();
+  auto* transport_ptr = transport.get();
+  gdbstub::server server(make_target(target), arch, std::move(transport));
+
+  REQUIRE(server.listen("loop"));
+  REQUIRE(server.wait_for_connection());
+
+  auto out = send_packet(server, *transport_ptr, "qOffsets");
+  REQUIRE(out.ack_count == 1);
+  REQUIRE(out.packets.size() == 1);
+  CHECK(out.packets[0].payload == "TextSeg=4000;DataSeg=5000");
+}
+
+TEST_CASE("server responds to qOffsets with text segment only") {
+  mock_state state;
+  mock_components target(state);
+  state.offsets = gdbstub::offsets_info::segment(0x4000);
+
+  gdbstub::arch_spec arch;
+  arch.reg_count = 3;
+
+  auto transport = std::make_unique<loopback_transport>();
+  auto* transport_ptr = transport.get();
+  gdbstub::server server(make_target(target), arch, std::move(transport));
+
+  REQUIRE(server.listen("loop"));
+  REQUIRE(server.wait_for_connection());
+
+  auto out = send_packet(server, *transport_ptr, "qOffsets");
+  REQUIRE(out.ack_count == 1);
+  REQUIRE(out.packets.size() == 1);
+  CHECK(out.packets[0].payload == "TextSeg=4000");
+}
+
+TEST_CASE("server returns empty reply for invalid qOffsets data") {
+  mock_state state;
+  mock_components target(state);
+  gdbstub::offsets_info info;
+  info.kind = gdbstub::offsets_kind::segment;
+  info.text = 0x1000;
+  info.bss = 0x20;
+  state.offsets = info;
+
+  gdbstub::arch_spec arch;
+  arch.reg_count = 3;
+
+  auto transport = std::make_unique<loopback_transport>();
+  auto* transport_ptr = transport.get();
+  gdbstub::server server(make_target(target), arch, std::move(transport));
+
+  REQUIRE(server.listen("loop"));
+  REQUIRE(server.wait_for_connection());
+
+  auto out = send_packet(server, *transport_ptr, "qOffsets");
+  REQUIRE(out.ack_count == 1);
+  REQUIRE(out.packets.size() == 1);
+  CHECK(out.packets[0].payload == "");
+}
+
+TEST_CASE("server returns empty reply for missing qOffsets data") {
+  mock_state state;
+  mock_components target(state);
+
+  gdbstub::arch_spec arch;
+  arch.reg_count = 3;
+
+  auto transport = std::make_unique<loopback_transport>();
+  auto* transport_ptr = transport.get();
+  gdbstub::server server(make_target(target), arch, std::move(transport));
+
+  REQUIRE(server.listen("loop"));
+  REQUIRE(server.wait_for_connection());
+
+  auto out = send_packet(server, *transport_ptr, "qOffsets");
+  REQUIRE(out.ack_count == 1);
+  REQUIRE(out.packets.size() == 1);
+  CHECK(out.packets[0].payload == "");
 }
 
 TEST_CASE("server responds to jThreadsInfo") {

@@ -62,6 +62,11 @@ public enum BreakpointType : int {
     watchAccess = gdbstub_breakpoint_type.GDBSTUB_BREAKPOINT_WATCH_ACCESS,
 }
 
+public enum OffsetsKind : int {
+    section = gdbstub_offsets_kind.GDBSTUB_OFFSETS_SECTION,
+    segment = gdbstub_offsets_kind.GDBSTUB_OFFSETS_SEGMENT,
+}
+
 public struct StopReason {
     StopKind kind = StopKind.signal;
     int signal = 0;
@@ -150,6 +155,13 @@ public struct ProcessInfo {
 
 public struct ShlibInfo {
     Nullable!ulong infoAddr;
+}
+
+public struct OffsetsInfo {
+    OffsetsKind kind = OffsetsKind.section;
+    ulong text = 0;
+    Nullable!ulong data;
+    Nullable!ulong bss;
 }
 
 public struct RegisterInfo {
@@ -244,6 +256,10 @@ public struct ShlibInfoCallbacks {
     Nullable!ShlibInfo delegate() getShlibInfo;
 }
 
+public struct OffsetsInfoCallbacks {
+    Nullable!OffsetsInfo delegate() getOffsetsInfo;
+}
+
 public struct RegisterInfoCallbacks {
     Nullable!RegisterInfo delegate(int regno) getRegisterInfo;
 }
@@ -258,6 +274,7 @@ public struct TargetCallbacks {
     HostInfoCallbacks host;
     ProcessInfoCallbacks process;
     ShlibInfoCallbacks shlib;
+    OffsetsInfoCallbacks offsets;
     RegisterInfoCallbacks registerInfo;
 }
 
@@ -414,6 +431,18 @@ public struct TargetBuilder {
         return this;
     }
 
+    ref TargetBuilder withOffsetsInfo(OffsetsInfoCallbacks offsets) {
+        callbacks.offsets = offsets;
+        return this;
+    }
+
+    ref TargetBuilder withOffsetsInfo(Nullable!OffsetsInfo delegate() getOffsetsInfo) {
+        OffsetsInfoCallbacks offsets;
+        offsets.getOffsetsInfo = getOffsetsInfo;
+        callbacks.offsets = offsets;
+        return this;
+    }
+
     ref TargetBuilder withRegisterInfo(RegisterInfoCallbacks regInfo) {
         callbacks.registerInfo = regInfo;
         return this;
@@ -509,6 +538,7 @@ public final class Target {
         config.host = null;
         config.process = null;
         config.shlib = null;
+        config.offsets = null;
         config.reg_info = null;
 
         gdbstub_breakpoints_iface breakpointsIface;
@@ -565,6 +595,13 @@ public final class Target {
             shlibIface.ctx = cast(void*)ctx;
             shlibIface.get_shlib_info = &shlibInfoTramp;
             config.shlib = &shlibIface;
+        }
+
+        gdbstub_offsets_info_iface offsetsIface;
+        if (callbacks.offsets.getOffsetsInfo !is null) {
+            offsetsIface.ctx = cast(void*)ctx;
+            offsetsIface.get_offsets_info = &offsetsInfoTramp;
+            config.offsets = &offsetsIface;
         }
 
         gdbstub_register_info_iface regInfoIface;
@@ -655,6 +692,7 @@ private class TargetContext {
     Nullable!HostInfo hostInfoCache;
     Nullable!ProcessInfo processInfoCache;
     Nullable!ShlibInfo shlibInfoCache;
+    Nullable!OffsetsInfo offsetsInfoCache;
     Nullable!RegisterInfo registerInfoCache;
 
     this(TargetCallbacks callbacks) {
@@ -814,6 +852,17 @@ private gdbstub_shlib_info toCShlibInfo(ShlibInfo info) {
     gdbstub_shlib_info result;
     result.has_info_addr = info.infoAddr.isNull ? 0 : 1;
     result.info_addr = info.infoAddr.isNull ? 0 : info.infoAddr.get;
+    return result;
+}
+
+private gdbstub_offsets_info toCOffsetsInfo(OffsetsInfo info) {
+    gdbstub_offsets_info result;
+    result.kind = cast(gdbstub_offsets_kind)info.kind;
+    result.text = info.text;
+    result.has_data = info.data.isNull ? 0 : 1;
+    result.data = info.data.isNull ? 0 : info.data.get;
+    result.has_bss = info.bss.isNull ? 0 : 1;
+    result.bss = info.bss.isNull ? 0 : info.bss.get;
     return result;
 }
 
@@ -1140,6 +1189,18 @@ private extern(C) uint8_t shlibInfoTramp(void* ctx, gdbstub_shlib_info* infoOut)
     }
     if (infoOut !is null) {
         *infoOut = toCShlibInfo(c.shlibInfoCache.get);
+    }
+    return 1;
+}
+
+private extern(C) uint8_t offsetsInfoTramp(void* ctx, gdbstub_offsets_info* infoOut) {
+    auto c = cast(TargetContext)ctx;
+    c.offsetsInfoCache = c.callbacks.offsets.getOffsetsInfo();
+    if (c.offsetsInfoCache.isNull) {
+        return 0;
+    }
+    if (infoOut !is null) {
+        *infoOut = toCOffsetsInfo(c.offsetsInfoCache.get);
     }
     return 1;
 }
