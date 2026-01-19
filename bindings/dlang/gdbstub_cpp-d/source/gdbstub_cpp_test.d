@@ -914,6 +914,16 @@ private void runProcessControlChecks() {
     assert(lastArgs[0] == arg1);
     assert(lastArgs[1] == arg2);
 
+    client.sendPacket("vRun;;61726731");
+    auto runNoFilename = client.readPacket();
+    assert(runNoFilename.startsWith("T05") || runNoFilename.startsWith("S05"));
+
+    auto noFilename = harness.target.lastLaunchFilenameValue();
+    assert(noFilename.isNull);
+    auto noFilenameArgs = harness.target.lastLaunchArgsValue();
+    assert(noFilenameArgs.length == 1);
+    assert(noFilenameArgs[0] == "arg1");
+
     client.sendPacket("qAttached");
     assert(client.readPacket() == "0");
 

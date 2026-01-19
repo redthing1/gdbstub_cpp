@@ -1502,6 +1502,39 @@ TEST_CASE("server handles vRun in extended mode") {
   CHECK(attached.packets[0].payload == "0");
 }
 
+TEST_CASE("server handles vRun without filename") {
+  mock_state state;
+  mock_components target(state);
+  gdbstub::resume_result result;
+  result.state = gdbstub::resume_result::state::stopped;
+  result.stop = {gdbstub::stop_kind::signal, 5, 0, 0, 1};
+  result.status = gdbstub::target_status::ok;
+  state.launch_result = result;
+
+  gdbstub::arch_spec arch;
+  arch.reg_count = 3;
+
+  auto transport = std::make_unique<loopback_transport>();
+  auto* transport_ptr = transport.get();
+  gdbstub::server server(make_target(target), arch, std::move(transport));
+
+  REQUIRE(server.listen("loop"));
+  REQUIRE(server.wait_for_connection());
+
+  auto enable = send_packet(server, *transport_ptr, "!");
+  REQUIRE(enable.packets.size() == 1);
+  CHECK(enable.packets[0].payload == "OK");
+
+  auto out = send_packet(server, *transport_ptr, "vRun;;61726731");
+  REQUIRE(out.ack_count == 1);
+  REQUIRE(out.packets.size() == 1);
+  CHECK(out.packets[0].payload.rfind("T05", 0) == 0);
+  REQUIRE(state.last_launch.has_value());
+  CHECK(!state.last_launch->filename.has_value());
+  REQUIRE(state.last_launch->args.size() == 1);
+  CHECK(state.last_launch->args[0] == "arg1");
+}
+
 TEST_CASE("server handles vAttach in extended mode") {
   mock_state state;
   mock_components target(state);

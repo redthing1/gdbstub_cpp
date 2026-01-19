@@ -108,6 +108,9 @@ private:
   void handle_threads_info();
   void handle_thread_extended_info(std::string_view args);
   bool process_control_enabled() const;
+  const process_control_view* process_control() const;
+  void set_attached_state(attached_state state);
+  void set_attached_state_if_ok(attached_state state, target_status status);
 
   void send_ack();
   void send_nack();

@@ -735,6 +735,16 @@ TEST_CASE("capi tcp integration handles core packets") {
   REQUIRE(state.last_launch_args.size() == 1);
   CHECK(state.last_launch_args[0] == "arg1");
 
+  REQUIRE(client.send_packet("vRun;;61726731"));
+  auto vrun_no_filename = wait_for_reply(server_handle.server, client, std::chrono::milliseconds(200));
+  REQUIRE(vrun_no_filename.has_value());
+  CHECK(vrun_no_filename->payload.rfind("T05", 0) == 0);
+  CHECK(state.launch_called);
+  CHECK(!state.launch_has_filename);
+  CHECK(state.last_launch_filename.empty());
+  REQUIRE(state.last_launch_args.size() == 1);
+  CHECK(state.last_launch_args[0] == "arg1");
+
   REQUIRE(client.send_packet("qAttached"));
   auto attached_run = wait_for_reply(server_handle.server, client, std::chrono::milliseconds(200));
   REQUIRE(attached_run.has_value());
