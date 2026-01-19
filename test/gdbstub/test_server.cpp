@@ -90,6 +90,14 @@ struct mock_state {
   std::optional<gdbstub::stop_reason> stop_for_threads;
   std::optional<gdbstub::stop_reason> resume_stop;
   std::optional<gdbstub::shlib_info> shlib;
+  std::optional<gdbstub::process_launch_request> last_launch;
+  std::optional<uint64_t> last_attach_pid;
+  std::optional<uint64_t> last_kill_pid;
+  bool last_kill_has_pid = false;
+  bool restart_called = false;
+  std::optional<gdbstub::resume_result> launch_result;
+  std::optional<gdbstub::resume_result> attach_result;
+  std::optional<gdbstub::resume_result> restart_result;
   std::optional<gdbstub::offsets_info> offsets;
   std::optional<gdbstub::resume_request> last_resume;
   std::optional<uint64_t> last_set_thread;
@@ -97,6 +105,7 @@ struct mock_state {
   std::optional<gdbstub::breakpoint_spec> last_removed_breakpoint;
   gdbstub::target_status breakpoint_status = gdbstub::target_status::ok;
   gdbstub::target_status resume_status = gdbstub::target_status::ok;
+  gdbstub::target_status kill_status = gdbstub::target_status::ok;
   gdbstub::run_capabilities run_caps{};
   gdbstub::breakpoint_capabilities breakpoint_caps{};
   bool interrupt_called = false;
@@ -274,6 +283,31 @@ struct mock_shlib {
   std::optional<gdbstub::shlib_info> get_shlib_info() { return state.shlib; }
 };
 
+struct mock_process_control {
+  mock_state& state;
+
+  std::optional<gdbstub::resume_result> launch(const gdbstub::process_launch_request& request) {
+    state.last_launch = request;
+    return state.launch_result;
+  }
+
+  std::optional<gdbstub::resume_result> attach(uint64_t pid) {
+    state.last_attach_pid = pid;
+    return state.attach_result;
+  }
+
+  gdbstub::target_status kill(std::optional<uint64_t> pid) {
+    state.last_kill_has_pid = pid.has_value();
+    state.last_kill_pid = pid.value_or(0);
+    return state.kill_status;
+  }
+
+  std::optional<gdbstub::resume_result> restart() {
+    state.restart_called = true;
+    return state.restart_result;
+  }
+};
+
 struct mock_offsets {
   mock_state& state;
 
@@ -311,6 +345,7 @@ struct mock_components {
   mock_host host{};
   mock_process process{};
   mock_shlib shlib{state};
+  mock_process_control process_control{state};
   mock_offsets offsets{state};
   mock_register_info reg_info{};
 };
@@ -357,6 +392,7 @@ gdbstub::target make_target(mock_components& target) {
       target.host,
       target.process,
       target.shlib,
+      target.process_control,
       target.offsets,
       target.reg_info
   );
@@ -1407,6 +1443,214 @@ TEST_CASE("server returns empty reply for missing qOffsets data") {
   REQUIRE(out.ack_count == 1);
   REQUIRE(out.packets.size() == 1);
   CHECK(out.packets[0].payload == "");
+}
+
+TEST_CASE("server rejects vRun without extended mode") {
+  mock_state state;
+  mock_components target(state);
+
+  gdbstub::arch_spec arch;
+  arch.reg_count = 3;
+
+  auto transport = std::make_unique<loopback_transport>();
+  auto* transport_ptr = transport.get();
+  gdbstub::server server(make_target(target), arch, std::move(transport));
+
+  REQUIRE(server.listen("loop"));
+  REQUIRE(server.wait_for_connection());
+
+  auto out = send_packet(server, *transport_ptr, "vRun;74657374");
+  REQUIRE(out.ack_count == 1);
+  REQUIRE(out.packets.size() == 1);
+  CHECK(out.packets[0].payload == "");
+}
+
+TEST_CASE("server handles vRun in extended mode") {
+  mock_state state;
+  mock_components target(state);
+  gdbstub::resume_result result;
+  result.state = gdbstub::resume_result::state::stopped;
+  result.stop = {gdbstub::stop_kind::signal, 5, 0, 0, 1};
+  result.status = gdbstub::target_status::ok;
+  state.launch_result = result;
+
+  gdbstub::arch_spec arch;
+  arch.reg_count = 3;
+
+  auto transport = std::make_unique<loopback_transport>();
+  auto* transport_ptr = transport.get();
+  gdbstub::server server(make_target(target), arch, std::move(transport));
+
+  REQUIRE(server.listen("loop"));
+  REQUIRE(server.wait_for_connection());
+
+  auto enable = send_packet(server, *transport_ptr, "!");
+  REQUIRE(enable.packets.size() == 1);
+  CHECK(enable.packets[0].payload == "OK");
+
+  auto out = send_packet(server, *transport_ptr, "vRun;74657374;61726731");
+  REQUIRE(out.ack_count == 1);
+  REQUIRE(out.packets.size() == 1);
+  CHECK(out.packets[0].payload.rfind("T05", 0) == 0);
+  REQUIRE(state.last_launch.has_value());
+  CHECK(state.last_launch->filename.value_or("") == "test");
+  REQUIRE(state.last_launch->args.size() == 1);
+  CHECK(state.last_launch->args[0] == "arg1");
+
+  auto attached = send_packet(server, *transport_ptr, "qAttached");
+  REQUIRE(attached.packets.size() == 1);
+  CHECK(attached.packets[0].payload == "0");
+}
+
+TEST_CASE("server handles vAttach in extended mode") {
+  mock_state state;
+  mock_components target(state);
+  gdbstub::resume_result result;
+  result.state = gdbstub::resume_result::state::stopped;
+  result.stop = {gdbstub::stop_kind::signal, 5, 0, 0, 1};
+  result.status = gdbstub::target_status::ok;
+  state.attach_result = result;
+
+  gdbstub::arch_spec arch;
+  arch.reg_count = 3;
+
+  auto transport = std::make_unique<loopback_transport>();
+  auto* transport_ptr = transport.get();
+  gdbstub::server server(make_target(target), arch, std::move(transport));
+
+  REQUIRE(server.listen("loop"));
+  REQUIRE(server.wait_for_connection());
+
+  auto enable = send_packet(server, *transport_ptr, "!");
+  REQUIRE(enable.packets.size() == 1);
+  CHECK(enable.packets[0].payload == "OK");
+
+  auto out = send_packet(server, *transport_ptr, "vAttach;2a");
+  REQUIRE(out.ack_count == 1);
+  REQUIRE(out.packets.size() == 1);
+  CHECK(out.packets[0].payload.rfind("T05", 0) == 0);
+  REQUIRE(state.last_attach_pid.has_value());
+  CHECK(state.last_attach_pid.value() == 0x2a);
+
+  auto attached = send_packet(server, *transport_ptr, "qAttached");
+  REQUIRE(attached.packets.size() == 1);
+  CHECK(attached.packets[0].payload == "1");
+}
+
+TEST_CASE("server handles vKill in extended mode") {
+  mock_state state;
+  mock_components target(state);
+  state.kill_status = gdbstub::target_status::ok;
+
+  gdbstub::arch_spec arch;
+  arch.reg_count = 3;
+
+  auto transport = std::make_unique<loopback_transport>();
+  auto* transport_ptr = transport.get();
+  gdbstub::server server(make_target(target), arch, std::move(transport));
+
+  REQUIRE(server.listen("loop"));
+  REQUIRE(server.wait_for_connection());
+
+  auto enable = send_packet(server, *transport_ptr, "!");
+  REQUIRE(enable.packets.size() == 1);
+  CHECK(enable.packets[0].payload == "OK");
+
+  auto out = send_packet(server, *transport_ptr, "vKill;2a");
+  REQUIRE(out.ack_count == 1);
+  REQUIRE(out.packets.size() == 1);
+  CHECK(out.packets[0].payload == "OK");
+  CHECK(state.last_kill_has_pid);
+  CHECK(state.last_kill_pid == 0x2a);
+}
+
+TEST_CASE("server handles R restart without reply") {
+  mock_state state;
+  mock_components target(state);
+  gdbstub::resume_result result;
+  result.state = gdbstub::resume_result::state::stopped;
+  result.stop = {gdbstub::stop_kind::signal, 5, 0, 0, 1};
+  result.status = gdbstub::target_status::ok;
+  state.restart_result = result;
+
+  gdbstub::arch_spec arch;
+  arch.reg_count = 3;
+
+  auto transport = std::make_unique<loopback_transport>();
+  auto* transport_ptr = transport.get();
+  gdbstub::server server(make_target(target), arch, std::move(transport));
+
+  REQUIRE(server.listen("loop"));
+  REQUIRE(server.wait_for_connection());
+
+  auto enable = send_packet(server, *transport_ptr, "!");
+  REQUIRE(enable.packets.size() == 1);
+  CHECK(enable.packets[0].payload == "OK");
+
+  auto restart = send_packet(server, *transport_ptr, "R00");
+  CHECK(restart.ack_count == 1);
+  CHECK(restart.packets.empty());
+  CHECK(state.restart_called);
+
+  auto out = send_packet(server, *transport_ptr, "?");
+  REQUIRE(out.packets.size() == 1);
+  CHECK(out.packets[0].payload.rfind("T05", 0) == 0);
+}
+
+TEST_CASE("server marks restarted process as launched when running") {
+  mock_state state;
+  mock_components target(state);
+  gdbstub::resume_result result;
+  result.state = gdbstub::resume_result::state::running;
+  result.status = gdbstub::target_status::ok;
+  state.restart_result = result;
+
+  gdbstub::arch_spec arch;
+  arch.reg_count = 3;
+
+  auto transport = std::make_unique<loopback_transport>();
+  auto* transport_ptr = transport.get();
+  gdbstub::server server(make_target(target), arch, std::move(transport));
+
+  REQUIRE(server.listen("loop"));
+  REQUIRE(server.wait_for_connection());
+
+  auto enable = send_packet(server, *transport_ptr, "!");
+  REQUIRE(enable.packets.size() == 1);
+  CHECK(enable.packets[0].payload == "OK");
+
+  auto restart = send_packet(server, *transport_ptr, "R00");
+  CHECK(restart.ack_count == 1);
+  CHECK(restart.packets.empty());
+  CHECK(state.restart_called);
+
+  auto attached = send_packet(server, *transport_ptr, "qAttached");
+  REQUIRE(attached.packets.size() == 1);
+  CHECK(attached.packets[0].payload == "0");
+}
+
+TEST_CASE("server rejects invalid vRun hex") {
+  mock_state state;
+  mock_components target(state);
+
+  gdbstub::arch_spec arch;
+  arch.reg_count = 3;
+
+  auto transport = std::make_unique<loopback_transport>();
+  auto* transport_ptr = transport.get();
+  gdbstub::server server(make_target(target), arch, std::move(transport));
+
+  REQUIRE(server.listen("loop"));
+  REQUIRE(server.wait_for_connection());
+
+  auto enable = send_packet(server, *transport_ptr, "!");
+  REQUIRE(enable.packets.size() == 1);
+  CHECK(enable.packets[0].payload == "OK");
+
+  auto out = send_packet(server, *transport_ptr, "vRun;zz");
+  REQUIRE(out.ack_count == 1);
+  REQUIRE(out.packets.size() == 1);
+  CHECK(out.packets[0].payload == "E16");
 }
 
 TEST_CASE("server responds to jThreadsInfo") {

@@ -173,6 +173,13 @@ typedef struct gdbstub_shlib_info {
   uint64_t info_addr;
 } gdbstub_shlib_info;
 
+typedef struct gdbstub_process_launch_request {
+  uint8_t has_filename;
+  gdbstub_string_view filename;
+  const gdbstub_string_view* args;
+  size_t args_len;
+} gdbstub_process_launch_request;
+
 typedef enum gdbstub_offsets_kind {
   GDBSTUB_OFFSETS_SECTION = 0,
   GDBSTUB_OFFSETS_SEGMENT = 1,
@@ -286,6 +293,10 @@ typedef uint8_t (*gdbstub_thread_stop_reason_fn)(void* ctx, uint64_t tid, gdbstu
 typedef uint8_t (*gdbstub_get_host_info_fn)(void* ctx, gdbstub_host_info* out);
 typedef uint8_t (*gdbstub_get_process_info_fn)(void* ctx, gdbstub_process_info* out);
 typedef uint8_t (*gdbstub_get_shlib_info_fn)(void* ctx, gdbstub_shlib_info* out);
+typedef gdbstub_resume_result (*gdbstub_launch_fn)(void* ctx, const gdbstub_process_launch_request* request);
+typedef gdbstub_resume_result (*gdbstub_attach_fn)(void* ctx, uint64_t pid);
+typedef gdbstub_target_status (*gdbstub_kill_fn)(void* ctx, uint8_t has_pid, uint64_t pid);
+typedef gdbstub_resume_result (*gdbstub_restart_fn)(void* ctx);
 typedef uint8_t (*gdbstub_get_offsets_info_fn)(void* ctx, gdbstub_offsets_info* out);
 typedef uint8_t (*gdbstub_get_register_info_fn)(void* ctx, int regno, gdbstub_register_info* out);
 
@@ -349,6 +360,14 @@ typedef struct gdbstub_shlib_info_iface {
   gdbstub_get_shlib_info_fn get_shlib_info;
 } gdbstub_shlib_info_iface;
 
+typedef struct gdbstub_process_control_iface {
+  void* ctx;
+  gdbstub_launch_fn launch;
+  gdbstub_attach_fn attach;
+  gdbstub_kill_fn kill;
+  gdbstub_restart_fn restart;
+} gdbstub_process_control_iface;
+
 typedef struct gdbstub_offsets_info_iface {
   void* ctx;
   gdbstub_get_offsets_info_fn get_offsets_info;
@@ -369,6 +388,7 @@ typedef struct gdbstub_target_config {
   const gdbstub_host_info_iface* host;
   const gdbstub_process_info_iface* process;
   const gdbstub_shlib_info_iface* shlib;
+  const gdbstub_process_control_iface* process_control;
   const gdbstub_offsets_info_iface* offsets;
   const gdbstub_register_info_iface* reg_info;
 } gdbstub_target_config;

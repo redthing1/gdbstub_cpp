@@ -60,6 +60,9 @@ private:
   bool list_threads_in_stop_reply_ = false;
   bool thread_suffix_enabled_ = false;
   bool error_strings_enabled_ = false;
+  bool extended_mode_ = false;
+  enum class attached_state { unknown, launched, attached };
+  attached_state attached_state_ = attached_state::unknown;
   non_stop_state non_stop_;
   std::optional<stop_reason> last_stop_;
 
@@ -72,6 +75,10 @@ private:
   void handle_query(std::string_view args);
   void handle_set_query(std::string_view args);
   void handle_v_packet(std::string_view args);
+  void handle_vrun(std::string_view args);
+  void handle_vattach(std::string_view args);
+  void handle_vkill(std::string_view args);
+  void handle_restart(std::string_view args);
   void handle_continue(std::string_view args, resume_action action, bool has_signal);
   void handle_reverse(bool step);
   void finish_resume(const resume_result& result, bool optional_feature);
@@ -100,6 +107,7 @@ private:
   void handle_offsets();
   void handle_threads_info();
   void handle_thread_extended_info(std::string_view args);
+  bool process_control_enabled() const;
 
   void send_ack();
   void send_nack();

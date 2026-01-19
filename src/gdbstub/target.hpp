@@ -182,6 +182,11 @@ struct shlib_info {
   std::optional<uint64_t> info_addr;
 };
 
+struct process_launch_request {
+  std::optional<std::string> filename;
+  std::vector<std::string> args;
+};
+
 enum class offsets_kind {
   section,
   segment,
@@ -375,6 +380,42 @@ struct shlib_view {
   std::optional<shlib_info> get_shlib_info() const { return get_shlib_info_fn(ctx); }
 };
 
+struct process_control_view {
+  void* ctx = nullptr;
+  std::optional<resume_result> (*launch_fn)(void* ctx, const process_launch_request& request) = nullptr;
+  std::optional<resume_result> (*attach_fn)(void* ctx, uint64_t pid) = nullptr;
+  target_status (*kill_fn)(void* ctx, std::optional<uint64_t> pid) = nullptr;
+  std::optional<resume_result> (*restart_fn)(void* ctx) = nullptr;
+
+  std::optional<resume_result> launch(const process_launch_request& request) const {
+    if (!launch_fn) {
+      return std::nullopt;
+    }
+    return launch_fn(ctx, request);
+  }
+
+  std::optional<resume_result> attach(uint64_t pid) const {
+    if (!attach_fn) {
+      return std::nullopt;
+    }
+    return attach_fn(ctx, pid);
+  }
+
+  target_status kill(std::optional<uint64_t> pid) const {
+    if (!kill_fn) {
+      return target_status::unsupported;
+    }
+    return kill_fn(ctx, pid);
+  }
+
+  std::optional<resume_result> restart() const {
+    if (!restart_fn) {
+      return std::nullopt;
+    }
+    return restart_fn(ctx);
+  }
+};
+
 struct offsets_view {
   void* ctx = nullptr;
   std::optional<offsets_info> (*get_offsets_info_fn)(void* ctx) = nullptr;
@@ -399,6 +440,7 @@ struct target_view {
   std::optional<host_info_view> host;
   std::optional<process_info_view> process;
   std::optional<shlib_view> shlib;
+  std::optional<process_control_view> process_control;
   std::optional<offsets_view> offsets;
   std::optional<register_info_view> reg_info;
 };
@@ -509,6 +551,30 @@ template <typename T>
 concept shlib_capability = requires(T& t) {
   { t.get_shlib_info() } -> std::same_as<std::optional<shlib_info>>;
 };
+
+template <typename T>
+concept process_launch_capability = requires(T& t, const process_launch_request& request) {
+  { t.launch(request) } -> std::same_as<std::optional<resume_result>>;
+};
+
+template <typename T>
+concept process_attach_capability = requires(T& t, uint64_t pid) {
+  { t.attach(pid) } -> std::same_as<std::optional<resume_result>>;
+};
+
+template <typename T>
+concept process_kill_capability = requires(T& t, std::optional<uint64_t> pid) {
+  { t.kill(pid) } -> std::same_as<target_status>;
+};
+
+template <typename T>
+concept process_restart_capability = requires(T& t) {
+  { t.restart() } -> std::same_as<std::optional<resume_result>>;
+};
+
+template <typename T>
+concept process_control_capability = process_launch_capability<T> || process_attach_capability<T> ||
+                                     process_kill_capability<T> || process_restart_capability<T>;
 
 template <typename T>
 concept offsets_capability = requires(T& t) {
@@ -653,6 +719,33 @@ shlib_view make_shlib_view(T& shlib) {
 }
 
 template <typename T>
+process_control_view make_process_control_view(T& control) {
+  process_control_view view;
+  view.ctx = std::addressof(control);
+  if constexpr (process_launch_capability<T>) {
+    view.launch_fn = [](void* ctx, const process_launch_request& request) -> std::optional<resume_result> {
+      return static_cast<T*>(ctx)->launch(request);
+    };
+  }
+  if constexpr (process_attach_capability<T>) {
+    view.attach_fn = [](void* ctx, uint64_t pid) -> std::optional<resume_result> {
+      return static_cast<T*>(ctx)->attach(pid);
+    };
+  }
+  if constexpr (process_kill_capability<T>) {
+    view.kill_fn = [](void* ctx, std::optional<uint64_t> pid) -> target_status {
+      return static_cast<T*>(ctx)->kill(pid);
+    };
+  }
+  if constexpr (process_restart_capability<T>) {
+    view.restart_fn = [](void* ctx) -> std::optional<resume_result> {
+      return static_cast<T*>(ctx)->restart();
+    };
+  }
+  return view;
+}
+
+template <typename T>
 offsets_view make_offsets_view(T& offsets) {
   offsets_view view;
   view.ctx = std::addressof(offsets);
@@ -679,7 +772,7 @@ void assign_optional(target_view& view, T& obj) {
   static_assert(!run_capability<T>, "Optional capability object implements run control; pass it as run.");
   constexpr int matches = breakpoints_capability<T> + threads_capability<T> + memory_layout_capability<T> +
                           host_info_capability<T> + process_info_capability<T> + shlib_capability<T> +
-                          offsets_capability<T> + register_info_capability<T>;
+                          process_control_capability<T> + offsets_capability<T> + register_info_capability<T>;
   static_assert(matches >= 1, "Optional capability object must implement at least one optional capability.");
 
   if constexpr (breakpoints_capability<T>) {
@@ -699,6 +792,9 @@ void assign_optional(target_view& view, T& obj) {
   }
   if constexpr (shlib_capability<T>) {
     view.shlib = make_shlib_view(obj);
+  }
+  if constexpr (process_control_capability<T>) {
+    view.process_control = make_process_control_view(obj);
   }
   if constexpr (offsets_capability<T>) {
     view.offsets = make_offsets_view(obj);
@@ -728,6 +824,8 @@ target make_target(Regs& regs, Mem& mem, Run& run, Opts&... opts) {
   static_assert(process_count <= 1, "Process info capability provided multiple times.");
   constexpr int shlib_count = (0 + ... + detail::shlib_capability<Opts>);
   static_assert(shlib_count <= 1, "Shlib capability provided multiple times.");
+  constexpr int process_control_count = (0 + ... + detail::process_control_capability<Opts>);
+  static_assert(process_control_count <= 1, "Process control capability provided multiple times.");
   constexpr int offsets_count = (0 + ... + detail::offsets_capability<Opts>);
   static_assert(offsets_count <= 1, "Offsets capability provided multiple times.");
   constexpr int reg_info_count = (0 + ... + detail::register_info_capability<Opts>);

@@ -252,6 +252,7 @@ struct c_target {
   std::optional<gdbstub_host_info_iface> host;
   std::optional<gdbstub_process_info_iface> process;
   std::optional<gdbstub_shlib_info_iface> shlib;
+  std::optional<gdbstub_process_control_iface> process_control;
   std::optional<gdbstub_offsets_info_iface> offsets;
   std::optional<gdbstub_register_info_iface> reg_info;
   std::optional<gdbstub::stop_notifier> stop_notifier;
@@ -275,6 +276,9 @@ struct c_target {
     }
     if (config.shlib) {
       shlib = *config.shlib;
+    }
+    if (config.process_control) {
+      process_control = *config.process_control;
     }
     if (config.offsets) {
       offsets = *config.offsets;
@@ -543,6 +547,65 @@ struct c_target {
     return to_shlib_info(info);
   }
 
+  static std::optional<gdbstub::resume_result> launch_tramp(
+      void* ctx,
+      const gdbstub::process_launch_request& request
+  ) {
+    auto* self = static_cast<c_target*>(ctx);
+    if (!self->process_control || !self->process_control->launch) {
+      return std::nullopt;
+    }
+    gdbstub_process_launch_request c_request{};
+    gdbstub_string_view filename{};
+    if (request.filename) {
+      c_request.has_filename = 1;
+      filename.data = request.filename->data();
+      filename.size = request.filename->size();
+    } else {
+      c_request.has_filename = 0;
+    }
+    c_request.filename = filename;
+    std::vector<gdbstub_string_view> arg_views;
+    arg_views.reserve(request.args.size());
+    for (const auto& arg : request.args) {
+      gdbstub_string_view view{};
+      view.data = arg.data();
+      view.size = arg.size();
+      arg_views.push_back(view);
+    }
+    c_request.args = arg_views.data();
+    c_request.args_len = arg_views.size();
+    auto result = self->process_control->launch(self->process_control->ctx, &c_request);
+    return to_resume_result(result);
+  }
+
+  static std::optional<gdbstub::resume_result> attach_tramp(void* ctx, uint64_t pid) {
+    auto* self = static_cast<c_target*>(ctx);
+    if (!self->process_control || !self->process_control->attach) {
+      return std::nullopt;
+    }
+    auto result = self->process_control->attach(self->process_control->ctx, pid);
+    return to_resume_result(result);
+  }
+
+  static gdbstub::target_status kill_tramp(void* ctx, std::optional<uint64_t> pid) {
+    auto* self = static_cast<c_target*>(ctx);
+    if (!self->process_control || !self->process_control->kill) {
+      return gdbstub::target_status::unsupported;
+    }
+    auto status = self->process_control->kill(self->process_control->ctx, pid.has_value() ? 1 : 0, pid.value_or(0));
+    return static_cast<gdbstub::target_status>(status);
+  }
+
+  static std::optional<gdbstub::resume_result> restart_tramp(void* ctx) {
+    auto* self = static_cast<c_target*>(ctx);
+    if (!self->process_control || !self->process_control->restart) {
+      return std::nullopt;
+    }
+    auto result = self->process_control->restart(self->process_control->ctx);
+    return to_resume_result(result);
+  }
+
   static std::optional<gdbstub::offsets_info> offsets_info_tramp(void* ctx) {
     auto* self = static_cast<c_target*>(ctx);
     gdbstub_offsets_info info{};
@@ -629,6 +692,16 @@ struct c_target {
       sv.ctx = this;
       sv.get_shlib_info_fn = &shlib_info_tramp;
       view.shlib = sv;
+    }
+
+    if (process_control) {
+      gdbstub::process_control_view pv;
+      pv.ctx = this;
+      pv.launch_fn = &launch_tramp;
+      pv.attach_fn = &attach_tramp;
+      pv.kill_fn = &kill_tramp;
+      pv.restart_fn = &restart_tramp;
+      view.process_control = pv;
     }
 
     if (offsets) {

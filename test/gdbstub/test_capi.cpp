@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cstring>
 #include <string>
+#include <vector>
 #include <thread>
 
 namespace {
@@ -45,6 +46,21 @@ struct capi_state {
   gdbstub_process_info process{};
   gdbstub_shlib_info shlib{};
   gdbstub_offsets_info offsets{};
+  gdbstub_process_control_iface process_control_iface{};
+  gdbstub_resume_result launch_result{};
+  gdbstub_resume_result attach_result{};
+  gdbstub_resume_result restart_result{};
+  gdbstub_target_status kill_status = GDBSTUB_TARGET_OK;
+  bool launch_called = false;
+  bool launch_has_filename = false;
+  bool attach_called = false;
+  bool kill_called = false;
+  bool restart_called = false;
+  bool kill_has_pid = false;
+  uint64_t last_attach_pid = 0;
+  uint64_t last_kill_pid = 0;
+  std::string last_launch_filename;
+  std::vector<std::string> last_launch_args;
 
   gdbstub_register_info reg_info{};
   gdbstub_slice_int reg_info_container_slice{};
@@ -174,6 +190,21 @@ static void init_state(capi_state& state) {
   state.breakpoint_caps.watch_read = 0;
   state.breakpoint_caps.watch_write = 0;
   state.breakpoint_caps.watch_access = 0;
+
+  state.launch_result.state = GDBSTUB_RESUME_STOPPED;
+  state.launch_result.stop.kind = GDBSTUB_STOP_SIGNAL;
+  state.launch_result.stop.signal = 5;
+  state.launch_result.status = GDBSTUB_TARGET_OK;
+
+  state.attach_result.state = GDBSTUB_RESUME_STOPPED;
+  state.attach_result.stop.kind = GDBSTUB_STOP_SIGNAL;
+  state.attach_result.stop.signal = 5;
+  state.attach_result.status = GDBSTUB_TARGET_OK;
+
+  state.restart_result.state = GDBSTUB_RESUME_STOPPED;
+  state.restart_result.stop.kind = GDBSTUB_STOP_SIGNAL;
+  state.restart_result.stop.signal = 5;
+  state.restart_result.status = GDBSTUB_TARGET_OK;
 }
 
 static gdbstub_stop_reason make_stop_reason(uint64_t tid) {
@@ -405,6 +436,52 @@ static uint8_t get_shlib_info(void* ctx, gdbstub_shlib_info* out) {
   return 1;
 }
 
+static gdbstub_resume_result launch_process(void* ctx, const gdbstub_process_launch_request* req) {
+  auto* state = static_cast<capi_state*>(ctx);
+  state->launch_called = true;
+  state->launch_has_filename = req && req->has_filename != 0;
+  state->last_launch_filename.clear();
+  state->last_launch_args.clear();
+  if (req) {
+    if (req->has_filename != 0 && req->filename.data && req->filename.size > 0) {
+      state->last_launch_filename.assign(req->filename.data, req->filename.size);
+    }
+    if (req->args && req->args_len > 0) {
+      state->last_launch_args.reserve(req->args_len);
+      for (size_t i = 0; i < req->args_len; ++i) {
+        auto view = req->args[i];
+        if (view.data && view.size > 0) {
+          state->last_launch_args.emplace_back(view.data, view.size);
+        } else {
+          state->last_launch_args.emplace_back();
+        }
+      }
+    }
+  }
+  return state->launch_result;
+}
+
+static gdbstub_resume_result attach_process(void* ctx, uint64_t pid) {
+  auto* state = static_cast<capi_state*>(ctx);
+  state->attach_called = true;
+  state->last_attach_pid = pid;
+  return state->attach_result;
+}
+
+static gdbstub_target_status kill_process(void* ctx, uint8_t has_pid, uint64_t pid) {
+  auto* state = static_cast<capi_state*>(ctx);
+  state->kill_called = true;
+  state->kill_has_pid = has_pid != 0;
+  state->last_kill_pid = pid;
+  return state->kill_status;
+}
+
+static gdbstub_resume_result restart_process(void* ctx) {
+  auto* state = static_cast<capi_state*>(ctx);
+  state->restart_called = true;
+  return state->restart_result;
+}
+
 static uint8_t get_offsets_info(void* ctx, gdbstub_offsets_info* out) {
   auto* state = static_cast<capi_state*>(ctx);
   if (!out) {
@@ -466,6 +543,12 @@ static void setup_config(capi_state& state) {
   state.shlib_iface.ctx = &state;
   state.shlib_iface.get_shlib_info = &get_shlib_info;
 
+  state.process_control_iface.ctx = &state;
+  state.process_control_iface.launch = &launch_process;
+  state.process_control_iface.attach = &attach_process;
+  state.process_control_iface.kill = &kill_process;
+  state.process_control_iface.restart = &restart_process;
+
   state.offsets_iface.ctx = &state;
   state.offsets_iface.get_offsets_info = &get_offsets_info;
 
@@ -481,6 +564,7 @@ static void setup_config(capi_state& state) {
   state.config.host = &state.host_iface;
   state.config.process = &state.process_iface;
   state.config.shlib = &state.shlib_iface;
+  state.config.process_control = &state.process_control_iface;
   state.config.offsets = &state.offsets_iface;
   state.config.reg_info = &state.reg_info_iface;
 }
@@ -635,6 +719,56 @@ TEST_CASE("capi tcp integration handles core packets") {
   auto shlib = wait_for_reply(server_handle.server, client, std::chrono::milliseconds(200));
   REQUIRE(shlib.has_value());
   CHECK(shlib->payload == "11223344");
+
+  REQUIRE(client.send_packet("!"));
+  auto extended = wait_for_reply(server_handle.server, client, std::chrono::milliseconds(200));
+  REQUIRE(extended.has_value());
+  CHECK(extended->payload == "OK");
+
+  REQUIRE(client.send_packet("vRun;74657374;61726731"));
+  auto vrun = wait_for_reply(server_handle.server, client, std::chrono::milliseconds(200));
+  REQUIRE(vrun.has_value());
+  CHECK(vrun->payload.rfind("T05", 0) == 0);
+  CHECK(state.launch_called);
+  CHECK(state.launch_has_filename);
+  CHECK(state.last_launch_filename == "test");
+  REQUIRE(state.last_launch_args.size() == 1);
+  CHECK(state.last_launch_args[0] == "arg1");
+
+  REQUIRE(client.send_packet("qAttached"));
+  auto attached_run = wait_for_reply(server_handle.server, client, std::chrono::milliseconds(200));
+  REQUIRE(attached_run.has_value());
+  CHECK(attached_run->payload == "0");
+
+  REQUIRE(client.send_packet("vAttach;2a"));
+  auto vattach = wait_for_reply(server_handle.server, client, std::chrono::milliseconds(200));
+  REQUIRE(vattach.has_value());
+  CHECK(vattach->payload.rfind("T05", 0) == 0);
+  CHECK(state.attach_called);
+  CHECK(state.last_attach_pid == 0x2a);
+
+  REQUIRE(client.send_packet("qAttached"));
+  auto attached_attach = wait_for_reply(server_handle.server, client, std::chrono::milliseconds(200));
+  REQUIRE(attached_attach.has_value());
+  CHECK(attached_attach->payload == "1");
+
+  REQUIRE(client.send_packet("vKill;2a"));
+  auto vkill = wait_for_reply(server_handle.server, client, std::chrono::milliseconds(200));
+  REQUIRE(vkill.has_value());
+  CHECK(vkill->payload == "OK");
+  CHECK(state.kill_called);
+  CHECK(state.kill_has_pid);
+  CHECK(state.last_kill_pid == 0x2a);
+
+  REQUIRE(client.send_packet("R00"));
+  auto restart = wait_for_reply(server_handle.server, client, std::chrono::milliseconds(50));
+  CHECK(!restart.has_value());
+  CHECK(state.restart_called);
+
+  REQUIRE(client.send_packet("?"));
+  auto restart_stop = wait_for_reply(server_handle.server, client, std::chrono::milliseconds(200));
+  REQUIRE(restart_stop.has_value());
+  CHECK(restart_stop->payload.rfind("T05", 0) == 0);
 
   REQUIRE(client.send_packet("qOffsets"));
   auto offsets = wait_for_reply(server_handle.server, client, std::chrono::milliseconds(200));

@@ -29,6 +29,22 @@ std::string hex_encode_string(std::string_view value) {
   return rsp::encode_hex(as_bytes(value));
 }
 
+bool decode_hex_string(std::string_view value, std::string& out) {
+  out.clear();
+  if (value.empty()) {
+    return true;
+  }
+  if (value.size() % 2 != 0) {
+    return false;
+  }
+  std::vector<std::byte> buffer(value.size() / 2);
+  if (!rsp::decode_hex(value, buffer)) {
+    return false;
+  }
+  out.assign(reinterpret_cast<const char*>(buffer.data()), buffer.size());
+  return true;
+}
+
 std::string hex_byte(uint8_t value) {
   char buf[3] = {0};
   std::snprintf(buf, sizeof(buf), "%02x", value);
@@ -612,6 +628,9 @@ void server::handle_packet(std::string_view payload) {
   case '!':
     handle_extended_mode();
     break;
+  case 'R':
+    handle_restart(args);
+    break;
   case 'k':
     transport_->disconnect();
     break;
@@ -721,7 +740,7 @@ void server::handle_query(std::string_view args) {
   }
 
   if (name == "Attached") {
-    send_packet("1");
+    send_packet(attached_state_ == attached_state::launched ? "0" : "1");
     return;
   }
 
@@ -821,6 +840,21 @@ void server::handle_v_packet(std::string_view args) {
     return;
   }
 
+  if (args.rfind("Run", 0) == 0) {
+    handle_vrun(args.substr(3));
+    return;
+  }
+
+  if (args.rfind("Attach;", 0) == 0) {
+    handle_vattach(args.substr(7));
+    return;
+  }
+
+  if (args.rfind("Kill", 0) == 0) {
+    handle_vkill(args.substr(4));
+    return;
+  }
+
   if (args == "Stopped") {
     if (!non_stop_.enabled) {
       send_packet("");
@@ -907,6 +941,148 @@ void server::handle_v_packet(std::string_view args) {
   }
 
   send_stop_reply(last_stop_.value_or(stop_reason{stop_kind::signal, 5}));
+}
+
+void server::handle_vrun(std::string_view args) {
+  if (!process_control_enabled()) {
+    send_packet("");
+    return;
+  }
+
+  process_launch_request request;
+  if (!args.empty()) {
+    if (args[0] == ';') {
+      args.remove_prefix(1);
+    }
+    size_t start = 0;
+    bool first = true;
+    while (start <= args.size()) {
+      auto next = args.find(';', start);
+      auto part = args.substr(start, next == std::string_view::npos ? args.size() - start : next - start);
+      std::string decoded;
+      if (!decode_hex_string(part, decoded)) {
+        send_error(0x16);
+        return;
+      }
+      if (first) {
+        if (!decoded.empty()) {
+          request.filename = decoded;
+        }
+      } else {
+        request.args.push_back(decoded);
+      }
+      if (next == std::string_view::npos) {
+        break;
+      }
+      start = next + 1;
+      first = false;
+    }
+  }
+
+  auto result = target_.process_control->launch(request);
+  if (!result) {
+    send_packet("");
+    return;
+  }
+  if (result->status == target_status::ok) {
+    attached_state_ = attached_state::launched;
+  }
+  finish_resume(*result, true);
+}
+
+void server::handle_vattach(std::string_view args) {
+  if (!process_control_enabled()) {
+    send_packet("");
+    return;
+  }
+
+  if (args.empty()) {
+    send_error(0x16);
+    return;
+  }
+
+  uint64_t pid = 0;
+  if (!parse_hex_u64(args, pid)) {
+    send_error(0x16);
+    return;
+  }
+
+  auto result = target_.process_control->attach(pid);
+  if (!result) {
+    send_packet("");
+    return;
+  }
+  if (result->status == target_status::ok) {
+    attached_state_ = attached_state::attached;
+  }
+  finish_resume(*result, true);
+}
+
+void server::handle_vkill(std::string_view args) {
+  if (!process_control_enabled()) {
+    send_packet("");
+    return;
+  }
+
+  std::optional<uint64_t> pid;
+  if (!args.empty()) {
+    if (args[0] == ';') {
+      args.remove_prefix(1);
+    }
+    if (args.empty()) {
+      send_error(0x16);
+      return;
+    }
+    uint64_t parsed = 0;
+    if (!parse_hex_u64(args, parsed)) {
+      send_error(0x16);
+      return;
+    }
+    pid = parsed;
+  }
+
+  auto status = target_.process_control->kill(pid);
+  if (status == target_status::ok) {
+    attached_state_ = attached_state::unknown;
+  }
+  send_status_error(status, true);
+}
+
+void server::handle_restart(std::string_view) {
+  if (!process_control_enabled()) {
+    send_packet("");
+    return;
+  }
+
+  auto result = target_.process_control->restart();
+  if (!result) {
+    send_packet("");
+    return;
+  }
+  if (result->status != target_status::ok) {
+    send_status_error(result->status, true);
+    return;
+  }
+
+  attached_state_ = attached_state::launched;
+  if (result->state == resume_result::state::running) {
+    exec_state_ = exec_state::running;
+    return;
+  }
+
+  exec_state_ = exec_state::halted;
+  if (result->state == resume_result::state::exited || result->stop.kind == stop_kind::exited) {
+    last_stop_ = result->stop;
+    return;
+  }
+
+  if (non_stop_.enabled) {
+    enqueue_stop(result->stop);
+    maybe_send_stop_notification();
+    return;
+  }
+
+  last_stop_ = result->stop;
 }
 
 void server::handle_continue(std::string_view args, resume_action action, bool has_signal) {
@@ -1499,9 +1675,13 @@ void server::handle_detach() {
   send_packet("OK");
   transport_->disconnect();
   exec_state_ = exec_state::halted;
+  attached_state_ = attached_state::unknown;
 }
 
-void server::handle_extended_mode() { send_packet("OK"); }
+void server::handle_extended_mode() {
+  extended_mode_ = true;
+  send_packet("OK");
+}
 
 void server::handle_j_packet(std::string_view payload) {
   if (payload.rfind("jThreadsInfo", 0) == 0) {
@@ -1902,6 +2082,10 @@ void server::handle_memory_region_info(std::string_view addr_str) {
     }
   }
   send_packet(response);
+}
+
+bool server::process_control_enabled() const {
+  return extended_mode_ && target_.process_control.has_value();
 }
 
 void server::send_ack() { transport_->write(as_bytes(std::string_view{&rsp::ack_char, 1})); }

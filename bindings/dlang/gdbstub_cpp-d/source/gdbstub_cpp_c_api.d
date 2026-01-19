@@ -170,6 +170,13 @@ struct gdbstub_shlib_info {
     uint64_t info_addr;
 }
 
+struct gdbstub_process_launch_request {
+    uint8_t has_filename;
+    gdbstub_string_view filename;
+    const(gdbstub_string_view)* args;
+    size_t args_len;
+}
+
 enum gdbstub_offsets_kind : int {
     GDBSTUB_OFFSETS_SECTION = 0,
     GDBSTUB_OFFSETS_SEGMENT = 1,
@@ -317,6 +324,10 @@ alias gdbstub_thread_stop_reason_fn = extern(C) uint8_t function(
 alias gdbstub_get_host_info_fn = extern(C) uint8_t function(void* ctx, gdbstub_host_info* info_out);
 alias gdbstub_get_process_info_fn = extern(C) uint8_t function(void* ctx, gdbstub_process_info* info_out);
 alias gdbstub_get_shlib_info_fn = extern(C) uint8_t function(void* ctx, gdbstub_shlib_info* info_out);
+alias gdbstub_launch_fn = extern(C) gdbstub_resume_result function(void* ctx, const(gdbstub_process_launch_request)* req);
+alias gdbstub_attach_fn = extern(C) gdbstub_resume_result function(void* ctx, uint64_t pid);
+alias gdbstub_kill_fn = extern(C) gdbstub_target_status function(void* ctx, uint8_t has_pid, uint64_t pid);
+alias gdbstub_restart_fn = extern(C) gdbstub_resume_result function(void* ctx);
 alias gdbstub_get_offsets_info_fn = extern(C) uint8_t function(void* ctx, gdbstub_offsets_info* info_out);
 alias gdbstub_get_register_info_fn = extern(C) uint8_t function(
     void* ctx,
@@ -384,6 +395,14 @@ struct gdbstub_shlib_info_iface {
     gdbstub_get_shlib_info_fn get_shlib_info;
 }
 
+struct gdbstub_process_control_iface {
+    void* ctx;
+    gdbstub_launch_fn launch;
+    gdbstub_attach_fn attach;
+    gdbstub_kill_fn kill;
+    gdbstub_restart_fn restart;
+}
+
 struct gdbstub_offsets_info_iface {
     void* ctx;
     gdbstub_get_offsets_info_fn get_offsets_info;
@@ -404,6 +423,7 @@ struct gdbstub_target_config {
     const(gdbstub_host_info_iface)* host;
     const(gdbstub_process_info_iface)* process;
     const(gdbstub_shlib_info_iface)* shlib;
+    const(gdbstub_process_control_iface)* process_control;
     const(gdbstub_offsets_info_iface)* offsets;
     const(gdbstub_register_info_iface)* reg_info;
 }

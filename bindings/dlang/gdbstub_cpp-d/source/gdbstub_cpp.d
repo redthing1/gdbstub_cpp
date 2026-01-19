@@ -157,6 +157,11 @@ public struct ShlibInfo {
     Nullable!ulong infoAddr;
 }
 
+public struct ProcessLaunchRequest {
+    Nullable!string filename;
+    string[] args;
+}
+
 public struct OffsetsInfo {
     OffsetsKind kind = OffsetsKind.section;
     ulong text = 0;
@@ -256,6 +261,13 @@ public struct ShlibInfoCallbacks {
     Nullable!ShlibInfo delegate() getShlibInfo;
 }
 
+public struct ProcessControlCallbacks {
+    Nullable!ResumeResult delegate(ProcessLaunchRequest request) launch;
+    Nullable!ResumeResult delegate(ulong pid) attach;
+    TargetStatus delegate(Nullable!ulong pid) kill;
+    Nullable!ResumeResult delegate() restart;
+}
+
 public struct OffsetsInfoCallbacks {
     Nullable!OffsetsInfo delegate() getOffsetsInfo;
 }
@@ -274,6 +286,7 @@ public struct TargetCallbacks {
     HostInfoCallbacks host;
     ProcessInfoCallbacks process;
     ShlibInfoCallbacks shlib;
+    ProcessControlCallbacks processControl;
     OffsetsInfoCallbacks offsets;
     RegisterInfoCallbacks registerInfo;
 }
@@ -431,6 +444,26 @@ public struct TargetBuilder {
         return this;
     }
 
+    ref TargetBuilder withProcessControl(ProcessControlCallbacks processControl) {
+        callbacks.processControl = processControl;
+        return this;
+    }
+
+    ref TargetBuilder withProcessControl(
+        Nullable!ResumeResult delegate(ProcessLaunchRequest request) launch,
+        Nullable!ResumeResult delegate(ulong pid) attach = null,
+        TargetStatus delegate(Nullable!ulong pid) kill = null,
+        Nullable!ResumeResult delegate() restart = null
+    ) {
+        ProcessControlCallbacks processControl;
+        processControl.launch = launch;
+        processControl.attach = attach;
+        processControl.kill = kill;
+        processControl.restart = restart;
+        callbacks.processControl = processControl;
+        return this;
+    }
+
     ref TargetBuilder withOffsetsInfo(OffsetsInfoCallbacks offsets) {
         callbacks.offsets = offsets;
         return this;
@@ -538,6 +571,7 @@ public final class Target {
         config.host = null;
         config.process = null;
         config.shlib = null;
+        config.process_control = null;
         config.offsets = null;
         config.reg_info = null;
 
@@ -595,6 +629,19 @@ public final class Target {
             shlibIface.ctx = cast(void*)ctx;
             shlibIface.get_shlib_info = &shlibInfoTramp;
             config.shlib = &shlibIface;
+        }
+
+        gdbstub_process_control_iface processControlIface;
+        if (callbacks.processControl.launch !is null ||
+            callbacks.processControl.attach !is null ||
+            callbacks.processControl.kill !is null ||
+            callbacks.processControl.restart !is null) {
+            processControlIface.ctx = cast(void*)ctx;
+            processControlIface.launch = callbacks.processControl.launch is null ? null : &launchTramp;
+            processControlIface.attach = callbacks.processControl.attach is null ? null : &attachTramp;
+            processControlIface.kill = callbacks.processControl.kill is null ? null : &killTramp;
+            processControlIface.restart = callbacks.processControl.restart is null ? null : &restartTramp;
+            config.process_control = &processControlIface;
         }
 
         gdbstub_offsets_info_iface offsetsIface;
@@ -707,6 +754,13 @@ private gdbstub_string_view toStringView(string value) {
     return view;
 }
 
+private string fromStringView(gdbstub_string_view view) {
+    if (view.data is null || view.size == 0) {
+        return "";
+    }
+    return view.data[0 .. view.size].idup;
+}
+
 private gdbstub_string_view toStringViewNullable(Nullable!string value) {
     if (value.isNull) {
         return gdbstub_string_view(null, 0);
@@ -776,6 +830,15 @@ private gdbstub_resume_result toCResumeResult(ResumeResult result) {
     value.exit_code = result.exitCode;
     value.status = cast(gdbstub_target_status)result.status;
     return value;
+}
+
+private gdbstub_resume_result toCResumeResultOptional(Nullable!ResumeResult result) {
+    if (result.isNull) {
+        ResumeResult fallback;
+        fallback.status = TargetStatus.unsupported;
+        return toCResumeResult(fallback);
+    }
+    return toCResumeResult(result.get);
 }
 
 private gdbstub_run_capabilities toCRunCapabilities(RunCapabilities caps) {
@@ -1191,6 +1254,46 @@ private extern(C) uint8_t shlibInfoTramp(void* ctx, gdbstub_shlib_info* infoOut)
         *infoOut = toCShlibInfo(c.shlibInfoCache.get);
     }
     return 1;
+}
+
+private extern(C) gdbstub_resume_result launchTramp(void* ctx, const(gdbstub_process_launch_request)* request) {
+    auto c = cast(TargetContext)ctx;
+    ProcessLaunchRequest dRequest;
+    if (request !is null) {
+        if (request.has_filename != 0 && request.filename.data !is null && request.filename.size > 0) {
+            dRequest.filename = nullable(fromStringView(request.filename));
+        }
+        if (request.args !is null && request.args_len > 0) {
+            dRequest.args.length = request.args_len;
+            foreach (i; 0 .. request.args_len) {
+                dRequest.args[i] = fromStringView(request.args[i]);
+            }
+        }
+    }
+    auto result = c.callbacks.processControl.launch(dRequest);
+    return toCResumeResultOptional(result);
+}
+
+private extern(C) gdbstub_resume_result attachTramp(void* ctx, uint64_t pid) {
+    auto c = cast(TargetContext)ctx;
+    auto result = c.callbacks.processControl.attach(pid);
+    return toCResumeResultOptional(result);
+}
+
+private extern(C) gdbstub_target_status killTramp(void* ctx, uint8_t hasPid, uint64_t pid) {
+    auto c = cast(TargetContext)ctx;
+    Nullable!ulong dPid;
+    if (hasPid != 0) {
+        dPid = nullable(cast(ulong)pid);
+    }
+    auto status = c.callbacks.processControl.kill(dPid);
+    return cast(gdbstub_target_status)status;
+}
+
+private extern(C) gdbstub_resume_result restartTramp(void* ctx) {
+    auto c = cast(TargetContext)ctx;
+    auto result = c.callbacks.processControl.restart();
+    return toCResumeResultOptional(result);
 }
 
 private extern(C) uint8_t offsetsInfoTramp(void* ctx, gdbstub_offsets_info* infoOut) {

@@ -35,6 +35,13 @@ private class TestTarget {
     private Nullable!ReplayLogBoundary replayLogOverride;
     private Nullable!ResumeRequest lastResumeRequest;
     private TargetStatus resumeStatus = TargetStatus.ok;
+    private Nullable!string lastLaunchFilename;
+    private string[] lastLaunchArgs;
+    private Nullable!ulong lastAttachPid;
+    private bool killCalled;
+    private Nullable!ulong lastKillPid;
+    private bool restartCalled;
+    private TargetStatus killStatus = TargetStatus.ok;
 
     ubyte[regSizeBytes * regCount] regs;
     ubyte[memSize] mem;
@@ -69,6 +76,7 @@ private class TestTarget {
             .withHostInfo(&hostInfo)
             .withProcessInfo(&processInfo)
             .withShlibInfo(&shlibInfo)
+            .withProcessControl(&launchProcess, &attachProcess, &killProcess, &restartProcess)
             .withOffsetsInfo(&offsetsInfo)
             .withBreakpoints(&setBreakpoint, &removeBreakpoint, breakCapsFn)
             .withRegisterInfo(&registerInfo)
@@ -167,6 +175,34 @@ private class TestTarget {
 
     void setStopNotifier(StopNotifier notifier) {
         this.notifier = notifier;
+    }
+
+    Nullable!ResumeResult launchProcess(ProcessLaunchRequest request) {
+        lastLaunchFilename = request.filename;
+        lastLaunchArgs = request.args;
+        auto result = stoppedResult();
+        result.status = resumeStatus;
+        return nullable(result);
+    }
+
+    Nullable!ResumeResult attachProcess(ulong pid) {
+        lastAttachPid = nullable(pid);
+        auto result = stoppedResult();
+        result.status = resumeStatus;
+        return nullable(result);
+    }
+
+    TargetStatus killProcess(Nullable!ulong pid) {
+        killCalled = true;
+        lastKillPid = pid;
+        return killStatus;
+    }
+
+    Nullable!ResumeResult restartProcess() {
+        restartCalled = true;
+        auto result = stoppedResult();
+        result.status = resumeStatus;
+        return nullable(result);
     }
 
     MemoryRegion[] memoryMap() {
@@ -286,6 +322,30 @@ private class TestTarget {
 
     void setResumeStatus(TargetStatus status) {
         resumeStatus = status;
+    }
+
+    Nullable!string lastLaunchFilenameValue() {
+        return lastLaunchFilename;
+    }
+
+    string[] lastLaunchArgsValue() {
+        return lastLaunchArgs;
+    }
+
+    Nullable!ulong lastAttachPidValue() {
+        return lastAttachPid;
+    }
+
+    bool killCalledValue() {
+        return killCalled;
+    }
+
+    Nullable!ulong lastKillPidValue() {
+        return lastKillPid;
+    }
+
+    bool restartCalledValue() {
+        return restartCalled;
     }
 
     ulong currentThreadValue() {
@@ -827,6 +887,60 @@ private void runResumeStatusChecks() {
     assert(client.readPacket() == "E16");
 }
 
+private void runProcessControlChecks() {
+    auto harness = new ServerHarness(IntegrationMode.blocking);
+    scope(exit) harness.stop();
+
+    auto client = new RspClient(harness.address);
+    scope(exit) client.close();
+
+    client.sendPacket("!");
+    assert(client.readPacket() == "OK");
+
+    auto filename = "test.elf";
+    auto arg1 = "arg1";
+    auto arg2 = "arg2";
+    auto vrun = "vRun;" ~ hexEncode(cast(const(ubyte)[])filename) ~ ";" ~
+        hexEncode(cast(const(ubyte)[])arg1) ~ ";" ~ hexEncode(cast(const(ubyte)[])arg2);
+    client.sendPacket(vrun);
+    auto runStop = client.readPacket();
+    assert(runStop.startsWith("T05") || runStop.startsWith("S05"));
+
+    auto lastFilename = harness.target.lastLaunchFilenameValue();
+    assert(!lastFilename.isNull);
+    assert(lastFilename.get == filename);
+    auto lastArgs = harness.target.lastLaunchArgsValue();
+    assert(lastArgs.length == 2);
+    assert(lastArgs[0] == arg1);
+    assert(lastArgs[1] == arg2);
+
+    client.sendPacket("qAttached");
+    assert(client.readPacket() == "0");
+
+    auto pid = 4242UL;
+    client.sendPacket("vAttach;" ~ hexU64(pid));
+    auto attachStop = client.readPacket();
+    assert(attachStop.startsWith("T05") || attachStop.startsWith("S05"));
+
+    auto lastAttach = harness.target.lastAttachPidValue();
+    assert(!lastAttach.isNull);
+    assert(lastAttach.get == pid);
+
+    client.sendPacket("qAttached");
+    assert(client.readPacket() == "1");
+
+    client.sendPacket("vKill");
+    assert(client.readPacket() == "OK");
+    assert(harness.target.killCalledValue());
+    assert(harness.target.lastKillPidValue().isNull);
+
+    client.sendPacket("R00");
+    client.sendPacket("?");
+    auto restartStop = client.readPacket();
+    assert(restartStop.startsWith("T05") || restartStop.startsWith("S05"));
+    assert(harness.target.restartCalledValue());
+}
+
 unittest {
     runBasicProtocolChecks(IntegrationMode.blocking);
 }
@@ -845,4 +959,8 @@ unittest {
 
 unittest {
     runResumeStatusChecks();
+}
+
+unittest {
+    runProcessControlChecks();
 }
