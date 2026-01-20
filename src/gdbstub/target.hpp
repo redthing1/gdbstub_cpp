@@ -12,6 +12,7 @@
 #include <utility>
 #include <vector>
 
+#include "gdbstub/lldb_types.hpp"
 #include "gdbstub/rsp_types.hpp"
 
 namespace gdbstub {
@@ -61,6 +62,22 @@ struct breakpoint_spec {
   }
 };
 
+struct bytecode_expr {
+  std::vector<std::byte> bytes;
+};
+
+struct breakpoint_commands {
+  bool persist = false;
+  std::vector<bytecode_expr> commands;
+};
+
+struct breakpoint_request {
+  breakpoint_spec spec;
+  std::optional<uint64_t> thread_id;
+  std::vector<bytecode_expr> conditions;
+  std::optional<breakpoint_commands> commands;
+};
+
 struct run_capabilities {
   bool reverse_continue = false;
   bool reverse_step = false;
@@ -74,6 +91,9 @@ struct breakpoint_capabilities {
   bool watch_read = false;
   bool watch_write = false;
   bool watch_access = false;
+  bool supports_thread_suffix = false;
+  bool supports_conditional = false;
+  bool supports_commands = false;
 };
 
 enum class mem_perm : uint8_t {
@@ -180,6 +200,12 @@ struct process_info {
 
 struct shlib_info {
   std::optional<uint64_t> info_addr;
+};
+
+struct library_entry {
+  std::string name;
+  std::vector<uint64_t> segments;
+  std::vector<uint64_t> sections;
 };
 
 struct process_launch_request {
@@ -302,12 +328,14 @@ struct run_view {
 
 struct breakpoints_view {
   void* ctx = nullptr;
-  target_status (*set_breakpoint_fn)(void* ctx, const breakpoint_spec& request) = nullptr;
-  target_status (*remove_breakpoint_fn)(void* ctx, const breakpoint_spec& request) = nullptr;
+  target_status (*set_breakpoint_fn)(void* ctx, const breakpoint_request& request) = nullptr;
+  target_status (*remove_breakpoint_fn)(void* ctx, const breakpoint_request& request) = nullptr;
   std::optional<breakpoint_capabilities> (*get_breakpoint_capabilities_fn)(void* ctx) = nullptr;
 
-  target_status set_breakpoint(const breakpoint_spec& request) const { return set_breakpoint_fn(ctx, request); }
-  target_status remove_breakpoint(const breakpoint_spec& request) const {
+  target_status set_breakpoint(const breakpoint_request& request) const {
+    return set_breakpoint_fn(ctx, request);
+  }
+  target_status remove_breakpoint(const breakpoint_request& request) const {
     return remove_breakpoint_fn(ctx, request);
   }
 
@@ -380,6 +408,26 @@ struct shlib_view {
   std::optional<shlib_info> get_shlib_info() const { return get_shlib_info_fn(ctx); }
 };
 
+struct libraries_view {
+  void* ctx = nullptr;
+  std::vector<library_entry> (*get_libraries_fn)(void* ctx) = nullptr;
+  std::optional<uint64_t> (*generation_fn)(void* ctx) = nullptr;
+
+  std::vector<library_entry> libraries() const {
+    if (!get_libraries_fn) {
+      return {};
+    }
+    return get_libraries_fn(ctx);
+  }
+
+  std::optional<uint64_t> generation() const {
+    if (!generation_fn) {
+      return std::nullopt;
+    }
+    return generation_fn(ctx);
+  }
+};
+
 struct process_control_view {
   void* ctx = nullptr;
   std::optional<resume_result> (*launch_fn)(void* ctx, const process_launch_request& request) = nullptr;
@@ -440,6 +488,8 @@ struct target_view {
   std::optional<host_info_view> host;
   std::optional<process_info_view> process;
   std::optional<shlib_view> shlib;
+  std::optional<libraries_view> libraries;
+  std::optional<lldb::view> lldb;
   std::optional<process_control_view> process_control;
   std::optional<offsets_view> offsets;
   std::optional<register_info_view> reg_info;
@@ -504,7 +554,7 @@ concept register_info_capability = requires(T& t, int regno) {
 };
 
 template <typename T>
-concept breakpoints_capability = requires(T& t, const breakpoint_spec& request) {
+concept breakpoints_capability = requires(T& t, const breakpoint_request& request) {
   { t.set_breakpoint(request) } -> std::same_as<target_status>;
   { t.remove_breakpoint(request) } -> std::same_as<target_status>;
 };
@@ -551,6 +601,29 @@ template <typename T>
 concept shlib_capability = requires(T& t) {
   { t.get_shlib_info() } -> std::same_as<std::optional<shlib_info>>;
 };
+
+template <typename T>
+concept libraries_capability = requires(T& t) {
+  { t.libraries() } -> std::same_as<std::vector<library_entry>>;
+};
+
+template <typename T>
+concept libraries_generation_capability = requires(T& t) {
+  { t.libraries_generation() } -> std::same_as<std::optional<uint64_t>>;
+};
+
+template <typename T>
+concept lldb_process_info_extras_capability = requires(T& t) {
+  { t.process_info_extras() } -> std::same_as<std::optional<std::vector<lldb::process_kv_pair>>>;
+};
+
+template <typename T>
+concept lldb_loaded_libraries_capability = requires(T& t, const lldb::loaded_libraries_request& request) {
+  { t.loaded_libraries_json(request) } -> std::same_as<std::optional<std::string>>;
+};
+
+template <typename T>
+concept lldb_capability = lldb_process_info_extras_capability<T> || lldb_loaded_libraries_capability<T>;
 
 template <typename T>
 concept process_launch_capability = requires(T& t, const process_launch_request& request) {
@@ -640,10 +713,10 @@ template <typename T>
 breakpoints_view make_breakpoints_view(T& breakpoints) {
   breakpoints_view view;
   view.ctx = std::addressof(breakpoints);
-  view.set_breakpoint_fn = [](void* ctx, const breakpoint_spec& request) -> target_status {
+  view.set_breakpoint_fn = [](void* ctx, const breakpoint_request& request) -> target_status {
     return static_cast<T*>(ctx)->set_breakpoint(request);
   };
-  view.remove_breakpoint_fn = [](void* ctx, const breakpoint_spec& request) -> target_status {
+  view.remove_breakpoint_fn = [](void* ctx, const breakpoint_request& request) -> target_status {
     return static_cast<T*>(ctx)->remove_breakpoint(request);
   };
   if constexpr (breakpoint_capabilities_capability<T>) {
@@ -719,6 +792,37 @@ shlib_view make_shlib_view(T& shlib) {
 }
 
 template <typename T>
+libraries_view make_libraries_view(T& libraries) {
+  libraries_view view;
+  view.ctx = std::addressof(libraries);
+  view.get_libraries_fn = [](void* ctx) -> std::vector<library_entry> {
+    return static_cast<T*>(ctx)->libraries();
+  };
+  if constexpr (libraries_generation_capability<T>) {
+    view.generation_fn = [](void* ctx) -> std::optional<uint64_t> {
+      return static_cast<T*>(ctx)->libraries_generation();
+    };
+  }
+  return view;
+}
+
+template <typename T>
+lldb::view make_lldb_view(T& lldb_ext) {
+  lldb::view view;
+  view.ctx = std::addressof(lldb_ext);
+  if constexpr (lldb_process_info_extras_capability<T>) {
+    view.process_info_extras_fn = [](void* ctx) -> std::optional<std::vector<lldb::process_kv_pair>> {
+      return static_cast<T*>(ctx)->process_info_extras();
+    };
+  }
+  if constexpr (lldb_loaded_libraries_capability<T>) {
+    view.loaded_libraries_json_fn = [](void* ctx, const lldb::loaded_libraries_request& request)
+        -> std::optional<std::string> { return static_cast<T*>(ctx)->loaded_libraries_json(request); };
+  }
+  return view;
+}
+
+template <typename T>
 process_control_view make_process_control_view(T& control) {
   process_control_view view;
   view.ctx = std::addressof(control);
@@ -772,6 +876,7 @@ void assign_optional(target_view& view, T& obj) {
   static_assert(!run_capability<T>, "Optional capability object implements run control; pass it as run.");
   constexpr int matches = breakpoints_capability<T> + threads_capability<T> + memory_layout_capability<T> +
                           host_info_capability<T> + process_info_capability<T> + shlib_capability<T> +
+                          libraries_capability<T> + lldb_capability<T> +
                           process_control_capability<T> + offsets_capability<T> + register_info_capability<T>;
   static_assert(matches >= 1, "Optional capability object must implement at least one optional capability.");
 
@@ -792,6 +897,12 @@ void assign_optional(target_view& view, T& obj) {
   }
   if constexpr (shlib_capability<T>) {
     view.shlib = make_shlib_view(obj);
+  }
+  if constexpr (libraries_capability<T>) {
+    view.libraries = make_libraries_view(obj);
+  }
+  if constexpr (lldb_capability<T>) {
+    view.lldb = make_lldb_view(obj);
   }
   if constexpr (process_control_capability<T>) {
     view.process_control = make_process_control_view(obj);
@@ -824,6 +935,10 @@ target make_target(Regs& regs, Mem& mem, Run& run, Opts&... opts) {
   static_assert(process_count <= 1, "Process info capability provided multiple times.");
   constexpr int shlib_count = (0 + ... + detail::shlib_capability<Opts>);
   static_assert(shlib_count <= 1, "Shlib capability provided multiple times.");
+  constexpr int libraries_count = (0 + ... + detail::libraries_capability<Opts>);
+  static_assert(libraries_count <= 1, "Libraries capability provided multiple times.");
+  constexpr int lldb_count = (0 + ... + detail::lldb_capability<Opts>);
+  static_assert(lldb_count <= 1, "LLDB capability provided multiple times.");
   constexpr int process_control_count = (0 + ... + detail::process_control_capability<Opts>);
   static_assert(process_control_count <= 1, "Process control capability provided multiple times.");
   constexpr int offsets_count = (0 + ... + detail::offsets_capability<Opts>);

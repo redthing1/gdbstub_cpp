@@ -90,19 +90,19 @@ class breakpoints_component {
 public:
   explicit breakpoints_component(machine& machine) : machine_(machine) {}
 
-  target_status set_breakpoint(const breakpoint_spec& request) {
-    if (!supports(request.type)) {
+  target_status set_breakpoint(const breakpoint_request& request) {
+    if (!supports(request.spec.type)) {
       return target_status::unsupported;
     }
-    machine_.add_breakpoint(request);
+    machine_.add_breakpoint(request.spec);
     return target_status::ok;
   }
 
-  target_status remove_breakpoint(const breakpoint_spec& request) {
-    if (!supports(request.type)) {
+  target_status remove_breakpoint(const breakpoint_request& request) {
+    if (!supports(request.spec.type)) {
       return target_status::unsupported;
     }
-    machine_.remove_breakpoint(request);
+    machine_.remove_breakpoint(request.spec);
     return target_status::ok;
   }
 

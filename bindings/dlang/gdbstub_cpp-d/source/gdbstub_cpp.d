@@ -1,6 +1,7 @@
 module gdbstub_cpp;
 
 import core.stdc.stdint : uint32_t, uint64_t, uint8_t;
+import std.array : dup;
 import std.exception : enforce;
 import std.typecons : Nullable, nullable;
 import gdbstub_cpp_c_api;
@@ -109,12 +110,31 @@ public struct BreakpointCapabilities {
     bool watchRead = false;
     bool watchWrite = false;
     bool watchAccess = false;
+    bool supportsThreadSuffix = false;
+    bool supportsConditional = false;
+    bool supportsCommands = false;
 }
 
 public struct BreakpointSpec {
     BreakpointType type = BreakpointType.software;
     ulong addr = 0;
     uint length = 0;
+}
+
+public struct BytecodeExpr {
+    ubyte[] bytes;
+}
+
+public struct BreakpointCommands {
+    bool persist = false;
+    BytecodeExpr[] commands;
+}
+
+public struct BreakpointRequest {
+    BreakpointSpec spec;
+    Nullable!ulong threadId;
+    BytecodeExpr[] conditions;
+    Nullable!BreakpointCommands commands;
 }
 
 public struct MemoryRegion {
@@ -230,8 +250,8 @@ public struct RunCallbacks {
 }
 
 public struct BreakpointsCallbacks {
-    TargetStatus delegate(BreakpointSpec spec) setBreakpoint;
-    TargetStatus delegate(BreakpointSpec spec) removeBreakpoint;
+    TargetStatus delegate(BreakpointRequest request) setBreakpoint;
+    TargetStatus delegate(BreakpointRequest request) removeBreakpoint;
     Nullable!BreakpointCapabilities delegate() getCapabilities;
 }
 
@@ -356,8 +376,8 @@ public struct TargetBuilder {
     }
 
     ref TargetBuilder withBreakpoints(
-        TargetStatus delegate(BreakpointSpec spec) setBreakpoint,
-        TargetStatus delegate(BreakpointSpec spec) removeBreakpoint,
+        TargetStatus delegate(BreakpointRequest request) setBreakpoint,
+        TargetStatus delegate(BreakpointRequest request) removeBreakpoint,
         Nullable!BreakpointCapabilities delegate() getCapabilities = null
     ) {
         BreakpointsCallbacks breakpoints;
@@ -571,6 +591,7 @@ public final class Target {
         config.host = null;
         config.process = null;
         config.shlib = null;
+        config.libraries = null;
         config.process_control = null;
         config.offsets = null;
         config.reg_info = null;
@@ -857,6 +878,9 @@ private gdbstub_breakpoint_capabilities toCBreakpointCapabilities(BreakpointCapa
     result.watch_read = caps.watchRead ? 1 : 0;
     result.watch_write = caps.watchWrite ? 1 : 0;
     result.watch_access = caps.watchAccess ? 1 : 0;
+    result.supports_thread_suffix = caps.supportsThreadSuffix ? 1 : 0;
+    result.supports_conditional = caps.supportsConditional ? 1 : 0;
+    result.supports_commands = caps.supportsCommands ? 1 : 0;
     return result;
 }
 
@@ -1066,29 +1090,56 @@ private extern(C) uint8_t getRunCapabilitiesTramp(void* ctx, gdbstub_run_capabil
     return 1;
 }
 
-private extern(C) gdbstub_target_status setBreakpointTramp(void* ctx, const(gdbstub_breakpoint_spec)* spec) {
+private BytecodeExpr[] toBytecodeExprs(gdbstub_slice_bytecode_expr slice) {
+    if (slice.data is null || slice.len == 0) {
+        return [];
+    }
+    BytecodeExpr[] out;
+    out.length = slice.len;
+    foreach (i; 0 .. slice.len) {
+        auto expr = slice.data[i];
+        if (expr.data !is null && expr.len > 0) {
+            out[i].bytes = expr.data[0 .. expr.len].dup;
+        }
+    }
+    return out;
+}
+
+private BreakpointRequest toDBreakpointRequest(const(gdbstub_breakpoint_request)* request) {
+    BreakpointRequest result;
+    result.spec.type = cast(BreakpointType)request.spec.type;
+    result.spec.addr = request.spec.addr;
+    result.spec.length = request.spec.length;
+    if (request.has_thread_id != 0) {
+        result.threadId = nullable(request.thread_id);
+    }
+    result.conditions = toBytecodeExprs(request.conditions);
+    if (request.has_commands != 0) {
+        BreakpointCommands commands;
+        commands.persist = request.commands.persist != 0;
+        commands.commands = toBytecodeExprs(request.commands.commands);
+        result.commands = nullable(commands);
+    }
+    return result;
+}
+
+private extern(C) gdbstub_target_status setBreakpointTramp(void* ctx, const(gdbstub_breakpoint_request)* request) {
     auto c = cast(TargetContext)ctx;
-    if (spec is null) {
+    if (request is null) {
         return gdbstub_target_status.GDBSTUB_TARGET_INVALID;
     }
-    BreakpointSpec dSpec;
-    dSpec.type = cast(BreakpointType)spec.type;
-    dSpec.addr = spec.addr;
-    dSpec.length = spec.length;
-    auto status = c.callbacks.breakpoints.setBreakpoint(dSpec);
+    auto dRequest = toDBreakpointRequest(request);
+    auto status = c.callbacks.breakpoints.setBreakpoint(dRequest);
     return cast(gdbstub_target_status)status;
 }
 
-private extern(C) gdbstub_target_status removeBreakpointTramp(void* ctx, const(gdbstub_breakpoint_spec)* spec) {
+private extern(C) gdbstub_target_status removeBreakpointTramp(void* ctx, const(gdbstub_breakpoint_request)* request) {
     auto c = cast(TargetContext)ctx;
-    if (spec is null) {
+    if (request is null) {
         return gdbstub_target_status.GDBSTUB_TARGET_INVALID;
     }
-    BreakpointSpec dSpec;
-    dSpec.type = cast(BreakpointType)spec.type;
-    dSpec.addr = spec.addr;
-    dSpec.length = spec.length;
-    auto status = c.callbacks.breakpoints.removeBreakpoint(dSpec);
+    auto dRequest = toDBreakpointRequest(request);
+    auto status = c.callbacks.breakpoints.removeBreakpoint(dRequest);
     return cast(gdbstub_target_status)status;
 }
 

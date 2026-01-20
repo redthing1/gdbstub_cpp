@@ -101,6 +101,24 @@ gdbstub::breakpoint_capabilities to_breakpoint_capabilities(const gdbstub_breakp
   out.watch_read = caps.watch_read != 0;
   out.watch_write = caps.watch_write != 0;
   out.watch_access = caps.watch_access != 0;
+  out.supports_thread_suffix = caps.supports_thread_suffix != 0;
+  out.supports_conditional = caps.supports_conditional != 0;
+  out.supports_commands = caps.supports_commands != 0;
+  return out;
+}
+
+std::vector<uint64_t> to_u64_vector(const gdbstub_slice_u64& slice) {
+  if (!slice.data || slice.len == 0) {
+    return {};
+  }
+  return std::vector<uint64_t>(slice.data, slice.data + slice.len);
+}
+
+gdbstub::library_entry to_library_entry(const gdbstub_library_entry& entry) {
+  gdbstub::library_entry out;
+  out.name = to_string(entry.name);
+  out.segments = to_u64_vector(entry.segments);
+  out.sections = to_u64_vector(entry.sections);
   return out;
 }
 
@@ -252,6 +270,7 @@ struct c_target {
   std::optional<gdbstub_host_info_iface> host;
   std::optional<gdbstub_process_info_iface> process;
   std::optional<gdbstub_shlib_info_iface> shlib;
+  std::optional<gdbstub_libraries_iface> libraries;
   std::optional<gdbstub_process_control_iface> process_control;
   std::optional<gdbstub_offsets_info_iface> offsets;
   std::optional<gdbstub_register_info_iface> reg_info;
@@ -276,6 +295,9 @@ struct c_target {
     }
     if (config.shlib) {
       shlib = *config.shlib;
+    }
+    if (config.libraries) {
+      libraries = *config.libraries;
     }
     if (config.process_control) {
       process_control = *config.process_control;
@@ -409,27 +431,66 @@ struct c_target {
     return to_run_capabilities(caps);
   }
 
-  static gdbstub::target_status set_breakpoint_tramp(void* ctx, const gdbstub::breakpoint_spec& spec) {
+  static gdbstub_breakpoint_request make_breakpoint_request(
+      const gdbstub::breakpoint_request& request,
+      std::vector<gdbstub_bytecode_expr>& conditions,
+      std::vector<gdbstub_bytecode_expr>& commands
+  ) {
+    gdbstub_breakpoint_request out{};
+    out.spec.type = static_cast<gdbstub_breakpoint_type>(request.spec.type);
+    out.spec.addr = request.spec.addr;
+    out.spec.length = request.spec.length;
+    out.has_thread_id = request.thread_id.has_value() ? 1 : 0;
+    out.thread_id = request.thread_id.value_or(0);
+
+    if (!request.conditions.empty()) {
+      conditions.reserve(request.conditions.size());
+      for (const auto& cond : request.conditions) {
+        gdbstub_bytecode_expr expr{};
+        expr.data = reinterpret_cast<const uint8_t*>(cond.bytes.data());
+        expr.len = cond.bytes.size();
+        conditions.push_back(expr);
+      }
+      out.conditions.data = conditions.data();
+      out.conditions.len = conditions.size();
+    }
+
+    if (request.commands) {
+      out.has_commands = 1;
+      out.commands.persist = request.commands->persist ? 1 : 0;
+      if (!request.commands->commands.empty()) {
+        commands.reserve(request.commands->commands.size());
+        for (const auto& cmd : request.commands->commands) {
+          gdbstub_bytecode_expr expr{};
+          expr.data = reinterpret_cast<const uint8_t*>(cmd.bytes.data());
+          expr.len = cmd.bytes.size();
+          commands.push_back(expr);
+        }
+        out.commands.commands.data = commands.data();
+        out.commands.commands.len = commands.size();
+      }
+    }
+
+    return out;
+  }
+
+  static gdbstub::target_status set_breakpoint_tramp(void* ctx, const gdbstub::breakpoint_request& request) {
     auto* self = static_cast<c_target*>(ctx);
-    const auto c_spec = gdbstub_breakpoint_spec{
-        static_cast<gdbstub_breakpoint_type>(spec.type),
-        spec.addr,
-        spec.length,
-    };
+    std::vector<gdbstub_bytecode_expr> conditions;
+    std::vector<gdbstub_bytecode_expr> commands;
+    auto c_request = make_breakpoint_request(request, conditions, commands);
     return static_cast<gdbstub::target_status>(
-        self->breakpoints->set_breakpoint(self->breakpoints->ctx, &c_spec)
+        self->breakpoints->set_breakpoint(self->breakpoints->ctx, &c_request)
     );
   }
 
-  static gdbstub::target_status remove_breakpoint_tramp(void* ctx, const gdbstub::breakpoint_spec& spec) {
+  static gdbstub::target_status remove_breakpoint_tramp(void* ctx, const gdbstub::breakpoint_request& request) {
     auto* self = static_cast<c_target*>(ctx);
-    const auto c_spec = gdbstub_breakpoint_spec{
-        static_cast<gdbstub_breakpoint_type>(spec.type),
-        spec.addr,
-        spec.length,
-    };
+    std::vector<gdbstub_bytecode_expr> conditions;
+    std::vector<gdbstub_bytecode_expr> commands;
+    auto c_request = make_breakpoint_request(request, conditions, commands);
     return static_cast<gdbstub::target_status>(
-        self->breakpoints->remove_breakpoint(self->breakpoints->ctx, &c_spec)
+        self->breakpoints->remove_breakpoint(self->breakpoints->ctx, &c_request)
     );
   }
 
@@ -545,6 +606,35 @@ struct c_target {
       return std::nullopt;
     }
     return to_shlib_info(info);
+  }
+
+  static std::vector<gdbstub::library_entry> libraries_tramp(void* ctx) {
+    auto* self = static_cast<c_target*>(ctx);
+    if (!self->libraries || !self->libraries->get_libraries) {
+      return {};
+    }
+    auto entries = self->libraries->get_libraries(self->libraries->ctx);
+    if (!entries.data || entries.len == 0) {
+      return {};
+    }
+    std::vector<gdbstub::library_entry> out;
+    out.reserve(entries.len);
+    for (size_t i = 0; i < entries.len; ++i) {
+      out.push_back(to_library_entry(entries.data[i]));
+    }
+    return out;
+  }
+
+  static std::optional<uint64_t> libraries_generation_tramp(void* ctx) {
+    auto* self = static_cast<c_target*>(ctx);
+    if (!self->libraries || !self->libraries->get_libraries_generation) {
+      return std::nullopt;
+    }
+    uint64_t generation = 0;
+    if (!self->libraries->get_libraries_generation(self->libraries->ctx, &generation)) {
+      return std::nullopt;
+    }
+    return generation;
   }
 
   static std::optional<gdbstub::resume_result> launch_tramp(
@@ -692,6 +782,14 @@ struct c_target {
       sv.ctx = this;
       sv.get_shlib_info_fn = &shlib_info_tramp;
       view.shlib = sv;
+    }
+
+    if (libraries) {
+      gdbstub::libraries_view lv;
+      lv.ctx = this;
+      lv.get_libraries_fn = &libraries_tramp;
+      lv.generation_fn = &libraries_generation_tramp;
+      view.libraries = lv;
     }
 
     if (process_control) {

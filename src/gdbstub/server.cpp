@@ -173,6 +173,22 @@ struct vcont_selection {
   std::optional<address_range> range;
 };
 
+struct breakpoint_suffixes {
+  bool has_thread = false;
+  bool has_cond_list = false;
+  bool has_cmds = false;
+  std::optional<uint64_t> thread_id;
+  std::vector<bytecode_expr> conditions;
+  std::optional<breakpoint_commands> commands;
+};
+
+struct breakpoint_parse_result {
+  int type = 0;
+  uint64_t addr = 0;
+  uint64_t kind = 0;
+  breakpoint_suffixes suffixes{};
+};
+
 vcont_parse_result parse_vcont_actions(std::string_view actions,
                                        uint64_t current_tid,
                                        vcont_selection& out) {
@@ -255,6 +271,156 @@ bool split_thread_suffix(std::string_view payload, std::string_view& base, std::
   return true;
 }
 
+bool parse_bytecode_list(std::string_view input, std::vector<bytecode_expr>& out) {
+  out.clear();
+  if (input.empty()) {
+    return false;
+  }
+
+  size_t pos = 0;
+  while (pos < input.size()) {
+    if (input[pos] != 'X') {
+      return false;
+    }
+    ++pos;
+    auto comma = input.find(',', pos);
+    if (comma == std::string_view::npos) {
+      return false;
+    }
+    auto len_str = input.substr(pos, comma - pos);
+    if (len_str.empty()) {
+      return false;
+    }
+    uint64_t byte_len = 0;
+    if (!parse_hex_u64(len_str, byte_len)) {
+      return false;
+    }
+    if (byte_len > std::numeric_limits<size_t>::max() / 2) {
+      return false;
+    }
+    size_t hex_len = static_cast<size_t>(byte_len) * 2;
+    pos = comma + 1;
+    if (pos + hex_len > input.size()) {
+      return false;
+    }
+    std::vector<std::byte> buffer(static_cast<size_t>(byte_len));
+    if (!rsp::decode_hex(input.substr(pos, hex_len), buffer)) {
+      return false;
+    }
+    out.push_back(bytecode_expr{std::move(buffer)});
+    pos += hex_len;
+  }
+  return !out.empty();
+}
+
+bool parse_breakpoint_commands(std::string_view input, breakpoint_commands& out) {
+  out = {};
+  auto comma = input.find(',');
+  if (comma == std::string_view::npos) {
+    return false;
+  }
+  auto persist_str = input.substr(0, comma);
+  if (persist_str.empty()) {
+    return false;
+  }
+  int persist = 0;
+  if (!parse_dec_int(persist_str, persist)) {
+    return false;
+  }
+  out.persist = persist != 0;
+  auto list = input.substr(comma + 1);
+  if (!parse_bytecode_list(list, out.commands)) {
+    return false;
+  }
+  return true;
+}
+
+bool parse_breakpoint_suffixes(std::string_view suffix, breakpoint_suffixes& out) {
+  out = {};
+  if (suffix.empty()) {
+    return true;
+  }
+
+  size_t start = 0;
+  while (start < suffix.size()) {
+    auto next = suffix.find(';', start);
+    auto part = suffix.substr(start, next == std::string_view::npos ? suffix.size() - start : next - start);
+    if (!part.empty()) {
+      if (part.rfind("thread:", 0) == 0) {
+        if (out.has_thread) {
+          return false;
+        }
+        auto id_str = part.substr(std::string_view("thread:").size());
+        if (id_str.empty()) {
+          return false;
+        }
+        if (!parse_thread_token(id_str, out.thread_id)) {
+          return false;
+        }
+        out.has_thread = true;
+      } else if (part.rfind("cmds:", 0) == 0) {
+        if (out.has_cmds) {
+          return false;
+        }
+        breakpoint_commands commands;
+        if (!parse_breakpoint_commands(part.substr(std::string_view("cmds:").size()), commands)) {
+          return false;
+        }
+        out.commands = std::move(commands);
+        out.has_cmds = true;
+      } else if (part.front() == 'X') {
+        if (out.has_cond_list) {
+          return false;
+        }
+        if (!parse_bytecode_list(part, out.conditions)) {
+          return false;
+        }
+        out.has_cond_list = true;
+      } else {
+        return false;
+      }
+    }
+
+    if (next == std::string_view::npos) {
+      break;
+    }
+    start = next + 1;
+  }
+  return true;
+}
+
+bool parse_breakpoint_packet(std::string_view args, breakpoint_parse_result& out) {
+  out = {};
+  auto first = args.find(',');
+  auto second = args.find(',', first + 1);
+  if (first == std::string_view::npos || second == std::string_view::npos) {
+    return false;
+  }
+
+  if (!parse_dec_int(args.substr(0, first), out.type)) {
+    return false;
+  }
+
+  auto suffix_pos = args.find(';', second + 1);
+  std::string_view kind_str = suffix_pos == std::string_view::npos
+                                  ? args.substr(second + 1)
+                                  : args.substr(second + 1, suffix_pos - (second + 1));
+
+  if (!parse_hex_u64(args.substr(first + 1, second - first - 1), out.addr) ||
+      !parse_hex_u64(kind_str, out.kind)) {
+    return false;
+  }
+
+  if (suffix_pos != std::string_view::npos) {
+    auto suffix = args.substr(suffix_pos + 1);
+    if (!parse_breakpoint_suffixes(suffix, out.suffixes)) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
 std::string escape_json_string(std::string_view value) {
   std::string out;
   out.reserve(value.size());
@@ -319,6 +485,102 @@ std::optional<uint64_t> parse_json_thread_id(std::string_view json) {
   return tid;
 }
 
+bool parse_json_bool(std::string_view json, std::string_view key, bool& value) {
+  std::string token = "\"";
+  token.append(key.data(), key.size());
+  token.push_back('"');
+  auto key_pos = json.find(token);
+  if (key_pos == std::string_view::npos) {
+    return false;
+  }
+  auto colon = json.find(':', key_pos + token.size());
+  if (colon == std::string_view::npos) {
+    return false;
+  }
+  size_t pos = colon + 1;
+  while (pos < json.size() && std::isspace(static_cast<unsigned char>(json[pos])) != 0) {
+    ++pos;
+  }
+  if (json.compare(pos, 4, "true") == 0) {
+    value = true;
+    return true;
+  }
+  if (json.compare(pos, 5, "false") == 0) {
+    value = false;
+    return true;
+  }
+  return false;
+}
+
+std::optional<uint64_t> parse_json_u64(std::string_view json, std::string_view key) {
+  std::string token = "\"";
+  token.append(key.data(), key.size());
+  token.push_back('"');
+  auto key_pos = json.find(token);
+  if (key_pos == std::string_view::npos) {
+    return std::nullopt;
+  }
+  auto colon = json.find(':', key_pos + token.size());
+  if (colon == std::string_view::npos) {
+    return std::nullopt;
+  }
+  size_t pos = colon + 1;
+  while (pos < json.size() && std::isspace(static_cast<unsigned char>(json[pos])) != 0) {
+    ++pos;
+  }
+  if (pos >= json.size()) {
+    return std::nullopt;
+  }
+  uint64_t value = 0;
+  auto result = std::from_chars(json.data() + pos, json.data() + json.size(), value, 10);
+  if (result.ec != std::errc{}) {
+    return std::nullopt;
+  }
+  return value;
+}
+
+bool parse_json_u64_list(std::string_view json, std::string_view key, std::vector<uint64_t>& values) {
+  values.clear();
+  std::string token = "\"";
+  token.append(key.data(), key.size());
+  token.push_back('"');
+  auto key_pos = json.find(token);
+  if (key_pos == std::string_view::npos) {
+    return false;
+  }
+  auto colon = json.find(':', key_pos + token.size());
+  if (colon == std::string_view::npos) {
+    return false;
+  }
+  auto open = json.find('[', colon + 1);
+  if (open == std::string_view::npos) {
+    return false;
+  }
+  size_t pos = open + 1;
+  while (pos < json.size()) {
+    while (pos < json.size() && std::isspace(static_cast<unsigned char>(json[pos])) != 0) {
+      ++pos;
+    }
+    if (pos >= json.size() || json[pos] == ']') {
+      break;
+    }
+    uint64_t value = 0;
+    auto result = std::from_chars(json.data() + pos, json.data() + json.size(), value, 10);
+    if (result.ec != std::errc{}) {
+      return false;
+    }
+    values.push_back(value);
+    pos = static_cast<size_t>(result.ptr - json.data());
+    while (pos < json.size() && json[pos] != ',' && json[pos] != ']') {
+      ++pos;
+    }
+    if (pos < json.size() && json[pos] == ',') {
+      ++pos;
+    }
+  }
+  return true;
+}
+
 std::string stop_reason_label(stop_kind kind) {
   switch (kind) {
   case stop_kind::sw_break:
@@ -355,6 +617,68 @@ std::string build_memory_map_xml(const std::vector<memory_region>& regions) {
     xml += "/>";
   }
   xml += "</memory-map>";
+  return xml;
+}
+
+std::string escape_xml_attr(std::string_view value) {
+  std::string out;
+  out.reserve(value.size());
+  for (char c : value) {
+    switch (c) {
+    case '&':
+      out += "&amp;";
+      break;
+    case '<':
+      out += "&lt;";
+      break;
+    case '>':
+      out += "&gt;";
+      break;
+    case '"':
+      out += "&quot;";
+      break;
+    case '\'':
+      out += "&apos;";
+      break;
+    default:
+      out.push_back(c);
+      break;
+    }
+  }
+  return out;
+}
+
+std::string build_library_list_xml(const std::vector<library_entry>& libraries) {
+  std::string xml;
+  xml.reserve(128 + libraries.size() * 80);
+  xml += "<library-list version=\"1.0\">";
+  for (const auto& lib : libraries) {
+    if (lib.name.empty()) {
+      continue;
+    }
+    const bool has_segments = !lib.segments.empty();
+    const bool has_sections = !lib.sections.empty();
+    if (has_segments == has_sections) {
+      continue;
+    }
+
+    xml += "<library name=\"";
+    xml += escape_xml_attr(lib.name);
+    xml += "\">";
+
+    const auto& addrs = has_segments ? lib.segments : lib.sections;
+    const char* tag = has_segments ? "segment" : "section";
+    for (uint64_t addr : addrs) {
+      xml += "<";
+      xml += tag;
+      xml += " address=\"0x";
+      xml += hex_u64(addr);
+      xml += "\"/>";
+    }
+
+    xml += "</library>";
+  }
+  xml += "</library-list>";
   return xml;
 }
 
@@ -707,6 +1031,12 @@ void server::handle_query(std::string_view args) {
     if (bp_caps.hardware) {
       features += ";hwbreak+";
     }
+    if (bp_caps.supports_conditional) {
+      features += ";ConditionalBreakpoints+";
+    }
+    if (bp_caps.supports_commands) {
+      features += ";BreakpointCommands+";
+    }
     if (caps.reverse_continue) {
       features += ";ReverseContinue+";
     }
@@ -727,6 +1057,9 @@ void server::handle_query(std::string_view args) {
     }
     if (target_.memory_layout && target_.memory_layout->has_memory_map()) {
       features += ";qXfer:memory-map:read+";
+    }
+    if (target_.libraries) {
+      features += ";qXfer:libraries:read+";
     }
     send_packet(features);
     return;
@@ -911,7 +1244,8 @@ void server::handle_v_packet(std::string_view args) {
       send_packet("OK");
       return;
     }
-    send_packet(build_stop_reply_payload(*reason));
+    bool include_library = consume_library_change();
+    send_packet(build_stop_reply_payload(*reason, include_library));
     return;
   }
 
@@ -1552,37 +1886,42 @@ void server::handle_insert_breakpoint(std::string_view args) {
     return;
   }
 
-  auto first = args.find(',');
-  auto second = args.find(',', first + 1);
-  if (first == std::string_view::npos || second == std::string_view::npos) {
+  breakpoint_parse_result parsed;
+  if (!parse_breakpoint_packet(args, parsed)) {
     send_error(0x16);
     return;
   }
 
-  int parsed_type = 0;
-  if (!parse_dec_int(args.substr(0, first), parsed_type)) {
-    send_error(0x16);
-    return;
-  }
-  auto type = parse_breakpoint_type(parsed_type);
+  auto type = parse_breakpoint_type(parsed.type);
   if (!type) {
     send_packet("");
     return;
   }
-
-  uint64_t addr = 0;
-  uint64_t kind = 0;
-  if (!parse_hex_u64(args.substr(first + 1, second - first - 1), addr) ||
-      !parse_hex_u64(args.substr(second + 1), kind)) {
-    send_error(0x16);
-    return;
-  }
-  if (kind > std::numeric_limits<uint32_t>::max()) {
+  if (parsed.kind > std::numeric_limits<uint32_t>::max()) {
     send_error(0x16);
     return;
   }
 
-  breakpoint_spec request{*type, addr, static_cast<uint32_t>(kind)};
+  auto caps = breakpoint_caps();
+  if (!parsed.suffixes.conditions.empty() && !caps.supports_conditional) {
+    send_packet("");
+    return;
+  }
+  if (parsed.suffixes.commands && !caps.supports_commands) {
+    send_packet("");
+    return;
+  }
+  breakpoint_request request;
+  request.spec = {*type, parsed.addr, static_cast<uint32_t>(parsed.kind)};
+  if (caps.supports_thread_suffix && parsed.suffixes.thread_id) {
+    request.thread_id = parsed.suffixes.thread_id;
+    if (target_.threads) {
+      target_.threads->set_current_thread(*parsed.suffixes.thread_id);
+    }
+  }
+  request.conditions = std::move(parsed.suffixes.conditions);
+  request.commands = std::move(parsed.suffixes.commands);
+
   auto status = target_.breakpoints->set_breakpoint(request);
   if (status == target_status::unsupported) {
     send_packet("");
@@ -1597,37 +1936,42 @@ void server::handle_remove_breakpoint(std::string_view args) {
     return;
   }
 
-  auto first = args.find(',');
-  auto second = args.find(',', first + 1);
-  if (first == std::string_view::npos || second == std::string_view::npos) {
+  breakpoint_parse_result parsed;
+  if (!parse_breakpoint_packet(args, parsed)) {
     send_error(0x16);
     return;
   }
 
-  int parsed_type = 0;
-  if (!parse_dec_int(args.substr(0, first), parsed_type)) {
-    send_error(0x16);
-    return;
-  }
-  auto type = parse_breakpoint_type(parsed_type);
+  auto type = parse_breakpoint_type(parsed.type);
   if (!type) {
     send_packet("");
     return;
   }
-
-  uint64_t addr = 0;
-  uint64_t kind = 0;
-  if (!parse_hex_u64(args.substr(first + 1, second - first - 1), addr) ||
-      !parse_hex_u64(args.substr(second + 1), kind)) {
-    send_error(0x16);
-    return;
-  }
-  if (kind > std::numeric_limits<uint32_t>::max()) {
+  if (parsed.kind > std::numeric_limits<uint32_t>::max()) {
     send_error(0x16);
     return;
   }
 
-  breakpoint_spec request{*type, addr, static_cast<uint32_t>(kind)};
+  auto caps = breakpoint_caps();
+  if (!parsed.suffixes.conditions.empty() && !caps.supports_conditional) {
+    send_packet("");
+    return;
+  }
+  if (parsed.suffixes.commands && !caps.supports_commands) {
+    send_packet("");
+    return;
+  }
+  breakpoint_request request;
+  request.spec = {*type, parsed.addr, static_cast<uint32_t>(parsed.kind)};
+  if (caps.supports_thread_suffix && parsed.suffixes.thread_id) {
+    request.thread_id = parsed.suffixes.thread_id;
+    if (target_.threads) {
+      target_.threads->set_current_thread(*parsed.suffixes.thread_id);
+    }
+  }
+  request.conditions = std::move(parsed.suffixes.conditions);
+  request.commands = std::move(parsed.suffixes.commands);
+
   auto status = target_.breakpoints->remove_breakpoint(request);
   if (status == target_status::unsupported) {
     send_packet("");
@@ -1703,6 +2047,16 @@ void server::handle_j_packet(std::string_view payload) {
 
   if (payload.rfind("jThreadExtendedInfo:", 0) == 0) {
     handle_thread_extended_info(payload.substr(std::string_view("jThreadExtendedInfo:").size()));
+    return;
+  }
+
+  if (payload.rfind("jGetLoadedDynamicLibrariesInfos", 0) == 0) {
+    auto pos = payload.find(':');
+    std::string_view args;
+    if (pos != std::string_view::npos) {
+      args = payload.substr(pos + 1);
+    }
+    handle_loaded_dynamic_libraries_infos(args);
     return;
   }
 
@@ -1797,6 +2151,55 @@ void server::handle_thread_extended_info(std::string_view args) {
   json.push_back('}');
 
   auto escaped = rsp::escape_binary(as_bytes(json));
+  send_packet(escaped);
+}
+
+void server::handle_loaded_dynamic_libraries_infos(std::string_view args) {
+  if (!target_.lldb) {
+    send_packet("");
+    return;
+  }
+
+  if (args.empty()) {
+    send_packet("OK");
+    return;
+  }
+
+  std::string request(args);
+  rsp::unescape_binary(request);
+
+  lldb::loaded_libraries_request parsed{};
+  bool report_load_commands = true;
+  if (parse_json_bool(request, "report_load_commands", report_load_commands)) {
+    parsed.report_load_commands = report_load_commands;
+  }
+
+  bool fetch_all = false;
+  if (parse_json_bool(request, "fetch_all_solibs", fetch_all) && fetch_all) {
+    parsed.kind = lldb::loaded_libraries_request::kind::all;
+  }
+
+  std::vector<uint64_t> addresses;
+  if (parse_json_u64_list(request, "solib_addresses", addresses)) {
+    parsed.kind = lldb::loaded_libraries_request::kind::addresses;
+    parsed.addresses = std::move(addresses);
+  }
+
+  auto image_count = parse_json_u64(request, "image_count");
+  auto image_list_address = parse_json_u64(request, "image_list_address");
+  if (image_count && image_list_address) {
+    parsed.kind = lldb::loaded_libraries_request::kind::image_list;
+    parsed.image_count = *image_count;
+    parsed.image_list_address = *image_list_address;
+  }
+
+  auto payload = target_.lldb->loaded_libraries_json(parsed);
+  if (!payload) {
+    send_packet("");
+    return;
+  }
+
+  auto escaped = rsp::escape_binary(as_bytes(*payload));
   send_packet(escaped);
 }
 
@@ -1966,6 +2369,43 @@ void server::handle_xfer(std::string_view args) {
     return;
   }
 
+  constexpr std::string_view k_libraries_prefix = "libraries:read::";
+  if (args.rfind(k_libraries_prefix, 0) == 0) {
+    if (!target_.libraries) {
+      send_packet("");
+      return;
+    }
+
+    auto range = args.substr(k_libraries_prefix.size());
+    auto comma = range.find(',');
+    if (comma == std::string_view::npos) {
+      send_error(0x01);
+      return;
+    }
+
+    uint64_t offset = 0;
+    uint64_t length = 0;
+    if (!parse_hex_u64(range.substr(0, comma), offset) || !parse_hex_u64(range.substr(comma + 1), length)) {
+      send_error(0x01);
+      return;
+    }
+
+    auto xml = build_library_list_xml(target_.libraries->libraries());
+    if (offset >= xml.size()) {
+      send_packet("l");
+      return;
+    }
+
+    size_t available = xml.size() - static_cast<size_t>(offset);
+    size_t to_send = static_cast<size_t>(std::min<uint64_t>(length, available));
+    std::string response;
+    response.reserve(to_send + 1);
+    response.push_back(offset + to_send >= xml.size() ? 'l' : 'm');
+    response.append(xml.data() + offset, to_send);
+    send_packet(response);
+    return;
+  }
+
   send_packet("");
 }
 
@@ -1989,7 +2429,7 @@ void server::handle_host_info() {
   response += "hostname:" + hex_encode_string(info->hostname) + ";";
 
   if (info->os_version) {
-    response += "os_version:" + hex_encode_string(*info->os_version) + ";";
+    response += "os_version:" + *info->os_version + ";";
   }
   if (info->os_build) {
     response += "os_build:" + hex_encode_string(*info->os_build) + ";";
@@ -2023,6 +2463,32 @@ void server::handle_process_info() {
   response += "endian:" + info->endian + ";";
   response += "ptrsize:" + std::to_string(info->ptr_size) + ";";
   response += "ostype:" + info->ostype + ";";
+  if (target_.lldb) {
+    if (auto extras = target_.lldb->process_info_extras()) {
+      for (const auto& pair : *extras) {
+        if (pair.key.empty()) {
+          continue;
+        }
+        response += pair.key;
+        response += ":";
+        switch (pair.encoding) {
+        case lldb::kv_encoding::raw:
+          response += pair.value;
+          break;
+        case lldb::kv_encoding::hex_string:
+          response += hex_encode_string(pair.value);
+          break;
+        case lldb::kv_encoding::hex_u64:
+          response += hex_u64(pair.u64_value);
+          break;
+        case lldb::kv_encoding::dec_u64:
+          response += std::to_string(pair.u64_value);
+          break;
+        }
+        response += ";";
+      }
+    }
+  }
   send_packet(response);
 }
 
@@ -2107,11 +2573,14 @@ const process_control_view* server::process_control() const {
   return &*target_.process_control;
 }
 
-void server::set_attached_state(attached_state state) { attached_state_ = state; }
+void server::set_attached_state(attached_state state) {
+  attached_state_ = state;
+  last_library_generation_.reset();
+}
 
 void server::set_attached_state_if_ok(attached_state state, target_status status) {
   if (status == target_status::ok) {
-    attached_state_ = state;
+    set_attached_state(state);
   }
 }
 
@@ -2166,18 +2635,19 @@ void server::send_status_error(target_status status, bool optional_feature) {
 }
 
 void server::send_stop_reply(const stop_reason& reason) {
-  auto response = build_stop_reply_payload(reason);
+  bool include_library = consume_library_change();
+  auto response = build_stop_reply_payload(reason, include_library);
   last_stop_ = reason;
   send_packet(response);
 }
 
 void server::send_exit_reply(const stop_reason& reason) {
-  auto response = build_stop_reply_payload(reason);
+  auto response = build_stop_reply_payload(reason, false);
   last_stop_ = reason;
   send_packet(response);
 }
 
-std::string server::build_stop_reply_payload(const stop_reason& reason) const {
+std::string server::build_stop_reply_payload(const stop_reason& reason, bool include_library_key) const {
   if (reason.kind == stop_kind::exited) {
     int code = reason.exit_code;
     if (code < 0) {
@@ -2226,6 +2696,10 @@ std::string server::build_stop_reply_payload(const stop_reason& reason) const {
   uint64_t tid = reason.thread_id.value_or(current_thread_id().value_or(1));
   response += "thread:" + hex_u64(tid) + ";";
 
+  if (include_library_key) {
+    response += "library:;";
+  }
+
   if (list_threads_in_stop_reply_ && target_.threads) {
     auto ids = thread_ids();
     if (!ids.empty()) {
@@ -2269,6 +2743,21 @@ std::string server::build_stop_reply_payload(const stop_reason& reason) const {
   return response;
 }
 
+bool server::consume_library_change() {
+  if (!target_.libraries) {
+    return false;
+  }
+  auto generation = target_.libraries->generation();
+  if (!generation) {
+    return false;
+  }
+  if (!last_library_generation_ || *generation != *last_library_generation_) {
+    last_library_generation_ = *generation;
+    return true;
+  }
+  return false;
+}
+
 void server::enqueue_stop(stop_reason reason) {
   if (non_stop_.stop_signal_zero_pending) {
     reason.kind = stop_kind::signal;
@@ -2298,7 +2787,8 @@ void server::maybe_send_stop_notification() {
     return;
   }
 
-  auto payload = "Stop:" + build_stop_reply_payload(*reason);
+  bool include_library = consume_library_change();
+  auto payload = "Stop:" + build_stop_reply_payload(*reason, include_library);
   send_notification(payload);
   non_stop_.notification_in_flight = true;
 }

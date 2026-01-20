@@ -61,6 +61,7 @@ private:
   bool thread_suffix_enabled_ = false;
   bool error_strings_enabled_ = false;
   bool extended_mode_ = false;
+  std::optional<uint64_t> last_library_generation_;
   enum class attached_state { unknown, launched, attached };
   attached_state attached_state_ = attached_state::unknown;
   non_stop_state non_stop_;
@@ -99,6 +100,7 @@ private:
   void handle_detach();
   void handle_extended_mode();
   void handle_j_packet(std::string_view payload);
+  void handle_loaded_dynamic_libraries_infos(std::string_view args);
   void handle_xfer(std::string_view args);
   void handle_host_info();
   void handle_process_info();
@@ -120,7 +122,8 @@ private:
   void send_status_error(target_status status, bool optional_feature);
   void send_stop_reply(const stop_reason& reason);
   void send_exit_reply(const stop_reason& reason);
-  std::string build_stop_reply_payload(const stop_reason& reason) const;
+  std::string build_stop_reply_payload(const stop_reason& reason, bool include_library_key) const;
+  bool consume_library_change();
   void maybe_send_stop_notification();
   void enqueue_stop(stop_reason reason);
   void reset_non_stop_state();

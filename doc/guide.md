@@ -387,8 +387,8 @@ while (server.has_connection()) {
 Required methods if you implement breakpoints:
 
 ```cpp
-gdbstub::target_status set_breakpoint(const gdbstub::breakpoint_spec& spec);
-gdbstub::target_status remove_breakpoint(const gdbstub::breakpoint_spec& spec);
+gdbstub::target_status set_breakpoint(const gdbstub::breakpoint_request& request);
+gdbstub::target_status remove_breakpoint(const gdbstub::breakpoint_request& request);
 ```
 
 Optional capability query:
@@ -397,10 +397,13 @@ Optional capability query:
 std::optional<gdbstub::breakpoint_capabilities> capabilities();
 ```
 
-`breakpoint_spec` fields:
-- `type`: software/hardware/watchpoint
-- `addr`: address
-- `length`: size (interpretation depends on breakpoint type)
+`breakpoint_request` fields:
+- `spec.type`: software/hardware/watchpoint
+- `spec.addr`: address
+- `spec.length`: size (interpretation depends on breakpoint type)
+- `thread_id`: optional thread selector
+- `conditions`: optional bytecode expressions for conditional breakpoints
+- `commands`: optional command list with persistence flag
 
 Behavior notes:
 - If you return `unsupported`, the server replies with an empty response for

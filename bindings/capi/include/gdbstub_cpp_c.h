@@ -32,6 +32,17 @@ typedef struct gdbstub_slice_region {
   size_t len;
 } gdbstub_slice_region;
 
+typedef struct gdbstub_library_entry {
+  gdbstub_string_view name;
+  gdbstub_slice_u64 segments;
+  gdbstub_slice_u64 sections;
+} gdbstub_library_entry;
+
+typedef struct gdbstub_slice_library_entry {
+  const gdbstub_library_entry* data;
+  size_t len;
+} gdbstub_slice_library_entry;
+
 typedef enum gdbstub_stop_kind {
   GDBSTUB_STOP_SIGNAL = 0,
   GDBSTUB_STOP_SW_BREAK = 1,
@@ -125,6 +136,30 @@ typedef struct gdbstub_breakpoint_spec {
   uint64_t addr;
   uint32_t length;
 } gdbstub_breakpoint_spec;
+
+typedef struct gdbstub_bytecode_expr {
+  const uint8_t* data;
+  size_t len;
+} gdbstub_bytecode_expr;
+
+typedef struct gdbstub_slice_bytecode_expr {
+  const gdbstub_bytecode_expr* data;
+  size_t len;
+} gdbstub_slice_bytecode_expr;
+
+typedef struct gdbstub_breakpoint_commands {
+  uint8_t persist;
+  gdbstub_slice_bytecode_expr commands;
+} gdbstub_breakpoint_commands;
+
+typedef struct gdbstub_breakpoint_request {
+  gdbstub_breakpoint_spec spec;
+  uint8_t has_thread_id;
+  uint64_t thread_id;
+  gdbstub_slice_bytecode_expr conditions;
+  uint8_t has_commands;
+  gdbstub_breakpoint_commands commands;
+} gdbstub_breakpoint_request;
 
 typedef struct gdbstub_memory_region {
   uint64_t start;
@@ -255,7 +290,7 @@ typedef void (*gdbstub_interrupt_fn)(void* ctx);
 typedef uint8_t (*gdbstub_poll_stop_fn)(void* ctx, gdbstub_stop_reason* out);
 typedef void (*gdbstub_set_stop_notifier_fn)(void* ctx, gdbstub_stop_notifier notifier);
 
-typedef gdbstub_target_status (*gdbstub_breakpoint_fn)(void* ctx, const gdbstub_breakpoint_spec* spec);
+typedef gdbstub_target_status (*gdbstub_breakpoint_fn)(void* ctx, const gdbstub_breakpoint_request* request);
 
 typedef struct gdbstub_run_capabilities {
   uint8_t reverse_continue;
@@ -270,10 +305,15 @@ typedef struct gdbstub_breakpoint_capabilities {
   uint8_t watch_read;
   uint8_t watch_write;
   uint8_t watch_access;
+  uint8_t supports_thread_suffix;
+  uint8_t supports_conditional;
+  uint8_t supports_commands;
 } gdbstub_breakpoint_capabilities;
 
 typedef uint8_t (*gdbstub_get_run_capabilities_fn)(void* ctx, gdbstub_run_capabilities* out);
 typedef uint8_t (*gdbstub_get_breakpoint_capabilities_fn)(void* ctx, gdbstub_breakpoint_capabilities* out);
+typedef gdbstub_slice_library_entry (*gdbstub_get_libraries_fn)(void* ctx);
+typedef uint8_t (*gdbstub_get_libraries_generation_fn)(void* ctx, uint64_t* out);
 
 typedef uint8_t (*gdbstub_region_info_fn)(
     void* ctx,
@@ -360,6 +400,12 @@ typedef struct gdbstub_shlib_info_iface {
   gdbstub_get_shlib_info_fn get_shlib_info;
 } gdbstub_shlib_info_iface;
 
+typedef struct gdbstub_libraries_iface {
+  void* ctx;
+  gdbstub_get_libraries_fn get_libraries;
+  gdbstub_get_libraries_generation_fn get_libraries_generation;
+} gdbstub_libraries_iface;
+
 typedef struct gdbstub_process_control_iface {
   void* ctx;
   gdbstub_launch_fn launch;
@@ -388,6 +434,7 @@ typedef struct gdbstub_target_config {
   const gdbstub_host_info_iface* host;
   const gdbstub_process_info_iface* process;
   const gdbstub_shlib_info_iface* shlib;
+  const gdbstub_libraries_iface* libraries;
   const gdbstub_process_control_iface* process_control;
   const gdbstub_offsets_info_iface* offsets;
   const gdbstub_register_info_iface* reg_info;

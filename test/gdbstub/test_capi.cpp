@@ -33,6 +33,20 @@ struct capi_state {
 
   size_t breakpoints_set = 0;
   size_t breakpoints_removed = 0;
+  bool has_last_set_breakpoint = false;
+  bool has_last_removed_breakpoint = false;
+  gdbstub_breakpoint_spec last_set_spec{};
+  gdbstub_breakpoint_spec last_removed_spec{};
+  uint8_t last_set_has_thread = 0;
+  uint64_t last_set_thread_id = 0;
+  size_t last_set_condition_count = 0;
+  uint8_t last_set_has_commands = 0;
+  size_t last_set_command_count = 0;
+  uint8_t last_set_command_persist = 0;
+  uint8_t last_set_first_condition = 0;
+  uint8_t last_set_first_command = 0;
+  uint8_t last_removed_has_thread = 0;
+  uint64_t last_removed_thread_id = 0;
   gdbstub_run_capabilities run_caps{};
   gdbstub_breakpoint_capabilities breakpoint_caps{};
 
@@ -45,6 +59,12 @@ struct capi_state {
   gdbstub_host_info host{};
   gdbstub_process_info process{};
   gdbstub_shlib_info shlib{};
+  bool enable_libraries = false;
+  bool has_libraries_generation = false;
+  uint64_t libraries_generation = 0;
+  gdbstub_library_entry libraries[1]{};
+  gdbstub_slice_library_entry libraries_slice{};
+  gdbstub_libraries_iface libraries_iface{};
   gdbstub_offsets_info offsets{};
   gdbstub_process_control_iface process_control_iface{};
   gdbstub_resume_result launch_result{};
@@ -143,6 +163,9 @@ static void init_state(capi_state& state) {
 
   state.shlib.has_info_addr = 1;
   state.shlib.info_addr = 0x11223344;
+
+  state.libraries_slice.data = state.libraries;
+  state.libraries_slice.len = 0;
 
   state.offsets.kind = GDBSTUB_OFFSETS_SECTION;
   state.offsets.text = 0x1000;
@@ -322,17 +345,56 @@ static uint8_t get_run_capabilities(void* ctx, gdbstub_run_capabilities* out) {
   return 1;
 }
 
-static gdbstub_target_status set_breakpoint(void* ctx, const gdbstub_breakpoint_spec* spec) {
-  (void) spec;
+static uint8_t first_byte_or_zero(const gdbstub_slice_bytecode_expr& slice) {
+  if (!slice.data || slice.len == 0) {
+    return 0;
+  }
+  const auto& expr = slice.data[0];
+  if (!expr.data || expr.len == 0) {
+    return 0;
+  }
+  return expr.data[0];
+}
+
+static gdbstub_target_status set_breakpoint(void* ctx, const gdbstub_breakpoint_request* request) {
   auto* state = static_cast<capi_state*>(ctx);
   state->breakpoints_set++;
+  state->has_last_set_breakpoint = request != nullptr;
+  state->last_set_condition_count = 0;
+  state->last_set_has_commands = 0;
+  state->last_set_command_count = 0;
+  state->last_set_command_persist = 0;
+  state->last_set_first_condition = 0;
+  state->last_set_first_command = 0;
+  state->last_set_has_thread = 0;
+  state->last_set_thread_id = 0;
+  if (request) {
+    state->last_set_spec = request->spec;
+    state->last_set_has_thread = request->has_thread_id;
+    state->last_set_thread_id = request->thread_id;
+    state->last_set_condition_count = request->conditions.len;
+    state->last_set_first_condition = first_byte_or_zero(request->conditions);
+    state->last_set_has_commands = request->has_commands;
+    if (request->has_commands) {
+      state->last_set_command_count = request->commands.commands.len;
+      state->last_set_command_persist = request->commands.persist;
+      state->last_set_first_command = first_byte_or_zero(request->commands.commands);
+    }
+  }
   return GDBSTUB_TARGET_OK;
 }
 
-static gdbstub_target_status remove_breakpoint(void* ctx, const gdbstub_breakpoint_spec* spec) {
-  (void) spec;
+static gdbstub_target_status remove_breakpoint(void* ctx, const gdbstub_breakpoint_request* request) {
   auto* state = static_cast<capi_state*>(ctx);
   state->breakpoints_removed++;
+  state->has_last_removed_breakpoint = request != nullptr;
+  state->last_removed_has_thread = 0;
+  state->last_removed_thread_id = 0;
+  if (request) {
+    state->last_removed_spec = request->spec;
+    state->last_removed_has_thread = request->has_thread_id;
+    state->last_removed_thread_id = request->thread_id;
+  }
   return GDBSTUB_TARGET_OK;
 }
 
@@ -433,6 +495,20 @@ static uint8_t get_shlib_info(void* ctx, gdbstub_shlib_info* out) {
     return 0;
   }
   *out = state->shlib;
+  return 1;
+}
+
+static gdbstub_slice_library_entry get_libraries(void* ctx) {
+  auto* state = static_cast<capi_state*>(ctx);
+  return state->libraries_slice;
+}
+
+static uint8_t get_libraries_generation(void* ctx, uint64_t* out) {
+  auto* state = static_cast<capi_state*>(ctx);
+  if (!out || !state->has_libraries_generation) {
+    return 0;
+  }
+  *out = state->libraries_generation;
   return 1;
 }
 
@@ -543,6 +619,12 @@ static void setup_config(capi_state& state) {
   state.shlib_iface.ctx = &state;
   state.shlib_iface.get_shlib_info = &get_shlib_info;
 
+  if (state.enable_libraries) {
+    state.libraries_iface.ctx = &state;
+    state.libraries_iface.get_libraries = &get_libraries;
+    state.libraries_iface.get_libraries_generation = &get_libraries_generation;
+  }
+
   state.process_control_iface.ctx = &state;
   state.process_control_iface.launch = &launch_process;
   state.process_control_iface.attach = &attach_process;
@@ -564,6 +646,7 @@ static void setup_config(capi_state& state) {
   state.config.host = &state.host_iface;
   state.config.process = &state.process_iface;
   state.config.shlib = &state.shlib_iface;
+  state.config.libraries = state.enable_libraries ? &state.libraries_iface : nullptr;
   state.config.process_control = &state.process_control_iface;
   state.config.offsets = &state.offsets_iface;
   state.config.reg_info = &state.reg_info_iface;
@@ -790,12 +873,23 @@ TEST_CASE("capi tcp integration handles core packets") {
   REQUIRE(bp.has_value());
   CHECK(bp->payload == "OK");
   CHECK(state.breakpoints_set == 1);
+  CHECK(state.has_last_set_breakpoint);
+  CHECK(state.last_set_spec.type == GDBSTUB_BREAKPOINT_SOFTWARE);
+  CHECK(state.last_set_spec.addr == 0x1008);
+  CHECK(state.last_set_spec.length == 4);
+  CHECK(state.last_set_has_thread == 0);
+  CHECK(state.last_set_condition_count == 0);
+  CHECK(state.last_set_has_commands == 0);
 
   REQUIRE(client.send_packet("z0,1008,4"));
   auto bp_clear = wait_for_reply(server_handle.server, client, std::chrono::milliseconds(200));
   REQUIRE(bp_clear.has_value());
   CHECK(bp_clear->payload == "OK");
   CHECK(state.breakpoints_removed == 1);
+  CHECK(state.has_last_removed_breakpoint);
+  CHECK(state.last_removed_spec.type == GDBSTUB_BREAKPOINT_SOFTWARE);
+  CHECK(state.last_removed_spec.addr == 0x1008);
+  CHECK(state.last_removed_spec.length == 4);
 
   REQUIRE(client.send_packet("c"));
   auto stop = wait_for_reply(server_handle.server, client, std::chrono::milliseconds(200));
@@ -810,6 +904,91 @@ TEST_CASE("capi tcp integration handles core packets") {
   client.close();
 }
 
+TEST_CASE("capi forwards breakpoint conditions and commands") {
+  capi_state state;
+  init_state(state);
+  state.breakpoint_caps.supports_conditional = 1;
+  state.breakpoint_caps.supports_commands = 1;
+
+  auto server_handle = make_server(state);
+
+  constexpr std::string_view k_host = "127.0.0.1";
+  auto port = listen_on_available_port(server_handle.server, k_host, 45050, 200);
+  REQUIRE(port.has_value());
+
+  std::atomic<bool> accepted{false};
+  std::thread accept_thread([&]() { accepted = gdbstub_server_wait_for_connection(server_handle.server) != 0; });
+
+  gdbstub::test::tcp_client client;
+  REQUIRE(client.connect(k_host, *port));
+  accept_thread.join();
+  REQUIRE(accepted.load());
+
+  REQUIRE(client.send_packet("Z0,1008,4;X1,01;cmds:1,X1,02"));
+  auto bp = wait_for_reply(server_handle.server, client, std::chrono::milliseconds(200));
+  REQUIRE(bp.has_value());
+  CHECK(bp->payload == "OK");
+  CHECK(state.breakpoints_set == 1);
+  CHECK(state.has_last_set_breakpoint);
+  CHECK(state.last_set_spec.type == GDBSTUB_BREAKPOINT_SOFTWARE);
+  CHECK(state.last_set_spec.addr == 0x1008);
+  CHECK(state.last_set_spec.length == 4);
+  CHECK(state.last_set_condition_count == 1);
+  CHECK(state.last_set_has_commands == 1);
+  CHECK(state.last_set_command_count == 1);
+  CHECK(state.last_set_command_persist == 1);
+  CHECK(state.last_set_first_condition == 0x01);
+  CHECK(state.last_set_first_command == 0x02);
+
+  client.close();
+}
+
+TEST_CASE("capi library generation drives library stop key") {
+  capi_state state;
+  init_state(state);
+  state.enable_libraries = true;
+
+  auto server_handle = make_server(state);
+
+  constexpr std::string_view k_host = "127.0.0.1";
+  auto port = listen_on_available_port(server_handle.server, k_host, 45070, 200);
+  REQUIRE(port.has_value());
+
+  std::atomic<bool> accepted{false};
+  std::thread accept_thread([&]() { accepted = gdbstub_server_wait_for_connection(server_handle.server) != 0; });
+
+  gdbstub::test::tcp_client client;
+  REQUIRE(client.connect(k_host, *port));
+  accept_thread.join();
+  REQUIRE(accepted.load());
+
+  state.has_libraries_generation = false;
+  REQUIRE(client.send_packet("c"));
+  auto no_gen = wait_for_reply(server_handle.server, client, std::chrono::milliseconds(200));
+  REQUIRE(no_gen.has_value());
+  CHECK(no_gen->payload.find("library:;") == std::string::npos);
+
+  state.has_libraries_generation = true;
+  state.libraries_generation = 1;
+  REQUIRE(client.send_packet("c"));
+  auto first = wait_for_reply(server_handle.server, client, std::chrono::milliseconds(200));
+  REQUIRE(first.has_value());
+  CHECK(first->payload.find("library:;") != std::string::npos);
+
+  REQUIRE(client.send_packet("c"));
+  auto second = wait_for_reply(server_handle.server, client, std::chrono::milliseconds(200));
+  REQUIRE(second.has_value());
+  CHECK(second->payload.find("library:;") == std::string::npos);
+
+  state.libraries_generation = 2;
+  REQUIRE(client.send_packet("c"));
+  auto third = wait_for_reply(server_handle.server, client, std::chrono::milliseconds(200));
+  REQUIRE(third.has_value());
+  CHECK(third->payload.find("library:;") != std::string::npos);
+
+  client.close();
+}
+
 TEST_CASE("capi advertises run and breakpoint capabilities") {
   capi_state state;
   init_state(state);
@@ -817,6 +996,8 @@ TEST_CASE("capi advertises run and breakpoint capabilities") {
   state.run_caps.reverse_step = 1;
   state.run_caps.non_stop = 1;
   state.breakpoint_caps.hardware = 1;
+  state.breakpoint_caps.supports_conditional = 1;
+  state.breakpoint_caps.supports_commands = 1;
 
   auto server_handle = make_server(state);
 
@@ -839,6 +1020,8 @@ TEST_CASE("capi advertises run and breakpoint capabilities") {
   CHECK(supported->payload.find("ReverseStep+") != std::string::npos);
   CHECK(supported->payload.find("QNonStop+") != std::string::npos);
   CHECK(supported->payload.find("hwbreak+") != std::string::npos);
+  CHECK(supported->payload.find("ConditionalBreakpoints+") != std::string::npos);
+  CHECK(supported->payload.find("BreakpointCommands+") != std::string::npos);
 
   client.close();
 }

@@ -101,8 +101,13 @@ struct mock_state {
   std::optional<gdbstub::offsets_info> offsets;
   std::optional<gdbstub::resume_request> last_resume;
   std::optional<uint64_t> last_set_thread;
-  std::optional<gdbstub::breakpoint_spec> last_breakpoint;
-  std::optional<gdbstub::breakpoint_spec> last_removed_breakpoint;
+  std::optional<gdbstub::breakpoint_request> last_breakpoint;
+  std::optional<gdbstub::breakpoint_request> last_removed_breakpoint;
+  std::vector<gdbstub::library_entry> libraries;
+  std::optional<uint64_t> libraries_generation;
+  std::vector<gdbstub::lldb::process_kv_pair> lldb_process_extras;
+  std::optional<std::string> lldb_loaded_libraries_json;
+  std::optional<gdbstub::lldb::loaded_libraries_request> last_loaded_libraries_request;
   gdbstub::target_status breakpoint_status = gdbstub::target_status::ok;
   gdbstub::target_status resume_status = gdbstub::target_status::ok;
   gdbstub::target_status kill_status = gdbstub::target_status::ok;
@@ -209,12 +214,12 @@ struct mock_run {
 struct mock_breakpoints {
   mock_state& state;
 
-  gdbstub::target_status set_breakpoint(const gdbstub::breakpoint_spec& request) {
+  gdbstub::target_status set_breakpoint(const gdbstub::breakpoint_request& request) {
     state.last_breakpoint = request;
     return state.breakpoint_status;
   }
 
-  gdbstub::target_status remove_breakpoint(const gdbstub::breakpoint_spec& request) {
+  gdbstub::target_status remove_breakpoint(const gdbstub::breakpoint_request& request) {
     state.last_removed_breakpoint = request;
     return state.breakpoint_status;
   }
@@ -272,8 +277,13 @@ struct mock_host {
 };
 
 struct mock_process {
+  mock_state& state;
+
+  explicit mock_process(mock_state& state_in) : state(state_in) {}
+
   std::optional<gdbstub::process_info> get_process_info() {
-    return gdbstub::process_info{42, "riscv32-unknown-elf", "little", 4, "bare"};
+    gdbstub::process_info info{42, "riscv32-unknown-elf", "little", 4, "bare"};
+    return info;
   }
 };
 
@@ -281,6 +291,28 @@ struct mock_shlib {
   mock_state& state;
 
   std::optional<gdbstub::shlib_info> get_shlib_info() { return state.shlib; }
+};
+
+struct mock_libraries {
+  mock_state& state;
+
+  std::vector<gdbstub::library_entry> libraries() const { return state.libraries; }
+  std::optional<uint64_t> libraries_generation() const { return state.libraries_generation; }
+};
+
+struct mock_lldb {
+  mock_state& state;
+
+  std::optional<std::vector<gdbstub::lldb::process_kv_pair>> process_info_extras() const {
+    return state.lldb_process_extras;
+  }
+
+  std::optional<std::string> loaded_libraries_json(
+      const gdbstub::lldb::loaded_libraries_request& request
+  ) {
+    state.last_loaded_libraries_request = request;
+    return state.lldb_loaded_libraries_json;
+  }
 };
 
 struct mock_process_control {
@@ -343,8 +375,10 @@ struct mock_components {
   mock_memory_layout memory_layout{};
   mock_threads threads{state};
   mock_host host{};
-  mock_process process{};
+  mock_process process{state};
   mock_shlib shlib{state};
+  mock_libraries libraries{state};
+  mock_lldb lldb{state};
   mock_process_control process_control{state};
   mock_offsets offsets{state};
   mock_register_info reg_info{};
@@ -392,6 +426,26 @@ gdbstub::target make_target(mock_components& target) {
       target.host,
       target.process,
       target.shlib,
+      target.libraries,
+      target.lldb,
+      target.process_control,
+      target.offsets,
+      target.reg_info
+  );
+}
+
+gdbstub::target make_target_without_lldb(mock_components& target) {
+  return gdbstub::make_target(
+      target.regs,
+      target.mem,
+      target.run,
+      target.breakpoints,
+      target.threads,
+      target.memory_layout,
+      target.host,
+      target.process,
+      target.shlib,
+      target.libraries,
       target.process_control,
       target.offsets,
       target.reg_info
@@ -443,6 +497,9 @@ TEST_CASE("server responds to qSupported") {
   CHECK(payload.find("swbreak+") != std::string::npos);
   CHECK(payload.find("qMemoryRegionInfo+") != std::string::npos);
   CHECK(payload.find("qXfer:memory-map:read+") != std::string::npos);
+  CHECK(payload.find("qXfer:libraries:read+") != std::string::npos);
+  CHECK(payload.find("ConditionalBreakpoints+") == std::string::npos);
+  CHECK(payload.find("BreakpointCommands+") == std::string::npos);
 }
 
 TEST_CASE("server advertises optional capabilities in qSupported") {
@@ -453,6 +510,8 @@ TEST_CASE("server advertises optional capabilities in qSupported") {
   state.run_caps.non_stop = true;
   state.breakpoint_caps.software = true;
   state.breakpoint_caps.hardware = true;
+  state.breakpoint_caps.supports_conditional = true;
+  state.breakpoint_caps.supports_commands = true;
 
   mock_components target(state);
   gdbstub::arch_spec arch;
@@ -473,6 +532,8 @@ TEST_CASE("server advertises optional capabilities in qSupported") {
   CHECK(payload.find("ReverseStep+") != std::string::npos);
   CHECK(payload.find("QNonStop+") != std::string::npos);
   CHECK(payload.find("hwbreak+") != std::string::npos);
+  CHECK(payload.find("ConditionalBreakpoints+") != std::string::npos);
+  CHECK(payload.find("BreakpointCommands+") != std::string::npos);
 }
 
 TEST_CASE("server responds to qRegisterInfo") {
@@ -721,6 +782,61 @@ TEST_CASE("server handles no-ack mode") {
   CHECK(host_info.ack_count == 0);
   REQUIRE(host_info.packets.size() == 1);
   CHECK(host_info.packets[0].payload.find("triple:") != std::string::npos);
+  CHECK(host_info.packets[0].payload.find("os_version:1.0;") != std::string::npos);
+}
+
+TEST_CASE("server appends LLDB process info extras when provided") {
+  mock_state state;
+  state.lldb_process_extras = {
+      {"ext-raw", "alpha", 0, gdbstub::lldb::kv_encoding::raw},
+      {"ext-hex", "", 0x1234, gdbstub::lldb::kv_encoding::hex_u64},
+      {"ext-dec", "", 42, gdbstub::lldb::kv_encoding::dec_u64},
+  };
+  mock_components target(state);
+  gdbstub::arch_spec arch;
+  arch.reg_count = 3;
+  arch.pc_reg_num = 2;
+
+  auto transport = std::make_unique<loopback_transport>();
+  auto* transport_ptr = transport.get();
+  gdbstub::server server(make_target(target), arch, std::move(transport));
+
+  REQUIRE(server.listen("loop"));
+  REQUIRE(server.wait_for_connection());
+
+  auto proc_info = send_packet(server, *transport_ptr, "qProcessInfo");
+  REQUIRE(proc_info.packets.size() == 1);
+  const auto& payload = proc_info.packets[0].payload;
+  CHECK(payload.find("ext-raw:alpha;") != std::string::npos);
+  CHECK(payload.find("ext-hex:1234;") != std::string::npos);
+  CHECK(payload.find("ext-dec:42;") != std::string::npos);
+}
+
+TEST_CASE("server omits LLDB process info extras without extension") {
+  mock_state state;
+  state.lldb_process_extras = {
+      {"ext-raw", "alpha", 0, gdbstub::lldb::kv_encoding::raw},
+      {"ext-hex", "", 0x1234, gdbstub::lldb::kv_encoding::hex_u64},
+      {"ext-dec", "", 42, gdbstub::lldb::kv_encoding::dec_u64},
+  };
+  mock_components target(state);
+  gdbstub::arch_spec arch;
+  arch.reg_count = 3;
+  arch.pc_reg_num = 2;
+
+  auto transport = std::make_unique<loopback_transport>();
+  auto* transport_ptr = transport.get();
+  gdbstub::server server(make_target_without_lldb(target), arch, std::move(transport));
+
+  REQUIRE(server.listen("loop"));
+  REQUIRE(server.wait_for_connection());
+
+  auto proc_info = send_packet(server, *transport_ptr, "qProcessInfo");
+  REQUIRE(proc_info.packets.size() == 1);
+  const auto& payload = proc_info.packets[0].payload;
+  CHECK(payload.find("ext-raw:") == std::string::npos);
+  CHECK(payload.find("ext-hex:") == std::string::npos);
+  CHECK(payload.find("ext-dec:") == std::string::npos);
 }
 
 TEST_CASE("server supports thread suffix on register packets") {
@@ -774,6 +890,31 @@ TEST_CASE("server serves target xml via qXfer") {
   CHECK(out_empty.packets[0].payload[0] == 'm');
 }
 
+TEST_CASE("server serves library list via qXfer") {
+  mock_state state;
+  gdbstub::library_entry lib;
+  lib.name = "/lib/libc.so.6";
+  lib.segments = {0x1000};
+  state.libraries.push_back(lib);
+  mock_components target(state);
+  gdbstub::arch_spec arch;
+  arch.reg_count = 3;
+  arch.pc_reg_num = 2;
+
+  auto transport = std::make_unique<loopback_transport>();
+  auto* transport_ptr = transport.get();
+  gdbstub::server server(make_target(target), arch, std::move(transport));
+
+  REQUIRE(server.listen("loop"));
+  REQUIRE(server.wait_for_connection());
+
+  auto out = send_packet(server, *transport_ptr, "qXfer:libraries:read::0,200");
+  REQUIRE(out.packets.size() == 1);
+  CHECK(out.packets[0].payload[0] == 'l');
+  CHECK(out.packets[0].payload.find("<library-list") != std::string::npos);
+  CHECK(out.packets[0].payload.find("/lib/libc.so.6") != std::string::npos);
+}
+
 TEST_CASE("server sets breakpoints and continues") {
   mock_state state;
   mock_components target(state);
@@ -792,13 +933,114 @@ TEST_CASE("server sets breakpoints and continues") {
   REQUIRE(bp.packets.size() == 1);
   CHECK(bp.packets[0].payload == "OK");
   REQUIRE(state.last_breakpoint.has_value());
-  CHECK(state.last_breakpoint->type == gdbstub::breakpoint_type::software);
-  CHECK(state.last_breakpoint->addr == 0x1000);
-  CHECK(state.last_breakpoint->length == 4);
+  CHECK(state.last_breakpoint->spec.type == gdbstub::breakpoint_type::software);
+  CHECK(state.last_breakpoint->spec.addr == 0x1000);
+  CHECK(state.last_breakpoint->spec.length == 4);
 
   auto cont = send_packet(server, *transport_ptr, "c");
   REQUIRE(cont.packets.size() == 1);
   CHECK(cont.packets[0].payload.rfind("T", 0) == 0);
+}
+
+TEST_CASE("server accepts breakpoint thread suffix without thread-scoped support") {
+  mock_state state;
+  mock_components target(state);
+  gdbstub::arch_spec arch;
+  arch.reg_count = 3;
+  arch.pc_reg_num = 2;
+
+  auto transport = std::make_unique<loopback_transport>();
+  auto* transport_ptr = transport.get();
+  gdbstub::server server(make_target(target), arch, std::move(transport));
+
+  REQUIRE(server.listen("loop"));
+  REQUIRE(server.wait_for_connection());
+
+  auto bp = send_packet(server, *transport_ptr, "Z0,1000,4;thread:2");
+  REQUIRE(bp.packets.size() == 1);
+  CHECK(bp.packets[0].payload == "OK");
+  REQUIRE(state.last_breakpoint.has_value());
+  CHECK(state.last_breakpoint->spec.addr == 0x1000);
+  CHECK_FALSE(state.last_breakpoint->thread_id.has_value());
+  CHECK_FALSE(state.last_set_thread.has_value());
+}
+
+TEST_CASE("server applies breakpoint thread suffix when supported") {
+  mock_state state;
+  state.breakpoint_caps.supports_thread_suffix = true;
+  mock_components target(state);
+  gdbstub::arch_spec arch;
+  arch.reg_count = 3;
+  arch.pc_reg_num = 2;
+
+  auto transport = std::make_unique<loopback_transport>();
+  auto* transport_ptr = transport.get();
+  gdbstub::server server(make_target(target), arch, std::move(transport));
+
+  REQUIRE(server.listen("loop"));
+  REQUIRE(server.wait_for_connection());
+
+  auto bp = send_packet(server, *transport_ptr, "Z0,1000,4;thread:2");
+  REQUIRE(bp.packets.size() == 1);
+  CHECK(bp.packets[0].payload == "OK");
+  REQUIRE(state.last_breakpoint.has_value());
+  REQUIRE(state.last_breakpoint->thread_id.has_value());
+  CHECK(state.last_breakpoint->thread_id.value() == 2);
+  REQUIRE(state.last_set_thread.has_value());
+  CHECK(state.last_set_thread.value() == 2);
+}
+
+TEST_CASE("server rejects conditional breakpoints when unsupported") {
+  mock_state state;
+  mock_components target(state);
+  gdbstub::arch_spec arch;
+  arch.reg_count = 3;
+  arch.pc_reg_num = 2;
+
+  auto transport = std::make_unique<loopback_transport>();
+  auto* transport_ptr = transport.get();
+  gdbstub::server server(make_target(target), arch, std::move(transport));
+
+  REQUIRE(server.listen("loop"));
+  REQUIRE(server.wait_for_connection());
+
+  auto bp = send_packet(server, *transport_ptr, "Z0,1000,4;X1,00");
+  REQUIRE(bp.packets.size() == 1);
+  CHECK(bp.packets[0].payload.empty());
+  CHECK_FALSE(state.last_breakpoint.has_value());
+}
+
+TEST_CASE("server forwards conditional breakpoints and commands when supported") {
+  mock_state state;
+  state.breakpoint_caps.supports_conditional = true;
+  state.breakpoint_caps.supports_commands = true;
+  mock_components target(state);
+  gdbstub::arch_spec arch;
+  arch.reg_count = 3;
+  arch.pc_reg_num = 2;
+
+  auto transport = std::make_unique<loopback_transport>();
+  auto* transport_ptr = transport.get();
+  gdbstub::server server(make_target(target), arch, std::move(transport));
+
+  REQUIRE(server.listen("loop"));
+  REQUIRE(server.wait_for_connection());
+
+  auto bp = send_packet(server, *transport_ptr, "Z0,1000,4;X1,01;cmds:1,X1,02");
+  REQUIRE(bp.packets.size() == 1);
+  CHECK(bp.packets[0].payload == "OK");
+  REQUIRE(state.last_breakpoint.has_value());
+  CHECK(state.last_breakpoint->spec.type == gdbstub::breakpoint_type::software);
+  CHECK(state.last_breakpoint->spec.addr == 0x1000);
+  CHECK(state.last_breakpoint->spec.length == 4);
+  REQUIRE(state.last_breakpoint->conditions.size() == 1);
+  REQUIRE(state.last_breakpoint->conditions[0].bytes.size() == 1);
+  CHECK(state.last_breakpoint->conditions[0].bytes[0] == std::byte{0x01});
+  REQUIRE(state.last_breakpoint->commands.has_value());
+  CHECK(state.last_breakpoint->commands->persist);
+  REQUIRE(state.last_breakpoint->commands->commands.size() == 1);
+  REQUIRE(state.last_breakpoint->commands->commands[0].bytes.size() == 1);
+  CHECK(state.last_breakpoint->commands->commands[0].bytes[0] == std::byte{0x02});
 }
 
 TEST_CASE("server includes hwbreak stop reason when enabled") {
@@ -968,6 +1210,40 @@ TEST_CASE("server includes thread list in stop reply when enabled") {
   CHECK(payload.find("2:") != std::string::npos);
 }
 
+TEST_CASE("server includes library stop key only when generation changes") {
+  mock_state state;
+  mock_components target(state);
+  gdbstub::arch_spec arch;
+  arch.reg_count = 3;
+  arch.pc_reg_num = 2;
+
+  auto transport = std::make_unique<loopback_transport>();
+  auto* transport_ptr = transport.get();
+  gdbstub::server server(make_target(target), arch, std::move(transport));
+
+  REQUIRE(server.listen("loop"));
+  REQUIRE(server.wait_for_connection());
+
+  state.libraries_generation.reset();
+  auto first = send_packet(server, *transport_ptr, "c");
+  REQUIRE(first.packets.size() == 1);
+  CHECK(first.packets[0].payload.find("library:;") == std::string::npos);
+
+  state.libraries_generation = 1;
+  auto second = send_packet(server, *transport_ptr, "c");
+  REQUIRE(second.packets.size() == 1);
+  CHECK(second.packets[0].payload.find("library:;") != std::string::npos);
+
+  auto third = send_packet(server, *transport_ptr, "c");
+  REQUIRE(third.packets.size() == 1);
+  CHECK(third.packets[0].payload.find("library:;") == std::string::npos);
+
+  state.libraries_generation = 2;
+  auto fourth = send_packet(server, *transport_ptr, "c");
+  REQUIRE(fourth.packets.size() == 1);
+  CHECK(fourth.packets[0].payload.find("library:;") != std::string::npos);
+}
+
 TEST_CASE("server reports unsupported watchpoints") {
   mock_state state;
   mock_components target(state);
@@ -988,7 +1264,7 @@ TEST_CASE("server reports unsupported watchpoints") {
   REQUIRE(out.packets.size() == 1);
   CHECK(out.packets[0].payload.empty());
   REQUIRE(state.last_breakpoint.has_value());
-  CHECK(state.last_breakpoint->type == gdbstub::breakpoint_type::watch_write);
+  CHECK(state.last_breakpoint->spec.type == gdbstub::breakpoint_type::watch_write);
 }
 
 TEST_CASE("server sends non-stop notifications and drains vStopped") {
@@ -1041,6 +1317,41 @@ TEST_CASE("server sends non-stop notifications and drains vStopped") {
   auto notify_again = parse_output(transport_ptr->take_outgoing());
   REQUIRE(notify_again.notifications.size() == 1);
   CHECK(notify_again.notifications[0].payload.rfind("Stop:T", 0) == 0);
+}
+
+TEST_CASE("server includes library key in non-stop notifications on generation change") {
+  mock_state state;
+  state.run_caps.non_stop = true;
+  state.resume_behavior = mock_state::resume_behavior::run;
+  state.libraries_generation = 1;
+  mock_components target(state);
+
+  gdbstub::arch_spec arch;
+  arch.reg_count = 3;
+  arch.pc_reg_num = 2;
+
+  auto transport = std::make_unique<loopback_transport>();
+  auto* transport_ptr = transport.get();
+  gdbstub::server server(make_target(target), arch, std::move(transport));
+
+  REQUIRE(server.listen("loop"));
+  REQUIRE(server.wait_for_connection());
+
+  auto enable = send_packet(server, *transport_ptr, "QNonStop:1");
+  REQUIRE(enable.packets.size() == 1);
+  CHECK(enable.packets[0].payload == "OK");
+
+  auto resume = send_packet(server, *transport_ptr, "c");
+  REQUIRE(resume.packets.size() == 1);
+  CHECK(resume.packets[0].payload == "OK");
+
+  gdbstub::stop_reason stop{gdbstub::stop_kind::signal, 5, 0x1111, 0, 1};
+  server.notify_stop(stop);
+  server.poll(std::chrono::milliseconds(0));
+
+  auto notify = parse_output(transport_ptr->take_outgoing());
+  REQUIRE(notify.notifications.size() == 1);
+  CHECK(notify.notifications[0].payload.find("library:;") != std::string::npos);
 }
 
 TEST_CASE("server includes replaylog end in stop reply") {
@@ -1314,6 +1625,70 @@ TEST_CASE("server responds to qShlibInfoAddr when available") {
   REQUIRE(out.ack_count == 1);
   REQUIRE(out.packets.size() == 1);
   CHECK(out.packets[0].payload == "11223344");
+}
+
+TEST_CASE("server responds to jGetLoadedDynamicLibrariesInfos") {
+  mock_state state;
+  mock_components target(state);
+  state.lldb_loaded_libraries_json = "{\"images\":[{\"id\":1}]}";
+
+  gdbstub::arch_spec arch;
+  arch.reg_count = 3;
+
+  auto transport = std::make_unique<loopback_transport>();
+  auto* transport_ptr = transport.get();
+  gdbstub::server server(make_target(target), arch, std::move(transport));
+
+  REQUIRE(server.listen("loop"));
+  REQUIRE(server.wait_for_connection());
+
+  auto probe = send_packet(server, *transport_ptr, "jGetLoadedDynamicLibrariesInfos:");
+  REQUIRE(probe.ack_count == 1);
+  REQUIRE(probe.packets.size() == 1);
+  CHECK(probe.packets[0].payload == "OK");
+
+  auto out = send_packet(server, *transport_ptr, "jGetLoadedDynamicLibrariesInfos:{\"fetch_all_solibs\":true}");
+  REQUIRE(out.ack_count == 1);
+  REQUIRE(out.packets.size() == 1);
+  std::string json = unescape_payload(out.packets[0].payload);
+  CHECK(json == "{\"images\":[{\"id\":1}]}");
+  REQUIRE(state.last_loaded_libraries_request.has_value());
+  CHECK(state.last_loaded_libraries_request->kind == gdbstub::lldb::loaded_libraries_request::kind::all);
+  CHECK(state.last_loaded_libraries_request->report_load_commands);
+
+  state.lldb_loaded_libraries_json = "{\"images\":[{\"id\":2}]}";
+  auto out_addresses = send_packet(
+      server,
+      *transport_ptr,
+      "jGetLoadedDynamicLibrariesInfos:{\"report_load_commands\":false,\"solib_addresses\":[4096,8192]}"
+  );
+  REQUIRE(out_addresses.ack_count == 1);
+  REQUIRE(out_addresses.packets.size() == 1);
+  json = unescape_payload(out_addresses.packets[0].payload);
+  CHECK(json == "{\"images\":[{\"id\":2}]}");
+  REQUIRE(state.last_loaded_libraries_request.has_value());
+  CHECK(state.last_loaded_libraries_request->kind == gdbstub::lldb::loaded_libraries_request::kind::addresses);
+  CHECK_FALSE(state.last_loaded_libraries_request->report_load_commands);
+  REQUIRE(state.last_loaded_libraries_request->addresses.size() == 2);
+  CHECK(state.last_loaded_libraries_request->addresses[0] == 0x1000);
+  CHECK(state.last_loaded_libraries_request->addresses[1] == 0x2000);
+
+  state.lldb_loaded_libraries_json = "{\"images\":[{\"id\":3}]}";
+  auto out_image_list = send_packet(
+      server,
+      *transport_ptr,
+      "jGetLoadedDynamicLibrariesInfos:{\"image_count\":2,\"image_list_address\":12288}"
+  );
+  REQUIRE(out_image_list.ack_count == 1);
+  REQUIRE(out_image_list.packets.size() == 1);
+  json = unescape_payload(out_image_list.packets[0].payload);
+  CHECK(json == "{\"images\":[{\"id\":3}]}");
+  REQUIRE(state.last_loaded_libraries_request.has_value());
+  CHECK(state.last_loaded_libraries_request->kind == gdbstub::lldb::loaded_libraries_request::kind::image_list);
+  REQUIRE(state.last_loaded_libraries_request->image_count.has_value());
+  REQUIRE(state.last_loaded_libraries_request->image_list_address.has_value());
+  CHECK(state.last_loaded_libraries_request->image_count.value() == 2);
+  CHECK(state.last_loaded_libraries_request->image_list_address.value() == 0x3000);
 }
 
 TEST_CASE("server responds to qOffsets with section offsets") {

@@ -29,6 +29,17 @@ struct gdbstub_slice_region {
     size_t len;
 }
 
+struct gdbstub_library_entry {
+    gdbstub_string_view name;
+    gdbstub_slice_u64 segments;
+    gdbstub_slice_u64 sections;
+}
+
+struct gdbstub_slice_library_entry {
+    const(gdbstub_library_entry)* data;
+    size_t len;
+}
+
 enum gdbstub_stop_kind : int {
     GDBSTUB_STOP_SIGNAL = 0,
     GDBSTUB_STOP_SW_BREAK = 1,
@@ -121,6 +132,30 @@ struct gdbstub_breakpoint_spec {
     gdbstub_breakpoint_type type;
     uint64_t addr;
     uint32_t length;
+}
+
+struct gdbstub_bytecode_expr {
+    const(uint8_t)* data;
+    size_t len;
+}
+
+struct gdbstub_slice_bytecode_expr {
+    const(gdbstub_bytecode_expr)* data;
+    size_t len;
+}
+
+struct gdbstub_breakpoint_commands {
+    uint8_t persist;
+    gdbstub_slice_bytecode_expr commands;
+}
+
+struct gdbstub_breakpoint_request {
+    gdbstub_breakpoint_spec spec;
+    uint8_t has_thread_id;
+    uint64_t thread_id;
+    gdbstub_slice_bytecode_expr conditions;
+    uint8_t has_commands;
+    gdbstub_breakpoint_commands commands;
 }
 
 struct gdbstub_memory_region {
@@ -270,7 +305,7 @@ alias gdbstub_set_stop_notifier_fn = extern(C) void function(
 
 alias gdbstub_breakpoint_fn = extern(C) gdbstub_target_status function(
     void* ctx,
-    const(gdbstub_breakpoint_spec)* spec
+    const(gdbstub_breakpoint_request)* request
 );
 
 struct gdbstub_run_capabilities {
@@ -286,6 +321,9 @@ struct gdbstub_breakpoint_capabilities {
     uint8_t watch_read;
     uint8_t watch_write;
     uint8_t watch_access;
+    uint8_t supports_thread_suffix;
+    uint8_t supports_conditional;
+    uint8_t supports_commands;
 }
 
 alias gdbstub_get_run_capabilities_fn = extern(C) uint8_t function(
@@ -297,6 +335,9 @@ alias gdbstub_get_breakpoint_capabilities_fn = extern(C) uint8_t function(
     void* ctx,
     gdbstub_breakpoint_capabilities* caps_out
 );
+
+alias gdbstub_get_libraries_fn = extern(C) gdbstub_slice_library_entry function(void* ctx);
+alias gdbstub_get_libraries_generation_fn = extern(C) uint8_t function(void* ctx, uint64_t* generation_out);
 
 alias gdbstub_region_info_fn = extern(C) uint8_t function(
     void* ctx,
@@ -395,6 +436,12 @@ struct gdbstub_shlib_info_iface {
     gdbstub_get_shlib_info_fn get_shlib_info;
 }
 
+struct gdbstub_libraries_iface {
+    void* ctx;
+    gdbstub_get_libraries_fn get_libraries;
+    gdbstub_get_libraries_generation_fn get_libraries_generation;
+}
+
 struct gdbstub_process_control_iface {
     void* ctx;
     gdbstub_launch_fn launch;
@@ -423,6 +470,7 @@ struct gdbstub_target_config {
     const(gdbstub_host_info_iface)* host;
     const(gdbstub_process_info_iface)* process;
     const(gdbstub_shlib_info_iface)* shlib;
+    const(gdbstub_libraries_iface)* libraries;
     const(gdbstub_process_control_iface)* process_control;
     const(gdbstub_offsets_info_iface)* offsets;
     const(gdbstub_register_info_iface)* reg_info;
