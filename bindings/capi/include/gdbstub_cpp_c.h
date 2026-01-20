@@ -32,10 +32,15 @@ typedef struct gdbstub_slice_region {
   size_t len;
 } gdbstub_slice_region;
 
+typedef enum gdbstub_library_address_kind {
+  GDBSTUB_LIBRARY_ADDRESS_SEGMENT = 0,
+  GDBSTUB_LIBRARY_ADDRESS_SECTION = 1,
+} gdbstub_library_address_kind;
+
 typedef struct gdbstub_library_entry {
   gdbstub_string_view name;
-  gdbstub_slice_u64 segments;
-  gdbstub_slice_u64 sections;
+  gdbstub_library_address_kind kind;
+  gdbstub_slice_u64 addresses;
 } gdbstub_library_entry;
 
 typedef struct gdbstub_slice_library_entry {
@@ -193,6 +198,10 @@ typedef struct gdbstub_host_info {
   gdbstub_string_view os_kernel;
   uint8_t has_addressing_bits;
   int addressing_bits;
+  uint8_t has_low_mem_addressing_bits;
+  int low_mem_addressing_bits;
+  uint8_t has_high_mem_addressing_bits;
+  int high_mem_addressing_bits;
 } gdbstub_host_info;
 
 typedef struct gdbstub_process_info {

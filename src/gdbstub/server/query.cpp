@@ -553,6 +553,12 @@ void server::handle_host_info() {
   if (info->addressing_bits) {
     response += "addressing_bits:" + std::to_string(*info->addressing_bits) + ";";
   }
+  if (info->low_mem_addressing_bits) {
+    response += "low_mem_addressing_bits:" + std::to_string(*info->low_mem_addressing_bits) + ";";
+  }
+  if (info->high_mem_addressing_bits) {
+    response += "high_mem_addressing_bits:" + std::to_string(*info->high_mem_addressing_bits) + ";";
+  }
 
   send_packet(response);
 }

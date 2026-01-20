@@ -163,6 +163,8 @@ public struct HostInfo {
     Nullable!string osBuild;
     Nullable!string osKernel;
     Nullable!int addressingBits;
+    Nullable!int lowMemAddressingBits;
+    Nullable!int highMemAddressingBits;
 }
 
 public struct ProcessInfo {
@@ -922,6 +924,12 @@ private gdbstub_host_info toCHostInfo(HostInfo info) {
     result.os_kernel = toStringViewNullable(info.osKernel);
     result.has_addressing_bits = info.addressingBits.isNull ? 0 : 1;
     result.addressing_bits = info.addressingBits.isNull ? 0 : info.addressingBits.get;
+    result.has_low_mem_addressing_bits = info.lowMemAddressingBits.isNull ? 0 : 1;
+    result.low_mem_addressing_bits =
+        info.lowMemAddressingBits.isNull ? 0 : info.lowMemAddressingBits.get;
+    result.has_high_mem_addressing_bits = info.highMemAddressingBits.isNull ? 0 : 1;
+    result.high_mem_addressing_bits =
+        info.highMemAddressingBits.isNull ? 0 : info.highMemAddressingBits.get;
     return result;
 }
 

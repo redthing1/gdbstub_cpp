@@ -272,7 +272,8 @@ struct mock_threads {
 struct mock_host {
   std::optional<gdbstub::host_info> get_host_info() {
     return gdbstub::host_info{
-        "riscv32-unknown-elf", "little", 4, "mock-host", "1.0", "build", "kernel", std::nullopt};
+        "riscv32-unknown-elf", "little", 4, "mock-host", "1.0", "build", "kernel", std::nullopt, std::nullopt,
+        std::nullopt};
   }
 };
 
@@ -892,10 +893,7 @@ TEST_CASE("server serves target xml via qXfer") {
 
 TEST_CASE("server serves library list via qXfer") {
   mock_state state;
-  gdbstub::library_entry lib;
-  lib.name = "/lib/libc.so.6";
-  lib.segments = {0x1000};
-  state.libraries.push_back(lib);
+  state.libraries.push_back(gdbstub::library_entry::segment("/lib/libc.so.6", {0x1000}));
   mock_components target(state);
   gdbstub::arch_spec arch;
   arch.reg_count = 3;

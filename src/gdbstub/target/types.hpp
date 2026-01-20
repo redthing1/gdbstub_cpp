@@ -183,6 +183,8 @@ struct host_info {
   std::optional<std::string> os_build;
   std::optional<std::string> os_kernel;
   std::optional<int> addressing_bits;
+  std::optional<int> low_mem_addressing_bits;
+  std::optional<int> high_mem_addressing_bits;
 };
 
 struct process_info {
@@ -197,10 +199,31 @@ struct shlib_info {
   std::optional<uint64_t> info_addr;
 };
 
+enum class library_address_kind : uint8_t {
+  segment = 0,
+  section = 1,
+};
+
 struct library_entry {
   std::string name;
-  std::vector<uint64_t> segments;
-  std::vector<uint64_t> sections;
+  library_address_kind kind = library_address_kind::segment;
+  std::vector<uint64_t> addresses;
+
+  static library_entry segment(std::string name_value, std::vector<uint64_t> addresses_value) {
+    library_entry entry;
+    entry.name = std::move(name_value);
+    entry.kind = library_address_kind::segment;
+    entry.addresses = std::move(addresses_value);
+    return entry;
+  }
+
+  static library_entry section(std::string name_value, std::vector<uint64_t> addresses_value) {
+    library_entry entry;
+    entry.name = std::move(name_value);
+    entry.kind = library_address_kind::section;
+    entry.addresses = std::move(addresses_value);
+    return entry;
+  }
 };
 
 struct process_launch_request {

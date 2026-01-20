@@ -624,9 +624,7 @@ std::string build_library_list_xml(const std::vector<library_entry>& libraries) 
     if (lib.name.empty()) {
       continue;
     }
-    const bool has_segments = !lib.segments.empty();
-    const bool has_sections = !lib.sections.empty();
-    if (has_segments == has_sections) {
+    if (lib.addresses.empty()) {
       continue;
     }
 
@@ -634,9 +632,21 @@ std::string build_library_list_xml(const std::vector<library_entry>& libraries) 
     xml += escape_xml_attr(lib.name);
     xml += "\">";
 
-    const auto& addrs = has_segments ? lib.segments : lib.sections;
-    const char* tag = has_segments ? "segment" : "section";
-    for (uint64_t addr : addrs) {
+    const char* tag = nullptr;
+    switch (lib.kind) {
+    case library_address_kind::segment:
+      tag = "segment";
+      break;
+    case library_address_kind::section:
+      tag = "section";
+      break;
+    default:
+      break;
+    }
+    if (!tag) {
+      continue;
+    }
+    for (uint64_t addr : lib.addresses) {
       xml += "<";
       xml += tag;
       xml += " address=\"0x";

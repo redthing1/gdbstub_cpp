@@ -154,6 +154,10 @@ static void init_state(capi_state& state) {
   state.host.os_kernel = make_view("capi-kernel");
   state.host.has_addressing_bits = 1;
   state.host.addressing_bits = 32;
+  state.host.has_low_mem_addressing_bits = 1;
+  state.host.low_mem_addressing_bits = 32;
+  state.host.has_high_mem_addressing_bits = 1;
+  state.host.high_mem_addressing_bits = 32;
 
   state.process.pid = 1234;
   state.process.triple = make_view("riscv32-unknown-elf");

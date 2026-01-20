@@ -114,11 +114,21 @@ std::vector<uint64_t> to_u64_vector(const gdbstub_slice_u64& slice) {
   return std::vector<uint64_t>(slice.data, slice.data + slice.len);
 }
 
+gdbstub::library_address_kind to_library_address_kind(gdbstub_library_address_kind kind) {
+  switch (kind) {
+  case GDBSTUB_LIBRARY_ADDRESS_SECTION:
+    return gdbstub::library_address_kind::section;
+  case GDBSTUB_LIBRARY_ADDRESS_SEGMENT:
+  default:
+    return gdbstub::library_address_kind::segment;
+  }
+}
+
 gdbstub::library_entry to_library_entry(const gdbstub_library_entry& entry) {
   gdbstub::library_entry out;
   out.name = to_string(entry.name);
-  out.segments = to_u64_vector(entry.segments);
-  out.sections = to_u64_vector(entry.sections);
+  out.kind = to_library_address_kind(entry.kind);
+  out.addresses = to_u64_vector(entry.addresses);
   return out;
 }
 
@@ -198,6 +208,10 @@ gdbstub::host_info to_host_info(const gdbstub_host_info& info) {
   out.os_build = opt_value(info.has_os_build != 0, to_string(info.os_build));
   out.os_kernel = opt_value(info.has_os_kernel != 0, to_string(info.os_kernel));
   out.addressing_bits = opt_value(info.has_addressing_bits != 0, info.addressing_bits);
+  out.low_mem_addressing_bits =
+      opt_value(info.has_low_mem_addressing_bits != 0, info.low_mem_addressing_bits);
+  out.high_mem_addressing_bits =
+      opt_value(info.has_high_mem_addressing_bits != 0, info.high_mem_addressing_bits);
   return out;
 }
 
