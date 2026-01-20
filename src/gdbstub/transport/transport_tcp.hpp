@@ -6,7 +6,7 @@
 #include <span>
 #include <string_view>
 
-#include "gdbstub/transport.hpp"
+#include "gdbstub/transport/transport.hpp"
 
 namespace gdbstub {
 

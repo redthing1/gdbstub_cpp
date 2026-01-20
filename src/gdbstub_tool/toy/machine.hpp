@@ -11,8 +11,8 @@
 #include <utility>
 #include <vector>
 
-#include "gdbstub/rsp_types.hpp"
-#include "gdbstub/target.hpp"
+#include "gdbstub/protocol/rsp_types.hpp"
+#include "gdbstub/target/target.hpp"
 #include "gdbstub_tool/toy/types.hpp"
 
 namespace gdbstub::toy {

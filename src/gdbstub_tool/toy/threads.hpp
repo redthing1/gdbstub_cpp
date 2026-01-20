@@ -4,7 +4,7 @@
 #include <mutex>
 #include <vector>
 
-#include "gdbstub/rsp_types.hpp"
+#include "gdbstub/protocol/rsp_types.hpp"
 
 namespace gdbstub::toy {
 

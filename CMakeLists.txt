@@ -36,9 +36,18 @@ endfunction()
 add_library(gdbstub)
 target_sources(gdbstub PRIVATE
     src/gdbstub/gdbstub.cpp
-    src/gdbstub/rsp_core.cpp
-    src/gdbstub/server.cpp
-    src/gdbstub/transport_tcp.cpp
+    src/gdbstub/protocol/rsp_core.cpp
+    src/gdbstub/server/breakpoints.cpp
+    src/gdbstub/server/control.cpp
+    src/gdbstub/server/core.cpp
+    src/gdbstub/server/detail.cpp
+    src/gdbstub/server/dispatch.cpp
+    src/gdbstub/server/memory.cpp
+    src/gdbstub/server/query.cpp
+    src/gdbstub/server/registers.cpp
+    src/gdbstub/server/stop.cpp
+    src/gdbstub/server/threads.cpp
+    src/gdbstub/transport/transport_tcp.cpp
 )
 set_target_properties(gdbstub PROPERTIES OUTPUT_NAME gdbstub)
 target_include_directories(gdbstub
@@ -55,9 +64,18 @@ add_library(gdbstub_c)
 target_sources(gdbstub_c PRIVATE
     bindings/capi/src/gdbstub_cpp_c.cpp
     src/gdbstub/gdbstub.cpp
-    src/gdbstub/rsp_core.cpp
-    src/gdbstub/server.cpp
-    src/gdbstub/transport_tcp.cpp
+    src/gdbstub/protocol/rsp_core.cpp
+    src/gdbstub/server/breakpoints.cpp
+    src/gdbstub/server/control.cpp
+    src/gdbstub/server/core.cpp
+    src/gdbstub/server/detail.cpp
+    src/gdbstub/server/dispatch.cpp
+    src/gdbstub/server/memory.cpp
+    src/gdbstub/server/query.cpp
+    src/gdbstub/server/registers.cpp
+    src/gdbstub/server/stop.cpp
+    src/gdbstub/server/threads.cpp
+    src/gdbstub/transport/transport_tcp.cpp
 )
 set_target_properties(gdbstub_c PROPERTIES OUTPUT_NAME gdbstub_c)
 target_include_directories(gdbstub_c

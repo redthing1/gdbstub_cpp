@@ -7,7 +7,7 @@
 #include <optional>
 #include <thread>
 
-#include "gdbstub/target.hpp"
+#include "gdbstub/target/target.hpp"
 #include "gdbstub_tool/toy/machine.hpp"
 #include "gdbstub_tool/toy/threads.hpp"
 #include "gdbstub_tool/toy/types.hpp"

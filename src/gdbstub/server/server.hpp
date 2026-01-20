@@ -9,10 +9,10 @@
 #include <string_view>
 #include <vector>
 
-#include "gdbstub/rsp_core.hpp"
-#include "gdbstub/rsp_types.hpp"
-#include "gdbstub/target.hpp"
-#include "gdbstub/transport.hpp"
+#include "gdbstub/protocol/rsp_core.hpp"
+#include "gdbstub/protocol/rsp_types.hpp"
+#include "gdbstub/target/target.hpp"
+#include "gdbstub/transport/transport.hpp"
 
 namespace gdbstub {
 

@@ -6,7 +6,7 @@
 #include <string_view>
 
 #include "gdbstub/gdbstub.hpp"
-#include "gdbstub/rsp_core.hpp"
+#include "gdbstub/protocol/rsp_core.hpp"
 
 namespace {
 

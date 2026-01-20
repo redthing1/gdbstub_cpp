@@ -5,7 +5,7 @@
 #include <utility>
 #include <vector>
 
-#include "gdbstub/target.hpp"
+#include "gdbstub/target/target.hpp"
 #include "gdbstub_tool/toy/layout.hpp"
 #include "gdbstub_tool/toy/machine.hpp"
 #include "gdbstub_tool/toy/runner.hpp"

@@ -13,11 +13,11 @@
 #include <unordered_map>
 #include <vector>
 
-#include "gdbstub/rsp_core.hpp"
-#include "gdbstub/server.hpp"
+#include "gdbstub/protocol/rsp_core.hpp"
+#include "gdbstub/server/server.hpp"
 #include "gdbstub/tcp_test_client.hpp"
-#include "gdbstub/transport.hpp"
-#include "gdbstub/transport_tcp.hpp"
+#include "gdbstub/transport/transport.hpp"
+#include "gdbstub/transport/transport_tcp.hpp"
 
 namespace {
 

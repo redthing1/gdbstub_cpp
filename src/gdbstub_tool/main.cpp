@@ -5,8 +5,8 @@
 
 #include "args/args.hpp"
 #include "gdbstub/gdbstub.hpp"
-#include "gdbstub/server.hpp"
-#include "gdbstub/transport_tcp.hpp"
+#include "gdbstub/server/server.hpp"
+#include "gdbstub/transport/transport_tcp.hpp"
 #include "gdbstub_tool/toy/target.hpp"
 
 namespace {

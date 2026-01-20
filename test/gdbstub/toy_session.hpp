@@ -7,9 +7,9 @@
 #include <string_view>
 #include <thread>
 
-#include "gdbstub/server.hpp"
+#include "gdbstub/server/server.hpp"
 #include "gdbstub/tcp_test_client.hpp"
-#include "gdbstub/transport_tcp.hpp"
+#include "gdbstub/transport/transport_tcp.hpp"
 #include "gdbstub_tool/toy/target.hpp"
 
 namespace gdbstub::test {

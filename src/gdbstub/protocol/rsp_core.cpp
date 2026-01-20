@@ -1,4 +1,4 @@
-#include "gdbstub/rsp_core.hpp"
+#include "gdbstub/protocol/rsp_core.hpp"
 
 #include <algorithm>
 #include <array>

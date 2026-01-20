@@ -13,10 +13,10 @@
 #include <vector>
 
 #include "gdbstub/gdbstub.hpp"
-#include "gdbstub/server.hpp"
-#include "gdbstub/target.hpp"
-#include "gdbstub/transport.hpp"
-#include "gdbstub/transport_tcp.hpp"
+#include "gdbstub/server/server.hpp"
+#include "gdbstub/target/target.hpp"
+#include "gdbstub/transport/transport.hpp"
+#include "gdbstub/transport/transport_tcp.hpp"
 
 namespace gdbstub_c_detail {
 

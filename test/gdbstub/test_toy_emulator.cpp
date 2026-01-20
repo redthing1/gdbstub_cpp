@@ -4,7 +4,7 @@
 #include <span>
 #include <string_view>
 
-#include "gdbstub/rsp_core.hpp"
+#include "gdbstub/protocol/rsp_core.hpp"
 #include "gdbstub/tcp_test_client.hpp"
 #include "gdbstub/toy_session.hpp"
 

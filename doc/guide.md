@@ -40,8 +40,8 @@ Include one header to get the public API:
 
 Key types:
 
-- `gdbstub::target` and `gdbstub::make_target(...)` (see `src/gdbstub/target.hpp`)
-- `gdbstub::arch_spec` (see `src/gdbstub/server.hpp`)
+- `gdbstub::target` and `gdbstub::make_target(...)` (see `src/gdbstub/target/target.hpp`)
+- `gdbstub::arch_spec` (see `src/gdbstub/server/server.hpp`)
 - `gdbstub::server`
 - `gdbstub::transport` and `gdbstub::transport_tcp`
 - RSP data types (stop/restart enums, `resume_request`, `stop_reason`, etc.)
@@ -741,8 +741,8 @@ Optional run helpers (strongly recommended):
 
 ## 16. Where to look next
 
-- `src/gdbstub/target.hpp`: capability definitions and `make_target`.
-- `src/gdbstub/server.hpp` and `src/gdbstub/server.cpp`: full server behavior.
+- `src/gdbstub/target/target.hpp`: capability definitions and `make_target`.
+- `src/gdbstub/server/server.hpp` and `src/gdbstub/server/`: full server behavior.
 - `src/gdbstub_tool/toy`: a complete C++ example with many optional capabilities.
 
 This guide should be sufficient to build a clean, fully functional integration
