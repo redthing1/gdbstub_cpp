@@ -436,10 +436,11 @@ void server::handle_xfer(std::string_view args) {
 
     size_t available = arch_.target_xml.size() - static_cast<size_t>(offset);
     size_t to_send = static_cast<size_t>(std::min<uint64_t>(length, available));
+    bool last_chunk = offset + to_send >= arch_.target_xml.size();
 
     std::string response;
     response.reserve(to_send + 1);
-    response.push_back(offset + to_send >= arch_.target_xml.size() ? 'l' : 'm');
+    response.push_back(last_chunk ? 'l' : 'm');
     response.append(arch_.target_xml.data() + offset, to_send);
     send_packet(response);
     return;
