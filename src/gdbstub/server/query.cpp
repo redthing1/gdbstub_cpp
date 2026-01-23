@@ -59,6 +59,9 @@ void server::handle_query(std::string_view args) {
     if (target_.process) {
       features += ";qProcessInfo+";
     }
+    if (target_.auxv) {
+      features += ";qXfer:auxv:read+";
+    }
     if (target_.memory_layout) {
       features += ";qMemoryRegionInfo+";
     }
@@ -479,6 +482,50 @@ void server::handle_xfer(std::string_view args) {
     response.reserve(to_send + 1);
     response.push_back(offset + to_send >= xml.size() ? 'l' : 'm');
     response.append(xml.data() + offset, to_send);
+    send_packet(response);
+    return;
+  }
+
+  constexpr std::string_view k_auxv_prefix = "auxv:read::";
+  if (args.rfind(k_auxv_prefix, 0) == 0) {
+    if (!target_.auxv) {
+      send_packet("");
+      return;
+    }
+
+    auto range = args.substr(k_auxv_prefix.size());
+    auto comma = range.find(',');
+    if (comma == std::string_view::npos) {
+      send_error(0x01);
+      return;
+    }
+
+    uint64_t offset = 0;
+    uint64_t length = 0;
+    if (!parse_hex_u64(range.substr(0, comma), offset) || !parse_hex_u64(range.substr(comma + 1), length)) {
+      send_error(0x01);
+      return;
+    }
+
+    auto data = target_.auxv->auxv_data();
+    if (!data) {
+      send_packet("");
+      return;
+    }
+
+    if (offset >= data->size()) {
+      send_packet("l");
+      return;
+    }
+
+    size_t available = data->size() - static_cast<size_t>(offset);
+    size_t to_send = static_cast<size_t>(std::min<uint64_t>(length, available));
+    auto escaped = rsp::escape_binary(std::span<const std::byte>(data->data() + offset, to_send));
+
+    std::string response;
+    response.reserve(escaped.size() + 1);
+    response.push_back(offset + to_send >= data->size() ? 'l' : 'm');
+    response.append(escaped);
     send_packet(response);
     return;
   }

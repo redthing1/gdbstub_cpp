@@ -20,9 +20,7 @@ struct regs_view {
 
   size_t reg_size(int regno) const { return reg_size_fn(ctx, regno); }
   target_status read_reg(int regno, std::span<std::byte> out) const { return read_reg_fn(ctx, regno, out); }
-  target_status write_reg(int regno, std::span<const std::byte> data) const {
-    return write_reg_fn(ctx, regno, data);
-  }
+  target_status write_reg(int regno, std::span<const std::byte> data) const { return write_reg_fn(ctx, regno, data); }
 };
 
 struct mem_view {
@@ -79,9 +77,7 @@ struct breakpoints_view {
   target_status (*remove_breakpoint_fn)(void* ctx, const breakpoint_request& request) = nullptr;
   std::optional<breakpoint_capabilities> (*get_breakpoint_capabilities_fn)(void* ctx) = nullptr;
 
-  target_status set_breakpoint(const breakpoint_request& request) const {
-    return set_breakpoint_fn(ctx, request);
-  }
+  target_status set_breakpoint(const breakpoint_request& request) const { return set_breakpoint_fn(ctx, request); }
   target_status remove_breakpoint(const breakpoint_request& request) const {
     return remove_breakpoint_fn(ctx, request);
   }
@@ -146,6 +142,13 @@ struct process_info_view {
   std::optional<process_info> (*get_process_info_fn)(void* ctx) = nullptr;
 
   std::optional<process_info> get_process_info() const { return get_process_info_fn(ctx); }
+};
+
+struct auxv_view {
+  void* ctx = nullptr;
+  std::optional<std::vector<std::byte>> (*get_auxv_data_fn)(void* ctx) = nullptr;
+
+  std::optional<std::vector<std::byte>> auxv_data() const { return get_auxv_data_fn(ctx); }
 };
 
 struct shlib_view {
@@ -234,6 +237,7 @@ struct target_view {
   std::optional<threads_view> threads;
   std::optional<host_info_view> host;
   std::optional<process_info_view> process;
+  std::optional<auxv_view> auxv;
   std::optional<shlib_view> shlib;
   std::optional<libraries_view> libraries;
   std::optional<lldb::view> lldb;

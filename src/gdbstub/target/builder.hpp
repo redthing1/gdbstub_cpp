@@ -102,6 +102,11 @@ concept process_info_capability = requires(T& t) {
 };
 
 template <typename T>
+concept auxv_capability = requires(T& t) {
+  { t.auxv_data() } -> std::same_as<std::optional<std::vector<std::byte>>>;
+};
+
+template <typename T>
 concept shlib_capability = requires(T& t) {
   { t.get_shlib_info() } -> std::same_as<std::optional<shlib_info>>;
 };
@@ -288,6 +293,16 @@ process_info_view make_process_info_view(T& process) {
 }
 
 template <typename T>
+auxv_view make_auxv_view(T& auxv) {
+  auxv_view view;
+  view.ctx = std::addressof(auxv);
+  view.get_auxv_data_fn = [](void* ctx) -> std::optional<std::vector<std::byte>> {
+    return static_cast<T*>(ctx)->auxv_data();
+  };
+  return view;
+}
+
+template <typename T>
 shlib_view make_shlib_view(T& shlib) {
   shlib_view view;
   view.ctx = std::addressof(shlib);
@@ -379,7 +394,8 @@ void assign_optional(target_view& view, T& obj) {
   static_assert(!mem_capability<T>, "Optional capability object implements memory access; pass it as mem.");
   static_assert(!run_capability<T>, "Optional capability object implements run control; pass it as run.");
   constexpr int matches = breakpoints_capability<T> + threads_capability<T> + memory_layout_capability<T> +
-                          host_info_capability<T> + process_info_capability<T> + shlib_capability<T> +
+                          host_info_capability<T> + process_info_capability<T> + auxv_capability<T> +
+                          shlib_capability<T> +
                           libraries_capability<T> + lldb_capability<T> +
                           process_control_capability<T> + offsets_capability<T> + register_info_capability<T>;
   static_assert(matches >= 1, "Optional capability object must implement at least one optional capability.");
@@ -398,6 +414,9 @@ void assign_optional(target_view& view, T& obj) {
   }
   if constexpr (process_info_capability<T>) {
     view.process = make_process_info_view(obj);
+  }
+  if constexpr (auxv_capability<T>) {
+    view.auxv = make_auxv_view(obj);
   }
   if constexpr (shlib_capability<T>) {
     view.shlib = make_shlib_view(obj);
@@ -437,6 +456,8 @@ target make_target(Regs& regs, Mem& mem, Run& run, Opts&... opts) {
   static_assert(host_count <= 1, "Host info capability provided multiple times.");
   constexpr int process_count = (0 + ... + detail::process_info_capability<Opts>);
   static_assert(process_count <= 1, "Process info capability provided multiple times.");
+  constexpr int auxv_count = (0 + ... + detail::auxv_capability<Opts>);
+  static_assert(auxv_count <= 1, "Auxv capability provided multiple times.");
   constexpr int shlib_count = (0 + ... + detail::shlib_capability<Opts>);
   static_assert(shlib_count <= 1, "Shlib capability provided multiple times.");
   constexpr int libraries_count = (0 + ... + detail::libraries_capability<Opts>);
