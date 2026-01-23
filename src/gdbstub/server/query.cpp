@@ -1,6 +1,7 @@
 #include "gdbstub/server/server.hpp"
 
 #include <algorithm>
+#include <cctype>
 
 #include "gdbstub/gdbstub.hpp"
 #include "gdbstub/server/detail.hpp"
@@ -8,6 +9,34 @@
 namespace gdbstub {
 
 using namespace server_detail;
+
+namespace {
+
+std::string normalize_path(std::string_view path, bool case_insensitive) {
+  std::string out;
+  out.reserve(path.size());
+  for (char c : path) {
+    char ch = (c == '\\') ? '/' : c;
+    if (case_insensitive) {
+      ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    }
+    out.push_back(ch);
+  }
+  while (!out.empty() && out.back() == '/') {
+    out.pop_back();
+  }
+  return out;
+}
+
+std::string_view basename(std::string_view path) {
+  auto pos = path.find_last_of('/');
+  if (pos == std::string_view::npos) {
+    return path;
+  }
+  return path.substr(pos + 1);
+}
+
+} // namespace
 
 void server::handle_query(std::string_view args) {
   if (args.rfind("Xfer:", 0) == 0) {
@@ -150,6 +179,42 @@ void server::handle_query(std::string_view args) {
 
   if (name == "ProcessInfo") {
     handle_process_info();
+    return;
+  }
+
+  if (name == "FileLoadAddress") {
+    if (!target_.libraries) {
+      send_packet("");
+      return;
+    }
+
+    std::string decoded;
+    if (!decode_hex_string(params, decoded)) {
+      send_error(0x16);
+      return;
+    }
+
+    bool case_insensitive = false;
+    if (target_.process) {
+      if (auto info = target_.process->get_process_info()) {
+        case_insensitive = info->ostype == "windows";
+      }
+    }
+
+    auto query_norm = normalize_path(decoded, case_insensitive);
+    auto query_base = basename(query_norm);
+    for (const auto& lib : target_.libraries->libraries()) {
+      if (lib.name.empty() || lib.addresses.empty()) {
+        continue;
+      }
+      auto lib_norm = normalize_path(lib.name, case_insensitive);
+      if (lib_norm == query_norm || basename(lib_norm) == query_base) {
+        send_packet(hex_u64(lib.addresses.front()));
+        return;
+      }
+    }
+
+    send_packet("");
     return;
   }
 
