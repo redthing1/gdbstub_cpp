@@ -1,7 +1,6 @@
 module gdbstub_cpp;
 
 import core.stdc.stdint : uint32_t, uint64_t, uint8_t;
-import std.array : dup;
 import std.exception : enforce;
 import std.typecons : Nullable, nullable;
 import gdbstub_cpp_c_api;
@@ -1102,15 +1101,15 @@ private BytecodeExpr[] toBytecodeExprs(gdbstub_slice_bytecode_expr slice) {
     if (slice.data is null || slice.len == 0) {
         return [];
     }
-    BytecodeExpr[] out;
-    out.length = slice.len;
+    BytecodeExpr[] bytecodeExprs;
+    bytecodeExprs.length = slice.len;
     foreach (i; 0 .. slice.len) {
         auto expr = slice.data[i];
         if (expr.data !is null && expr.len > 0) {
-            out[i].bytes = expr.data[0 .. expr.len].dup;
+            bytecodeExprs[i].bytes = expr.data[0 .. expr.len].dup;
         }
     }
-    return out;
+    return bytecodeExprs;
 }
 
 private BreakpointRequest toDBreakpointRequest(const(gdbstub_breakpoint_request)* request) {
@@ -1119,7 +1118,7 @@ private BreakpointRequest toDBreakpointRequest(const(gdbstub_breakpoint_request)
     result.spec.addr = request.spec.addr;
     result.spec.length = request.spec.length;
     if (request.has_thread_id != 0) {
-        result.threadId = nullable(request.thread_id);
+        result.threadId = nullable(cast(ulong)request.thread_id);
     }
     result.conditions = toBytecodeExprs(request.conditions);
     if (request.has_commands != 0) {

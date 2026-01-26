@@ -288,14 +288,14 @@ private class TestTarget {
         return nullable(info);
     }
 
-    TargetStatus setBreakpoint(BreakpointSpec spec) {
-        lastBreakpoint = spec;
+    TargetStatus setBreakpoint(BreakpointRequest request) {
+        lastBreakpoint = request.spec;
         breakpointsSet++;
         return TargetStatus.ok;
     }
 
-    TargetStatus removeBreakpoint(BreakpointSpec spec) {
-        lastBreakpoint = spec;
+    TargetStatus removeBreakpoint(BreakpointRequest request) {
+        lastBreakpoint = request.spec;
         breakpointsRemoved++;
         return TargetStatus.ok;
     }
