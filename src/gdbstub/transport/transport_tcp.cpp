@@ -16,10 +16,10 @@
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
-#include <poll.h>
 #endif
 
 namespace gdbstub {
@@ -199,7 +199,9 @@ bool socket_readable(socket_type sock, std::chrono::milliseconds timeout) {
   pfd.events = POLLIN;
   int ms = static_cast<int>(std::min<std::chrono::milliseconds::rep>(timeout.count(), std::numeric_limits<int>::max()));
   int result = poll(&pfd, 1, ms);
-  return result > 0 && (pfd.revents & POLLIN);
+  // treat hangup/error as readable events, so callers can observe disconnect
+  return result > 0 &&
+         ((pfd.revents & POLLIN) || (pfd.revents & POLLHUP) || (pfd.revents & POLLERR) || (pfd.revents & POLLNVAL));
 #endif
 }
 
