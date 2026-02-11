@@ -16,11 +16,27 @@ server::~server() { stop(); }
 bool server::listen(std::string_view address) { return transport_->listen(address); }
 
 bool server::wait_for_connection() {
-  bool accepted = transport_->accept();
-  if (accepted) {
-    target_.run.set_stop_notifier(stop_notifier{this, notify_stop_thunk});
+  const bool accepted = transport_->accept();
+  if (!accepted) {
+    return false;
   }
-  return accepted;
+
+  // reset connection-scoped state for clean re-attach
+  parser_.reset();
+  exec_state_ = exec_state::halted;
+  no_ack_mode_ = false;
+  list_threads_in_stop_reply_ = false;
+  thread_suffix_enabled_ = false;
+  error_strings_enabled_ = false;
+  extended_mode_ = false;
+  attached_state_ = attached_state::unknown;
+  last_library_generation_.reset();
+  reset_non_stop_state();
+  non_stop_.enabled = false;
+  last_stop_.reset();
+
+  target_.run.set_stop_notifier(stop_notifier{this, notify_stop_thunk});
+  return true;
 }
 
 bool server::has_connection() const { return transport_->connected(); }
@@ -61,9 +77,7 @@ bool server::poll(std::chrono::milliseconds timeout) {
   return processed;
 }
 
-void server::notify_stop(stop_reason reason) {
-  enqueue_stop(std::move(reason));
-}
+void server::notify_stop(stop_reason reason) { enqueue_stop(std::move(reason)); }
 
 void server::stop() {
   target_.run.set_stop_notifier({});
@@ -147,8 +161,6 @@ bool server::flush_pending_stop() {
   return true;
 }
 
-void server::handle_interrupt() {
-  target_.run.interrupt();
-}
+void server::handle_interrupt() { target_.run.interrupt(); }
 
 } // namespace gdbstub
